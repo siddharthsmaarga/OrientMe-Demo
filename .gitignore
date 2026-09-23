@@ -1,0 +1,4 @@
+# Keep host logs and local work out of the demo repository.
+*.log
+__pycache__/
+local-runtime/

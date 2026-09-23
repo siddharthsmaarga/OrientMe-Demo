@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#f5f4eb" />
+    <meta name="description" content="A static, synthetic-data prototype of OrientMe Search and Orientation." />
+    <title>OrientMe | Search and Orientation prototype</title>
+    <link rel="stylesheet" href="./styles.css" />
+    <script src="./app.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <div class="app-shell">
+      <header class="topbar">
+        <a class="brand" href="#search" aria-label="OrientMe home">
+          <span class="brand-mark" aria-hidden="true">o</span>
+          <span>orientme</span>
+        </a>
+        <div class="topbar-right">
+          <span class="prototype-label"><span aria-hidden="true"></span> Static prototype</span>
+          <button class="avatar" type="button" aria-label="Sample user">S</button>
+        </div>
+      </header>
+
+      <div class="workspace">
+        <aside class="source-rail" aria-label="Source filters">
+          <div class="rail-heading">
+            <p class="eyebrow">Your workspace</p>
+            <h2>Find your footing.</h2>
+            <p class="rail-copy">A small, searchable set of example work notes.</p>
+          </div>
+          <div class="source-status">
+            <span class="status-dot" aria-hidden="true"></span>
+            <span>Sample library</span>
+            <span class="status-count">4</span>
+          </div>
+          <nav class="source-nav" aria-label="Filter example sources">
+            <button class="source-filter is-selected" type="button" data-filter="all" aria-pressed="true">
+              <span class="filter-icon" aria-hidden="true">▤</span><span>All notes</span><span class="filter-count">4</span>
+            </button>
+            <button class="source-filter" type="button" data-filter="planning" aria-pressed="false">
+              <span class="filter-icon" aria-hidden="true">◷</span><span>Planning</span><span class="filter-count">2</span>
+            </button>
+            <button class="source-filter" type="button" data-filter="research" aria-pressed="false">
+              <span class="filter-icon" aria-hidden="true">⌕</span><span>Research</span><span class="filter-count">1</span>
+            </button>
+            <button class="source-filter" type="button" data-filter="decisions" aria-pressed="false">
+              <span class="filter-icon" aria-hidden="true">◇</span><span>Decisions</span><span class="filter-count">1</span>
+            </button>
+          </nav>
+          <div class="rail-bottom">
+            <div class="privacy-note">
+              <span class="privacy-icon" aria-hidden="true">◈</span>
+              <p><strong>Example content only</strong><br />No files are connected in this demo.</p>
+            </div>
+            <button class="help-link" type="button" data-open-about>About this prototype <span aria-hidden="true">↗</span></button>
+          </div>
+        </aside>
+
+        <main id="main" class="main-area">
+          <div class="main-inner">
+            <div class="mode-tabs" role="tablist" aria-label="Choose a workspace mode">
+              <button id="tab-search" class="mode-tab is-active" type="button" role="tab" aria-selected="true" aria-controls="panel-search" data-mode="search">Search</button>
+              <button id="tab-ask" class="mode-tab" type="button" role="tab" aria-selected="false" aria-controls="panel-ask" data-mode="ask" tabindex="-1">Ask</button>
+              <button id="tab-orient" class="mode-tab" type="button" role="tab" aria-selected="false" aria-controls="panel-orient" data-mode="orient" tabindex="-1">Orient</button>
+            </div>
+
+            <section id="panel-search" class="mode-panel" role="tabpanel" aria-labelledby="tab-search" data-panel="search">
+              <div class="page-intro">
+                <p class="eyebrow">Search your notes</p>
+                <h1>What are you looking for?</h1>
+                <p>Find a useful passage in the material you have approved.</p>
+              </div>
+              <form id="search-form" class="search-form" role="search">
+                <label class="sr-only" for="search-input">Search example notes</label>
+                <span class="search-icon" aria-hidden="true">⌕</span>
+                <input id="search-input" name="q" type="search" placeholder="Try “launch timeline” or “open decisions”" autocomplete="off" />
+                <kbd>Enter</kbd>
+              </form>
+              <div class="search-meta">
+                <p id="result-count" aria-live="polite">4 notes in the example library</p>
+                <button class="sort-button" type="button" aria-label="Results sorted by relevance">Relevant first <span aria-hidden="true">⌄</span></button>
+              </div>
+              <div id="results" class="results-list" aria-live="polite"></div>
+              <div id="empty-state" class="empty-state" hidden>
+                <span class="empty-mark" aria-hidden="true">⌕</span>
+                <h2>No matching notes</h2>
+                <p>Try a broader phrase or choose another source group.</p>
+                <button id="clear-search" class="text-button" type="button">Clear search</button>
+              </div>
+            </section>
+
+            <section id="panel-ask" class="mode-panel" role="tabpanel" aria-labelledby="tab-ask" data-panel="ask" hidden>
+              <div class="page-intro">
+                <p class="eyebrow">Ask with evidence</p>
+                <h1>Get the useful context.</h1>
+                <p>Answers should show what supports them, and where the record is incomplete.</p>
+              </div>
+              <div class="demo-notice"><span aria-hidden="true">i</span><p>This is a scripted example. No AI service is connected.</p></div>
+              <div class="question-card">
+                <p class="field-label">Try this sample question</p>
+                <div class="sample-question">What changed in the launch plan?</div>
+                <button id="show-answer" class="primary-button" type="button">Show sample answer <span aria-hidden="true">→</span></button>
+              </div>
+              <article id="sample-answer" class="answer-card" hidden>
+                <div class="answer-topline"><span class="answer-badge">Example answer</span><span class="answer-mode">Based on 2 sample notes</span></div>
+                <p class="answer-claim"><span class="claim-label fact-label">Fact</span>The team moved the first review to Thursday and kept the wider release date open until the accessibility pass is complete.<button class="citation" type="button" data-source="planning-brief">[1]</button></p>
+                <p class="answer-claim"><span class="claim-label uncertainty-label">Uncertainty</span>The notes do not say who owns the accessibility pass.<button class="citation" type="button" data-source="decision-log">[2]</button></p>
+                <div class="answer-sources"><p>Sources</p><button class="source-link" type="button" data-source="planning-brief"><span>[1]</span> Launch planning brief <span aria-hidden="true">↗</span></button><button class="source-link" type="button" data-source="decision-log"><span>[2]</span> Open decisions <span aria-hidden="true">↗</span></button></div>
+              </article>
+            </section>
+
+            <section id="panel-orient" class="mode-panel" role="tabpanel" aria-labelledby="tab-orient" data-panel="orient" hidden>
+              <div class="page-intro">
+                <p class="eyebrow">Pick up where you left off</p>
+                <h1>Get oriented, quickly.</h1>
+                <p>A short handoff built from the example notes in this workspace.</p>
+              </div>
+              <div class="demo-notice"><span aria-hidden="true">i</span><p>This is a fixed sample orientation using synthetic content.</p></div>
+              <article class="orientation-card">
+                <div class="orientation-heading"><div><span class="orientation-icon" aria-hidden="true">↗</span><span class="eyebrow">Project handoff</span></div><span class="sample-tag">Sample</span></div>
+                <h2>Release planning</h2>
+                <p class="orientation-lead">The review is moving forward, while one readiness question remains open.</p>
+                <div class="orientation-section"><h3>Current state</h3><p><span class="claim-label fact-label">Fact</span> A first review is planned for Thursday. The wider release date is not confirmed.<button class="citation" type="button" data-source="planning-brief">[1]</button></p></div>
+                <div class="orientation-section"><h3>Open question</h3><p><span class="claim-label uncertainty-label">Uncertainty</span> The accessibility pass has no named owner in these notes.<button class="citation" type="button" data-source="decision-log">[2]</button></p></div>
+                <div class="next-step"><span class="next-step-mark" aria-hidden="true">→</span><p><span class="claim-label recommendation-label">Recommendation</span><br />Confirm an owner for the accessibility pass before setting the release date.</p></div>
+                <div class="answer-sources"><p>Sources</p><button class="source-link" type="button" data-source="planning-brief"><span>[1]</span> Launch planning brief <span aria-hidden="true">↗</span></button><button class="source-link" type="button" data-source="decision-log"><span>[2]</span> Open decisions <span aria-hidden="true">↗</span></button></div>
+              </article>
+            </section>
+
+            <footer class="page-footer"><span>OrientMe prototype</span><span>All names and work notes are fictional.</span></footer>
+          </div>
+        </main>
+      </div>
+    </div>
+
+    <dialog id="source-dialog" class="source-dialog" aria-labelledby="dialog-title">
+      <form method="dialog"><button class="dialog-close" aria-label="Close source preview">×</button></form>
+      <p class="eyebrow" id="dialog-category">Example source</p>
+      <h2 id="dialog-title">Source preview</h2>
+      <p id="dialog-meta" class="dialog-meta"></p>
+      <div class="dialog-rule"></div>
+      <p id="dialog-excerpt" class="dialog-excerpt"></p>
+      <div class="dialog-footer"><span class="synthetic-mark" aria-hidden="true">◈</span> Fictional example text for the prototype</div>
+    </dialog>
+
+    <dialog id="about-dialog" class="source-dialog about-dialog" aria-labelledby="about-title">
+      <form method="dialog"><button class="dialog-close" aria-label="Close about dialog">×</button></form>
+      <p class="eyebrow">About this demo</p>
+      <h2 id="about-title">A small window into OrientMe.</h2>
+      <p class="about-copy">This static prototype demonstrates how Search, Ask, and Orient could help someone find approved work notes and inspect the evidence behind an answer.</p>
+      <ul class="about-list"><li>All source notes are fictional.</li><li>Search runs in your browser against four bundled examples.</li><li>Ask and Orient show scripted examples. They do not call a model.</li><li>No folder selection, account, server, or external data connection is active.</li></ul>
+      <div class="dialog-footer"><span class="synthetic-mark" aria-hidden="true">◈</span> For product review only</div>
+    </dialog>
+  </body>
+</html>
