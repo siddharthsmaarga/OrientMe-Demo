@@ -1,0 +1,43 @@
+@import "tailwindcss";
+
+/* Fixed light theme, deliberately not adaptive to OS dark mode - the
+   reference products (Read.ai, Sybill) are both clean, light, minimal
+   SaaS UIs, and that's the look this app should always have regardless
+   of the viewer's system theme.
+
+   Palette matches Maarga's own HR Hiring Agent app (static/style.css) -
+   same purple/teal/cream brand system, applied here as Tailwind theme
+   tokens instead of that app's plain CSS custom properties, since this
+   frontend is Tailwind-based (visual match only - the stack itself stays
+   Next.js/Django per Venki's explicit decision, not a rebuild). */
+:root {
+  --background: #faf9ed;
+  --foreground: #1a1a1a;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-open-sans);
+  --font-mono: var(--font-geist-mono);
+
+  --color-brand: #662984;
+  --color-brand-dark: #4e1f65;
+  --color-teal: #0096af;
+  --color-teal-dark: #028c8c;
+  --color-teal-tint: #e8f7f7;
+  --color-teal-tint-strong: #d0eeee;
+  --color-cream: #faf9ed;
+  --color-border-warm: #e3e0d8;
+  --color-accent-green: #96c800;
+  --color-accent-orange: #d0811c;
+}
+
+html {
+  color-scheme: light;
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+}
