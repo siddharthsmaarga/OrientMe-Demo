@@ -20,7 +20,11 @@ The host must remain on and have Python 3.12-3.14, Node.js 20.9 or newer, and ne
    ```
 
 3. Colleagues browse to `http://<company-host-ip>:3001/` while connected to the company network or NetExtender.
-4. Stop both services with `.deploymentstop-vpn-demo.ps1`.
+4. Stop both services from the repository root:
+
+   ```powershell
+   ./deployment/stop-vpn-demo.ps1
+   ```
 
 The launcher creates a local Python environment, installs dependencies, builds the frontend, migrates the empty database, generates a private Django key on the host, and starts both services bound to the selected address. It writes its key, database, uploads, logs, and process record only to ignored local paths. It does not change Windows Firewall rules. The host firewall and company network must allow TCP 3001 (web UI) and 8010 (API) from the VPN clients.
 
