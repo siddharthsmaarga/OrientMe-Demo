@@ -1,0 +1,30 @@
+name: Package VPN demo
+
+on:
+  push:
+    branches: [prototype]
+    paths:
+      - '.github/workflows/package-vpn-demo.yml'
+      - '.gitignore'
+      - 'README.md'
+      - 'deployment/**'
+      - 'orientme-app/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Create clean source package
+        run: |
+          mkdir -p dist
+          git archive --format=zip --output=dist/orientme-vpn-demo.zip "$GITHUB_SHA" .gitignore README.md deployment orientme-app
+      - uses: actions/upload-artifact@v6
+        with:
+          name: orientme-vpn-demo
+          path: dist/orientme-vpn-demo.zip
+          if-no-files-found: error

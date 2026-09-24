@@ -1,4 +1,17 @@
 # Keep host logs and local work out of the demo repository.
 *.log
 __pycache__/
+*.py[cod]
 local-runtime/
+node_modules/
+.next/
+.venv/
+venv/
+db.sqlite3
+*.sqlite3
+*.sqlite
+media/
+deployment/.runtime/
+deployment/logs/
+.env
+.env.*
