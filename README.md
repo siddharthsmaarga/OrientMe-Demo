@@ -42,6 +42,8 @@ The password argument can be visible in local process listings and shell history
 
 ## Hosting limits
 
-GitHub Pages cannot run this Django backend. Pages deployment has been removed; the branch workflow creates a downloadable source package instead. The live app must run on a company-controlled computer or server reachable over the VPN. This demo uses HTTP and should remain on the company network/VPN; do not put confidential meeting data, provider keys, or production accounts into it.
+GitHub Pages cannot run this Django backend. The repository now also contains a separate static frontend demo at <https://siddharthsmaarga.github.io/OrientMe-Demo/>. It deploys from `main`; projects created there are stored in each visitor's browser and do not sync between users or devices. Folder scanning, file imports, backend APIs, and AI-generated briefs remain available only when using the full app below.
 
-The repository is public. It contains application source and deployment scripts only. Never commit the host's database, uploaded files, generated secret key, or provider credentials.
+The VPN-hosted full app must run on a company-controlled computer or server reachable over the VPN. It uses HTTP and should remain on the company network/VPN; do not put confidential meeting data, provider keys, or production accounts into it.
+
+The repository is public and includes fictional static sample content. Never commit the host's database, uploaded files, generated secret key, or provider credentials.

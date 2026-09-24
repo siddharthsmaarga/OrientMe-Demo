@@ -5,6 +5,7 @@ __pycache__/
 local-runtime/
 node_modules/
 .next/
+pages-site/out/
 .venv/
 venv/
 db.sqlite3

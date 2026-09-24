@@ -1,0 +1,35 @@
+@import "tailwindcss";
+
+/* Keep the supplied light theme and brand palette consistent across the
+   static demo's dashboard, project details, calendar, and task board. */
+:root {
+  --background: #faf9ed;
+  --foreground: #1a1a1a;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-open-sans);
+  --font-mono: var(--font-geist-mono);
+
+  --color-brand: #662984;
+  --color-brand-dark: #4e1f65;
+  --color-teal: #0096af;
+  --color-teal-dark: #028c8c;
+  --color-teal-tint: #e8f7f7;
+  --color-teal-tint-strong: #d0eeee;
+  --color-cream: #faf9ed;
+  --color-border-warm: #e3e0d8;
+  --color-accent-green: #96c800;
+  --color-accent-orange: #d0811c;
+}
+
+html {
+  color-scheme: light;
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+}
