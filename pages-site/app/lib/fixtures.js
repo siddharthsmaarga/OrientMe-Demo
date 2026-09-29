@@ -560,6 +560,15 @@ function buildInitialState() {
       llm_base_url: "https://openrouter.ai/api/v1",
       default_directory: "",
       stale_after_days: 14,
+      // The Transcripts pipeline's own config (see settings/page.js's
+      // "Transcripts" section) - fictional demo values, matching this
+      // file's own "C:\Demo\..." convention used elsewhere, since there's
+      // no real folder-watcher behind this static build (see
+      // recordingEvents above and its own header comment).
+      recordings_watch_folder: "C:\\Demo\\Recordings",
+      recordings_suggest_new_topics: "true",
+      transcription_engine: "local_whisper",
+      external_transcription_url: "",
     },
     user: { ...DEMO_USER },
   };

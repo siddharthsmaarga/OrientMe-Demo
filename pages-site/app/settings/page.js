@@ -53,6 +53,10 @@ export default function SettingsPage() {
     llm_base_url: "https://openrouter.ai/api/v1",
     default_directory: "",
     stale_after_days: "14",
+    recordings_watch_folder: "",
+    recordings_suggest_new_topics: "true",
+    transcription_engine: "local_whisper",
+    external_transcription_url: "",
   });
   const [keyIsSet, setKeyIsSet] = useState(false);
   const [saved, setSaved] = useState(false);
@@ -246,6 +250,84 @@ export default function SettingsPage() {
             Drives the &quot;Needs attention&quot; panel and Stale badge on the dashboard.
           </p>
         </div>
+        <div className="pt-2 mt-2 border-t border-slate-200">
+          <h2 className="text-sm font-semibold text-slate-700 mb-1">Transcripts</h2>
+          <p className="text-xs text-slate-400 mb-4">
+            The central Recordings-folder pipeline — recordings dropped there are transcribed and
+            routed to the right project automatically. See the{" "}
+            <Link href="/transcripts" className="text-teal-dark hover:underline">
+              Transcripts page
+            </Link>{" "}
+            for activity and manual assignment. This is a static demo build, so these fields are
+            for illustration — there&apos;s no real folder-watcher behind this page (see the{" "}
+            <Link href="/transcripts" className="text-teal-dark hover:underline">
+              Transcripts page
+            </Link>
+            &apos;s own sample data instead).
+          </p>
+        </div>
+
+        <div>
+          <label className="block text-sm font-medium text-slate-700 mb-1">Watched recordings folder</label>
+          <input
+            className="w-full rounded-md border border-slate-300 px-3 py-2 text-sm disabled:bg-slate-100 disabled:text-slate-400"
+            value={form.recordings_watch_folder}
+            disabled={effectiveLocked}
+            onChange={(e) => setForm({ ...form, recordings_watch_folder: e.target.value })}
+            placeholder="D:\OneDrive - Company\Recordings"
+          />
+          <p className="text-xs text-slate-400 mt-1">
+            Checked every ~60 seconds for new recordings (Teams cloud recordings, or anything else
+            dropped in — phone recordings included).
+          </p>
+        </div>
+
+        <label className="flex items-center gap-2 text-sm text-slate-700">
+          <input
+            type="checkbox"
+            checked={form.recordings_suggest_new_topics === "true"}
+            disabled={effectiveLocked}
+            onChange={(e) =>
+              setForm({ ...form, recordings_suggest_new_topics: e.target.checked ? "true" : "false" })
+            }
+          />
+          Suggest a new project when a recording clearly describes one that doesn&apos;t exist yet —
+          you&apos;ll always be asked to confirm or reject on the Transcripts page before anything is
+          created (otherwise it&apos;s just flagged &quot;Needs review&quot;)
+        </label>
+
+        <div>
+          <label className="block text-sm font-medium text-slate-700 mb-1">Transcription engine</label>
+          <select
+            className="w-full rounded-md border border-slate-300 px-3 py-2 text-sm bg-white disabled:bg-slate-100 disabled:text-slate-400"
+            value={form.transcription_engine}
+            disabled={effectiveLocked}
+            onChange={(e) => setForm({ ...form, transcription_engine: e.target.value })}
+          >
+            <option value="local_whisper">Local Whisper (built-in, no setup)</option>
+            <option value="external">External tool (e.g. the team&apos;s transcript diarizer)</option>
+          </select>
+          <p className="text-xs text-slate-400 mt-1">
+            The integration point for other tools — including the transcript diarizer the engineering
+            team is building. Point it at any service that accepts an uploaded audio file and returns{" "}
+            <code className="text-[11px]">{"{ text, speakers? }"}</code> JSON; it slots in here with no
+            code change, and falls back to Local Whisper automatically if it&apos;s ever unreachable.
+          </p>
+        </div>
+
+        {form.transcription_engine === "external" && (
+          <div>
+            <label className="block text-sm font-medium text-slate-700 mb-1">External engine URL</label>
+            <input
+              className="w-full rounded-md border border-slate-300 px-3 py-2 text-sm disabled:bg-slate-100 disabled:text-slate-400"
+              value={form.external_transcription_url}
+              disabled={effectiveLocked}
+              onChange={(e) => setForm({ ...form, external_transcription_url: e.target.value })}
+              placeholder="http://localhost:9000/transcribe"
+            />
+          </div>
+        )}
+
         <div className="flex items-center gap-3">
           <button
             type="submit"
