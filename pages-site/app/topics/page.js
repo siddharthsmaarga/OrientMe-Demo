@@ -1719,9 +1719,9 @@ const COMMITMENT_STATUS_OPTIONS = [
 ];
 
 // A person's explicit promise/obligation - deliberately backed by its own
-// Commitment model (see models.Commitment), NOT Task. "Venkatesh will
+// Commitment model (see models.Commitment), NOT Task. "A teammate will
 // provide the architecture proposal by Friday" is a commitment; "Create
-// Azure architecture proposal" is the task it might produce - the two are
+// the architecture proposal" is the task it might produce - the two are
 // independent records, optionally linked via linked_task. `tasks` here is
 // only for populating the optional "link to task" picker.
 function CommitmentsCard({ topicId, commitments, tasks, onChanged }) {
