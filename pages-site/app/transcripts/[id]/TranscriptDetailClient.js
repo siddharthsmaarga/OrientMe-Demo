@@ -6,27 +6,11 @@ import { api } from "../../lib/api";
 import { formatAdded } from "../../lib/format";
 import { STATUS_STYLES } from "../page";
 
-// Turns a transformers.js progress_callback payload into one human line -
-// the exact same shape localModel.js/model.worker.js already forward for
-// Ask/Orient (see generateDemoAnswer's onProgress param), just rendered
-// here for the first time. Nothing invents a new loading convention; this
-// is the one place in the app that actually surfaces it.
-function describeProgress(progress) {
-  if (!progress) return "Preparing the local model…";
-  if (progress.status === "fallback") return progress.message || "Switching browser runtimes…";
-  if (typeof progress.progress === "number" && progress.status !== "done") {
-    const pct = Math.round(progress.progress);
-    return `Downloading model files (first use only) — ${pct}%${progress.file ? ` · ${progress.file}` : ""}`;
-  }
-  if (progress.status === "ready" || progress.status === "done") return "Model ready — generating…";
-  return "Downloading model files (first use only)…";
-}
-
 // Detail view for one Transcripts row (see ../page.js). Two-column layout:
 // full transcript + honest "Diarize" button on the left, an empty-state /
 // generated-summary panel on the right. The summary is never generated
-// automatically - only api.generateRecordingSummary() (a real in-browser
-// SmolLM2 call, same worker Ask/Orient already uses) writes it, and only
+// automatically - only api.generateRecordingSummary() (deterministic code,
+// not a model call - see api.js's buildMeetingSummary) writes it, and only
 // when a person clicks the button.
 export default function TranscriptDetailClient({ id }) {
   const [event, setEvent] = useState(null);
@@ -35,7 +19,6 @@ export default function TranscriptDetailClient({ id }) {
 
   const [generating, setGenerating] = useState(false);
   const [summaryError, setSummaryError] = useState(null);
-  const [progress, setProgress] = useState(null);
 
   const [diarizing, setDiarizing] = useState(false);
   const [diarizeResult, setDiarizeResult] = useState(null);
@@ -64,17 +47,15 @@ export default function TranscriptDetailClient({ id }) {
   async function handleGenerateSummary() {
     setGenerating(true);
     setSummaryError(null);
-    setProgress(null);
     setSaveState("idle");
     setSaveError(null);
     try {
-      const updated = await api.generateRecordingSummary(id, (p) => setProgress(p));
+      const updated = await api.generateRecordingSummary(id);
       setEvent(updated);
     } catch (e) {
       setSummaryError(e.message);
     } finally {
       setGenerating(false);
-      setProgress(null);
     }
   }
 
@@ -183,16 +164,16 @@ export default function TranscriptDetailClient({ id }) {
 
           {generating && (
             <div className="mb-3 rounded-md bg-teal-tint border border-teal-tint-strong text-teal-dark text-xs px-3 py-2">
-              {describeProgress(progress)}
+              Generating…
             </div>
           )}
 
           {event.meeting_summary ? (
             <>
               <p className="text-sm text-[#1a1a1a] whitespace-pre-wrap leading-relaxed mb-3">{event.meeting_summary}</p>
-              <p className="text-xs text-amber-600 bg-amber-50 border border-amber-200 rounded px-3 py-2 mb-3">
-                Generated on this device by a small browser model (SmolLM2-360M) from this transcript. The model is
-                intentionally small and can be inaccurate — review before relying on it.
+              <p className="text-xs text-ink-muted bg-[#f3f2ec] border border-border-warm rounded px-3 py-2 mb-3">
+                Built from this transcript by plain extractive scoring (which words repeat most, which lines carry
+                them) — deterministic code, not a model call.
               </p>
               {event.summary_generated_at && (
                 <p className="text-xs text-ink-muted mb-4">Generated {formatAdded(event.summary_generated_at)}</p>

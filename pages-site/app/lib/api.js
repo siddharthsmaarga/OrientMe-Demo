@@ -17,6 +17,68 @@
 import { store, newId } from "./fixtures";
 import { generateDemoAnswer } from "./localModel";
 
+// Deterministic, code-based meeting summary - ported from the real app's
+// core/extraction.py::build_meeting_summary. No model call at all (not
+// even the in-browser one Ask/Orient uses) - a per-recording summary is
+// well within reach of plain extractive scoring, so it doesn't need one.
+// Frequency-based extractive scoring (the same family as TextRank/Luhn's
+// algorithm): count which non-stopword, non-filler words repeat most
+// across the whole transcript, score each line by how many DISTINCT such
+// words it contains (normalized by its own distinct-word count so a line
+// repeating one word several times doesn't inflate its own score), then
+// keep the highest-scoring lines in their original order.
+const STOPWORDS = new Set([
+  "the", "and", "for", "with", "are", "was", "were", "will", "what", "who",
+  "when", "where", "why", "how", "all", "any", "can", "did", "does", "not",
+  "should", "would", "could", "this", "that", "from", "have", "has", "had",
+  "you", "your", "our", "their", "its", "his", "her", "them", "they", "about",
+  "into", "over", "under", "than", "then", "there", "here", "some", "more",
+  "most", "such", "each", "both", "just", "also", "get", "got", "give",
+]);
+const SPOKEN_FILLER_WORDS = new Set([
+  "yeah", "sure", "okay", "right", "like", "just", "well", "really",
+  "actually", "basically", "kind", "sort", "gonna", "wanna", "hmm", "umm",
+  "hello", "thanks", "thank",
+]);
+
+function lineWords(line) {
+  const words = (line.match(/[a-zA-Z']+/g) || []).map((w) => w.toLowerCase());
+  return new Set(words.filter((w) => w.length >= 4 && !STOPWORDS.has(w) && !SPOKEN_FILLER_WORDS.has(w)));
+}
+
+function buildMeetingSummary(text) {
+  const lines = (text || "").split("\n").map((l) => l.trim()).filter(Boolean);
+  if (lines.length === 0) {
+    return "No summarizable content found - this transcript is empty.";
+  }
+
+  const lineSets = lines.map(lineWords);
+  const wordCounts = {};
+  for (const words of lineSets) {
+    for (const w of words) wordCounts[w] = (wordCounts[w] || 0) + 1;
+  }
+  const scores = lineSets.map((words) => {
+    if (words.size === 0) return 0;
+    let sum = 0;
+    for (const w of words) sum += wordCounts[w];
+    return sum / words.size;
+  });
+
+  const topN = Math.min(4, lines.length);
+  const topIndices = scores
+    .map((score, i) => [score, i])
+    .sort((a, b) => b[0] - a[0])
+    .slice(0, topN)
+    .map(([, i]) => i)
+    .filter((i) => scores[i] > 0)
+    .sort((a, b) => a - b);
+
+  if (topIndices.length === 0) {
+    return "No summarizable content found - no lines with distinctive enough wording to extract highlights from.";
+  }
+  return "**Highlights:**\n" + topIndices.map((i) => `- ${lines[i]}`).join("\n");
+}
+
 // GitHub Pages is static, so this adapter keeps the ZIP's fixture behavior in
 // the browser and runs only Ask/Orient through the local browser model.
 export const API_BASE = "";
@@ -822,26 +884,22 @@ export const api = {
     const ev = store.recordingEvents.find((e) => e.id === Number(eventId));
     return { text: ev?.transcript_text || "" };
   },
-  // Generate Summary - the one action here that is a REAL model call (see
-  // this file's header comment on AI-shaped features), not the fake wait()
-  // pattern every other mock above uses. Reuses the exact same in-browser
-  // SmolLM2 model/worker Ask/Orient already runs (see localModel.js and
-  // liveAnswer() above) - the transcript text stands in for "project
-  // context" and the instruction below stands in for the "question", so
-  // the worker's existing prompt format needs no changes. onProgress is the
-  // same progress_callback plumbing localModel.js already exposes; the
-  // caller renders it as the model's first-use download state.
-  generateRecordingSummary: async (eventId, onProgress) => {
+  // Generate Summary - deterministic code, not a model call (previously
+  // ran the real in-browser SmolLM2 model; rebuilt per an explicit
+  // correction, 29 Sep: "you are using too much llm... focus on codded
+  // thing rather than using llm - llm is for tuff works which is
+  // imposible to code" - see buildMeetingSummary above, ported from the
+  // real app's core/extraction.py::build_meeting_summary). onProgress is
+  // accepted (unused) only so the caller doesn't need updating.
+  generateRecordingSummary: async (eventId, _onProgress) => {
+    await wait();
     const ev = store.recordingEvents.find((e) => e.id === Number(eventId));
     if (!ev) throw new Error("404 Not Found: no such recording in this demo");
     const text = (ev.transcript_text || "").trim();
     if (!text) {
       throw new Error("This recording has no transcript text captured in this demo, so there is nothing to summarize.");
     }
-    const instruction =
-      "Summarize this meeting transcript in 2-3 short sentences. Mention concrete decisions or next steps only if the transcript actually states them.";
-    const summary = await generateDemoAnswer(instruction, onProgress, text);
-    ev.meeting_summary = summary;
+    ev.meeting_summary = buildMeetingSummary(text);
     ev.summary_generated_at = new Date().toISOString();
     return { ...ev };
   },
