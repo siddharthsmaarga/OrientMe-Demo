@@ -2,9 +2,11 @@
 
 import { Suspense, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
-import Image from "next/image";
 import Link from "next/link";
 import { api } from "../lib/api";
+
+// GitHub Pages serves this app under /OrientMe-Demo/ (see next.config.mjs).
+const BASE_PATH = process.env.NEXT_PUBLIC_BASE_PATH || "";
 
 function ResetPasswordForm() {
   const router = useRouter();
@@ -47,7 +49,7 @@ function ResetPasswordForm() {
     <div className="min-h-screen flex items-center justify-center bg-cream px-4">
       <div className="w-full max-w-sm">
         <div className="flex items-center justify-center gap-2 mb-8">
-          <Image src="/logo-icon.png" alt="" width={32} height={32} />
+          <img src={`${BASE_PATH}/logo-icon.png`} alt="" width={32} height={32} />
           <span className="text-xl font-extrabold tracking-tight">
             <span className="text-[#1a1a1a]">Orient</span>
             <span className="text-teal">Me</span>

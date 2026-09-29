@@ -1,11 +1,16 @@
 "use client";
 
-import Image from "next/image";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import { api } from "../lib/api";
 import { useAuth } from "../lib/AuthContext";
+
+// GitHub Pages serves this app under /OrientMe-Demo/ (see next.config.mjs),
+// so any static asset referenced by an absolute "/..." path needs this
+// prefix or it 404s against the domain root instead of the actual deploy
+// path - same fix already applied in app/page.js.
+const BASE_PATH = process.env.NEXT_PUBLIC_BASE_PATH || "";
 
 // Each item gets its own solid brand-colored square "logo tile" instead of
 // a thin stroke icon - matches the demo's multi-accent palette (cyan/
@@ -74,7 +79,7 @@ export default function Sidebar() {
         href="/dashboard"
         className="flex items-center gap-2 px-2 pb-4 mb-2 border-b border-border-warm"
       >
-        <Image src="/logo-icon.png" alt="" width={28} height={28} className="shrink-0" />
+        <img src={`${BASE_PATH}/logo-icon.png`} alt="" width={28} height={28} className="shrink-0" />
         <span className="text-[16px] font-extrabold tracking-tight">
           <span className="text-[#1a1a1a]">Orient</span>
           <span className="text-teal">Me</span>
