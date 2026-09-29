@@ -1584,7 +1584,7 @@ function ContextBriefPanel({
                 ) : (
                   <a
                     key={l.label}
-                    href={l.href}
+                    href={`${process.env.NEXT_PUBLIC_BASE_PATH || ""}${l.href}`}
                     target={l.external ? "_blank" : undefined}
                     rel={l.external ? "noreferrer" : undefined}
                     className="text-xs px-2.5 py-1 rounded-full border border-slate-200 bg-white text-slate-600 hover:border-brand hover:text-brand transition-colors"
