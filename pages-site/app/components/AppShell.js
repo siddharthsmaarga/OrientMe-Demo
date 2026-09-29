@@ -9,12 +9,20 @@ function Guarded({ children }) {
   const { user, loading } = useAuth();
   const pathname = usePathname();
 
-  // The public search page ("/") renders standalone, same as the real app.
-  // There's no login screen in this static demo build - AuthContext always
-  // returns a logged-in demo user.
-  if (pathname === "/") return children;
+  // The login page and the public search page ("/") render standalone - no
+  // sidebar/search chrome for a logged-out person to see. Everything else
+  // is the admin console and needs a real session.
+  if (pathname === "/login" || pathname === "/") return children;
 
-  if (loading || !user) return null;
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center h-screen text-slate-400 text-sm">
+        Loading…
+      </div>
+    );
+  }
+
+  if (!user) return null;
 
   return (
     <div className="flex min-h-full">
@@ -30,6 +38,11 @@ function Guarded({ children }) {
           backgroundAttachment: "fixed",
         }}
       >
+        {/* The public build uses fictional fixtures and runs Ask/Orient locally
+            in the visitor's browser; other backend-only actions stay simulated. */}
+        <div className="bg-brand text-white text-xs text-center py-1.5 px-4">
+          Demo mode — fictional sample data. Ask/Orient runs a small model in this browser; uploads and integrations are simulations.
+        </div>
         {children}
       </main>
     </div>

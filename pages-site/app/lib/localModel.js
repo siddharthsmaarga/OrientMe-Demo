@@ -31,12 +31,12 @@ function getWorker() {
   return worker;
 }
 
-export function generateDemoAnswer(question, onProgress) {
+export function generateDemoAnswer(question, onProgress, context) {
   return new Promise((resolve, reject) => {
     const id = nextRequestId++;
     try {
       pending.set(id, { resolve, reject, onProgress });
-      getWorker().postMessage({ id, question });
+      getWorker().postMessage({ id, question, context });
     } catch (error) {
       pending.delete(id);
       reject(error);

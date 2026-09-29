@@ -3,7 +3,6 @@
 import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { api } from "../lib/api";
-import { topicHref } from "../lib/paths";
 
 // Universal search - Ctrl+K (Cmd+K on Mac), invoked from anywhere in the
 // app. Mounted once in the root layout, not per-page, so the shortcut works
@@ -90,10 +89,10 @@ export default function CommandPalette() {
 
   function go(item) {
     setOpen(false);
-    if (item.kind === "project") router.push(topicHref(item.id));
-    else if (item.kind === "stakeholder") router.push(topicHref(item.topic_id));
-    else if (item.kind === "task") router.push(topicHref(item.topic_id));
-    else if (item.kind === "file") router.push(topicHref(item.topic_id));
+    if (item.kind === "project") router.push(`/topics/?id=${encodeURIComponent(item.id)}`);
+    else if (item.kind === "stakeholder") router.push(`/topics/?id=${encodeURIComponent(item.topic_id)}`);
+    else if (item.kind === "task") router.push(`/topics/?id=${encodeURIComponent(item.topic_id)}`);
+    else if (item.kind === "file") router.push(`/topics/?id=${encodeURIComponent(item.topic_id)}`);
   }
 
   function handleInputKeyDown(e) {

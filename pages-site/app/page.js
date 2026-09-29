@@ -5,26 +5,30 @@ import { useState } from "react";
 import { api } from "./lib/api";
 import { TYPE_LABELS } from "./lib/format";
 
-// Public search front door; answers run through a small local browser model over fictional demo data.
+const BASE_PATH = process.env.NEXT_PUBLIC_BASE_PATH || "";
+
+// The public front door - no login required. Regular employees land here
+// and only here: one search bar, type a natural-language request ("what's
+// the status of Acme Rebrand"), get back a model-generated answer. This
+// replaced the old chat-first home page after it moved to /dashboard as the
+// admin-only project console (create/edit/ingest/settings still require
+// real login - see AppShell's Guarded component).
 export default function PublicOrient() {
   const [query, setQuery] = useState("");
   const [state, setState] = useState("idle"); // idle | loading | result | error
   const [result, setResult] = useState(null);
   const [error, setError] = useState(null);
-  const [modelProgress, setModelProgress] = useState(null);
 
   async function runSearch(text, topicId) {
     setState("loading");
     setError(null);
-    setModelProgress(null);
     try {
-      const data = await api.orient(text, topicId, setModelProgress);
+      const data = await api.orient(text, topicId);
       setResult(data);
       setState("result");
     } catch (e) {
       setError(e.message);
       setState("error");
-      setModelProgress(null);
     }
   }
 
@@ -43,7 +47,6 @@ export default function PublicOrient() {
     setState("idle");
     setResult(null);
     setError(null);
-    setModelProgress(null);
   }
 
   return (
@@ -53,7 +56,7 @@ export default function PublicOrient() {
       </Link>
 
       <div className="flex items-center gap-2 mb-10">
-        <img src={`${process.env.NEXT_PUBLIC_BASE_PATH || ""}/logo-icon.png`} alt="" width={36} height={36} />
+        <img src={`${BASE_PATH}/logo-icon.png`} alt="" width={36} height={36} />
         <span className="text-2xl font-extrabold tracking-tight">
           <span className="text-[#1a1a1a]">Orient</span>
           <span className="text-teal">Me</span>
@@ -71,13 +74,7 @@ export default function PublicOrient() {
             className="flex-1 text-base outline-none placeholder:text-slate-400 bg-transparent"
           />
           {state === "loading" ? (
-            <span className="text-xs text-slate-400 shrink-0">
-              {modelProgress?.status === "progress" && Number.isFinite(modelProgress.progress)
-                ? `Loading model ${Math.round(modelProgress.progress)}%…`
-                : modelProgress?.status === "fallback"
-                  ? "Switching to CPU…"
-                  : "Generating locally…"}
-            </span>
+            <span className="text-xs text-slate-400 shrink-0">Searching…</span>
           ) : (
             <button
               type="submit"
@@ -89,14 +86,10 @@ export default function PublicOrient() {
         </div>
       </form>
 
-      <p className="w-full max-w-2xl mt-3 text-center text-xs text-slate-400">
-        Experimental 360M-parameter local model. First use downloads about 273 MB (GPU) or 388 MB (CPU fallback) from Hugging Face. Questions stay in this browser; answers use fictional sample data only and may be inaccurate.
-      </p>
-
       <div className="w-full max-w-2xl mt-6">
         {state === "error" && (
           <div className="rounded-lg bg-red-50 border border-red-200 text-red-700 text-sm px-4 py-3">
-            Couldn&apos;t generate a demo answer: {error}
+            Couldn&apos;t reach OrientMe: {error}
           </div>
         )}
 
@@ -137,8 +130,7 @@ export default function PublicOrient() {
 
         {state === "idle" && (
           <p className="text-center text-sm text-slate-400 mt-4">
-            Try: &ldquo;what is the current status of the Harborline planning example?&rdquo; or
-            &ldquo;what should the team review next?&rdquo;
+            Try: &ldquo;what&apos;s the status of Acme Rebrand&rdquo; or &ldquo;what is the next step for Meridian Onboarding?&rdquo;
           </p>
         )}
       </div>
@@ -161,7 +153,7 @@ function MatchedResult({ result, onReset }) {
           New search
         </button>
       </div>
-      {answer?.generation_note && (
+      {!answer?.is_llm && answer?.generation_note && (
         <p className="text-xs text-amber-600 bg-amber-50 border border-amber-200 rounded px-3 py-2 mb-3">
           {answer.generation_note}
         </p>

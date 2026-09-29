@@ -1,9 +1,14 @@
 @import "tailwindcss";
 
-/* Keep the supplied light theme and brand palette consistent across the
-   static demo's dashboard, project details, calendar, and task board. */
+/* Fixed light theme, deliberately not adaptive to OS dark mode - the
+   reference products (Read.ai, Sybill) are both clean, light, minimal
+   SaaS UIs, and that's the look this app should always have regardless
+   of the viewer's system theme.
+
+   Palette uses the OrientMe demo's purple/teal/cream brand tokens while
+   retaining the frontend's existing Tailwind implementation. */
 :root {
-  --background: #faf9ed;
+  --background: #fdfbf4;
   --foreground: #1a1a1a;
 }
 
@@ -13,16 +18,18 @@
   --font-sans: var(--font-open-sans);
   --font-mono: var(--font-geist-mono);
 
-  --color-brand: #662984;
-  --color-brand-dark: #4e1f65;
-  --color-teal: #0096af;
-  --color-teal-dark: #028c8c;
-  --color-teal-tint: #e8f7f7;
-  --color-teal-tint-strong: #d0eeee;
-  --color-cream: #faf9ed;
-  --color-border-warm: #e3e0d8;
-  --color-accent-green: #96c800;
-  --color-accent-orange: #d0811c;
+  --color-brand: #7A2E9E;
+  --color-brand-dark: #59237A;
+  --color-brand-tint: #F6ECFB;
+  --color-teal: #00A6C0;
+  --color-teal-dark: #027488;
+  --color-teal-tint: #E3F7F9;
+  --color-teal-tint-strong: #BFEEF2;
+  --color-cream: #FDFBF4;
+  --color-border-warm: #DAD2C0;
+  --color-accent-green: #7FB800;
+  --color-accent-orange: #C96A0C;
+  --color-ink-muted: #71685A;
 }
 
 html {

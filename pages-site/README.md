@@ -2,7 +2,7 @@
 
 This is the public, static frontend demo served from GitHub Pages:
 
-<https://siddharthsmaarga.github.io/OrientMe-Demo/>
+This site is published from the repository's GitHub Pages configuration.
 
 ## Run locally
 
@@ -15,9 +15,11 @@ npm run dev
 
 The `Deploy OrientMe static demo to GitHub Pages` workflow builds this app and deploys it only after changes reach the repository's `main` branch. The build exports static files to `out/` under the `/OrientMe-Demo/` base path.
 
-## Static demo limits
+## Static demo behavior and limits
 
-- Projects created with the manual form are stored in this browser only. They do not sync to other people or devices; use fictional information in this public demo.
-- Folder scanning, file imports, backend APIs, account management, and AI-generated briefs are unavailable on GitHub Pages.
-- Questions about the included fictional sample project run with SmolLM2-360M-Instruct in the visitor's browser using Transformers.js. Its first use downloads about 273 MB of GPU weights or 388 MB for the CPU fallback from Hugging Face; model files are cached by the browser. The question and generated answer stay on the device. Do not enter private or real customer information into this public demo.
-- The model is intentionally small and can produce inaccurate answers. Treat responses as experimental and verify important details. The model sees only the fictional sample project, not projects created in the browser.
+- The frontend uses the supplied fictional sample records. Tasks, commitments, decisions, and risks can be changed during a session; those fixture edits reset on refresh.
+- Projects created with the manual form are stored in this browser only. They do not sync to other people or devices. Use fictional information in this public demo.
+- Folder scanning, file imports, external integrations, account services, and backend workflows are not connected on GitHub Pages. Their controls show demo behavior and do not upload files or contact business systems.
+- Ask/Orient on the supplied sample projects runs SmolLM2-360M-Instruct in the visitor's browser using Transformers.js. Its first use downloads model files from Hugging Face; the browser caches them. The question and generated answer are processed on the device. Do not enter private or real customer information into this public demo.
+- Browser-created projects have no source material, so the model is not called for those projects. They remain usable as project records and can be deleted locally.
+- The model is intentionally small and can produce inaccurate answers. Treat responses as experimental and verify important details.
