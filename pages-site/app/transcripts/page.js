@@ -5,7 +5,7 @@ import { useEffect, useState } from "react";
 import { api } from "../lib/api";
 import { formatAdded, TYPE_LABELS } from "../lib/format";
 
-const STATUS_STYLES = {
+export const STATUS_STYLES = {
   routed: { label: "Routed", bg: "bg-teal-tint", text: "text-teal-dark" },
   auto_created: { label: "New project created", bg: "bg-brand-tint", text: "text-brand-dark" },
   needs_review: { label: "Needs review", bg: "bg-amber-50", text: "text-amber-700" },
@@ -196,9 +196,13 @@ export default function TranscriptsPage() {
               return (
                 <div key={ev.id} className="rounded-lg border border-border-warm bg-white px-4 py-2.5 flex items-center justify-between gap-3">
                   <div className="min-w-0">
-                    <p className="text-sm font-medium text-[#1a1a1a] truncate" title={ev.file_name}>
+                    <Link
+                      href={`/transcripts/${ev.id}`}
+                      className="text-sm font-medium text-[#1a1a1a] hover:text-teal-dark hover:underline truncate block"
+                      title={ev.file_name}
+                    >
                       {ev.file_name}
-                    </p>
+                    </Link>
                     <p className="text-xs text-ink-muted mt-0.5">{formatAdded(ev.detected_at)}</p>
                   </div>
                   <span className={`shrink-0 text-[11px] font-semibold px-2 py-1 rounded-full ${style.bg} ${style.text}`}>
@@ -240,9 +244,13 @@ export default function TranscriptsPage() {
               <div key={ev.id} className="rounded-lg border border-border-warm bg-white px-4 py-3">
                 <div className="flex items-start justify-between gap-3">
                   <div className="min-w-0">
-                    <p className="text-sm font-medium text-[#1a1a1a] truncate" title={ev.file_name}>
+                    <Link
+                      href={`/transcripts/${ev.id}`}
+                      className="text-sm font-medium text-[#1a1a1a] hover:text-teal-dark hover:underline truncate block"
+                      title={ev.file_name}
+                    >
                       {ev.file_name}
-                    </p>
+                    </Link>
                     <p className="text-xs text-ink-muted mt-0.5">{formatAdded(ev.detected_at)}</p>
                   </div>
                   <span className={`shrink-0 text-[11px] font-semibold px-2 py-1 rounded-full ${style.bg} ${style.text}`}>

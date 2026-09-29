@@ -416,6 +416,11 @@ function buildInitialState() {
   // pipeline) - illustrates all four real outcomes (routed, awaiting a
   // new-project decision, needs manual review, pre-existing/not processed)
   // without a live watcher, transcription engine, or LLM router behind it.
+  // transcript_text is fictional sample content for the /transcripts/[id]
+  // detail page; meeting_summary/summary_generated_at mirror the real app's
+  // schema and start empty - a summary is only ever written by a person
+  // clicking "Generate Summary" (see api.js's generateRecordingSummary),
+  // never generated automatically.
   const recordingEvents = [
     {
       id: 1,
@@ -431,6 +436,10 @@ function buildInitialState() {
       suggested_topic_name: "",
       suggested_topic_one_liner: "",
       suggested_topic_type: "",
+      transcript_text:
+        "Jordan Lee: Quick update from my side — the extra logo lockup variant is basically done, I'll drop it in the shared folder tonight.\nPriya Nair: Good, because design sign-off is blocked on it. Any word from legal on the trademark check for the warm-neutral palette?\nJordan Lee: Not yet. I followed up again yesterday.\nSam Ortiz: I can start wiring the new wordmark into the marketing site footer in parallel, that doesn't need to wait on legal.\nPriya Nair: Do that. I'll chase legal again today and flag it as blocking if I don't hear back by Friday.\nJordan Lee: Sounds good. Once the variant's in, we should be ready for the next design review.\nSam Ortiz: Agreed — let's target early next week for that.",
+      meeting_summary: "",
+      summary_generated_at: null,
     },
     {
       id: 2,
@@ -446,6 +455,10 @@ function buildInitialState() {
       suggested_topic_name: "",
       suggested_topic_one_liner: "",
       suggested_topic_type: "",
+      transcript_text:
+        "Taylor Brooks: Where are we on the data-import formatting issue? It's been open a few days past the original date.\nMorgan Diaz: Almost there — I found the root cause, a date field Meridian's export uses a different format than we expect. The corrected template is ready, I'll send it today.\nTaylor Brooks: Great, that'll unblock their import. Can we also lock the 30-day check-in call this week?\nMorgan Diaz: Yes, I'll send a few time options. Friday afternoon works on my end.\nTaylor Brooks: Friday works for me too. I'll loop in their team lead once we have a firm time.\nMorgan Diaz: Perfect, I'll follow up after I send the template.",
+      meeting_summary: "",
+      summary_generated_at: null,
     },
     {
       id: 3,
@@ -461,6 +474,10 @@ function buildInitialState() {
       suggested_topic_name: "Q4 Vendor Security Review",
       suggested_topic_one_liner: "A one-time audit of third-party vendor access ahead of the Q4 compliance deadline.",
       suggested_topic_type: "project",
+      transcript_text:
+        "Dana Okafor: Thanks for jumping on short notice — we need to scope the Q4 vendor security review before the compliance deadline.\nRiley Chen: From procurement's side, we've got twelve active vendors with system access that haven't been re-reviewed this year.\nCasey Lindqvist: IT can pull access logs for all twelve, but we should prioritize the ones with write access to production data first.\nDana Okafor: Agreed. Let's treat this as its own project rather than folding it into an existing one — it has a hard deadline and a distinct scope.\nRiley Chen: Makes sense. I'll get the vendor list over to Casey by tomorrow.\nCasey Lindqvist: I'll start pulling logs as soon as I have it. Let's check back in a week.",
+      meeting_summary: "",
+      summary_generated_at: null,
     },
     {
       id: 4,
@@ -476,6 +493,10 @@ function buildInitialState() {
       suggested_topic_name: "",
       suggested_topic_one_liner: "",
       suggested_topic_type: "",
+      transcript_text:
+        "Alex: Hey, good to catch up — it's been a while since we just talked without an agenda.\nDemo Admin: Yeah, things have been busy. How was the trip you mentioned last time?\nAlex: Really good, actually — took a few extra days off, barely looked at email.\nDemo Admin: Good, you needed that. Anything new on your end work-wise, or are we just talking weekend plans?\nAlex: Mostly just weekend plans, honestly — thinking about finally trying that new place downtown. Want to grab lunch sometime next week?\nDemo Admin: Sure, let's find a day. No real work topics here, just good to reconnect.",
+      meeting_summary: "",
+      summary_generated_at: null,
     },
     {
       id: 5,
@@ -491,6 +512,10 @@ function buildInitialState() {
       suggested_topic_name: "",
       suggested_topic_one_liner: "",
       suggested_topic_type: "",
+      transcript_text:
+        "CEO: Thanks everyone for joining the Q2 all-hands. Overall the quarter came in roughly on plan — revenue was up modestly versus Q1, and we closed a couple of the larger deals we'd been tracking.\nHead of Product: On the product side, the main roadmap items shipped close to schedule. We're prioritizing performance work next quarter based on customer feedback.\nHead of People: Hiring is on track against plan — a few open roles in engineering and support are still in process.\nCEO: Good to hear. Let's keep the momentum into Q3. Any questions from the floor before we wrap?\nEmployee: Just a quick one — will the roadmap doc be shared afterward?\nHead of Product: Yes, I'll post it right after this call.",
+      meeting_summary: "",
+      summary_generated_at: null,
     },
     {
       id: 6,
@@ -506,6 +531,10 @@ function buildInitialState() {
       suggested_topic_name: "",
       suggested_topic_one_liner: "",
       suggested_topic_type: "",
+      transcript_text:
+        "Founder A: Before we get into the roadmap, let's touch on the fundraising timeline — where do things stand?\nFounder B: A few conversations are progressing, nothing signed yet. I'd guess we're still a couple of months out from closing anything.\nFounder A: Okay, let's plan around that rather than counting on it landing sooner. On product, I think we should hold the line on the current roadmap rather than chasing the new feature request from last week.\nFounder B: Agreed — spreading thin this early would hurt more than it helps. Let's revisit priorities once we have more runway visibility.\nFounder A: Sounds right. Let's check back on both fronts in two weeks.",
+      meeting_summary: "",
+      summary_generated_at: null,
     },
   ];
 

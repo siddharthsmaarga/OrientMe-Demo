@@ -809,6 +809,64 @@ export const api = {
     }
     return ev;
   },
+  // Transcript detail page (/transcripts/[id]) - one recording's full text
+  // plus the three actions below.
+  getRecordingEvent: async (eventId) => {
+    await wait(150);
+    const ev = store.recordingEvents.find((e) => e.id === Number(eventId));
+    if (!ev) throw new Error("404 Not Found: no such recording in this demo");
+    return { ...ev };
+  },
+  getRecordingEventText: async (eventId) => {
+    await wait(150);
+    const ev = store.recordingEvents.find((e) => e.id === Number(eventId));
+    return { text: ev?.transcript_text || "" };
+  },
+  // Generate Summary - the one action here that is a REAL model call (see
+  // this file's header comment on AI-shaped features), not the fake wait()
+  // pattern every other mock above uses. Reuses the exact same in-browser
+  // SmolLM2 model/worker Ask/Orient already runs (see localModel.js and
+  // liveAnswer() above) - the transcript text stands in for "project
+  // context" and the instruction below stands in for the "question", so
+  // the worker's existing prompt format needs no changes. onProgress is the
+  // same progress_callback plumbing localModel.js already exposes; the
+  // caller renders it as the model's first-use download state.
+  generateRecordingSummary: async (eventId, onProgress) => {
+    const ev = store.recordingEvents.find((e) => e.id === Number(eventId));
+    if (!ev) throw new Error("404 Not Found: no such recording in this demo");
+    const text = (ev.transcript_text || "").trim();
+    if (!text) {
+      throw new Error("This recording has no transcript text captured in this demo, so there is nothing to summarize.");
+    }
+    const instruction =
+      "Summarize this meeting transcript in 2-3 short sentences. Mention concrete decisions or next steps only if the transcript actually states them.";
+    const summary = await generateDemoAnswer(instruction, onProgress, text);
+    ev.meeting_summary = summary;
+    ev.summary_generated_at = new Date().toISOString();
+    return { ...ev };
+  },
+  // Diarize - this static demo has no diarization engine at all: no
+  // external service, no backend, no bundled speaker-ID model. Honest
+  // no-op response rather than a faked result (same rule as this file's
+  // header comment for every other AI-shaped mock).
+  diarizeRecording: async (eventId) => {
+    await wait();
+    return {
+      identified_speakers: false,
+      message:
+        "This demo has no diarization engine connected — speaker identification isn't available here. In the full app, this re-runs transcription against a configured external tool.",
+    };
+  },
+  // Save - generateRecordingSummary() above already wrote the summary into
+  // the fixture store, so this just confirms that (fixture-store-only,
+  // resets on refresh - see README). It exists mainly for UI parity with
+  // the real app's save button, not because there's real work left to do.
+  saveRecordingSummary: async (eventId) => {
+    await wait();
+    const ev = store.recordingEvents.find((e) => e.id === Number(eventId));
+    if (!ev) throw new Error("404 Not Found: no such recording in this demo");
+    return { saved: true, summary_generated_at: ev.summary_generated_at };
+  },
   search: async (q) => {
     await wait(150);
     const lowered = q.toLowerCase();
