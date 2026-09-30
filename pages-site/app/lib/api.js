@@ -903,17 +903,52 @@ export const api = {
     ev.summary_generated_at = new Date().toISOString();
     return { ...ev };
   },
-  // Diarize - this static demo has no diarization engine at all: no
-  // external service, no backend, no bundled speaker-ID model. Honest
-  // no-op response rather than a faked result (same rule as this file's
-  // header comment for every other AI-shaped mock).
+  // Diarize - the real app asks a local LLM to turn the raw transcript into
+  // a structured participants/decisions/action-items/parked-items/per-
+  // speaker breakdown (core/recordings.py's diarize_event). This static
+  // demo has no LLM behind it at all, so rather than fake a live call, a
+  // couple of sample recordings ship with a realistic PRE-BAKED result
+  // (fixtures.js's diarization_result, in the exact markdown shape the real
+  // app's _render_diarization_markdown produces) - clicking Diarize on one
+  // of those just reveals it. Anything without one gets an honest
+  // not-available message instead of an error, same as the real app's own
+  // "Ollama isn't reachable" graceful-fallback convention.
   diarizeRecording: async (eventId) => {
-    await wait();
-    return {
-      identified_speakers: false,
-      message:
-        "This demo has no diarization engine connected — speaker identification isn't available here. In the full app, this re-runs transcription against a configured external tool.",
-    };
+    await wait(400);
+    const ev = store.recordingEvents.find((e) => e.id === Number(eventId));
+    if (!ev) throw new Error("404 Not Found: no such recording in this demo");
+    if (!ev.diarization_result) {
+      return {
+        ...ev,
+        succeeded: false,
+        message:
+          "No pre-built Diarize breakdown is available for this recording in this demo — try the Acme Rebrand Weekly Sync or Vendor Security Review Kickoff recordings, which do.",
+      };
+    }
+    ev.diarization_generated_at = new Date().toISOString();
+    return { ...ev, succeeded: true, message: "Diarization complete." };
+  },
+  // Generate Transcript - the real app groups the transcript's own real
+  // timestamped lines by speaker (core/recordings.py's
+  // generate_speaker_transcript) - every timestamp and word is real, only
+  // the speaker label is inferred. This demo mirrors that with pre-baked
+  // fixtures.js's speaker_transcript (same [MM:SS] Speaker: text shape),
+  // rather than a live call. Same honest not-available fallback as Diarize
+  // above when a recording has no pre-baked speaker transcript.
+  generateSpeakerTranscript: async (eventId) => {
+    await wait(400);
+    const ev = store.recordingEvents.find((e) => e.id === Number(eventId));
+    if (!ev) throw new Error("404 Not Found: no such recording in this demo");
+    if (!ev.speaker_transcript) {
+      return {
+        ...ev,
+        succeeded: false,
+        message:
+          "No pre-built speaker transcript is available for this recording in this demo — try the Acme Rebrand Weekly Sync or Vendor Security Review Kickoff recordings, which do.",
+      };
+    }
+    ev.speaker_transcript_generated_at = new Date().toISOString();
+    return { ...ev, succeeded: true, message: "Transcript generated." };
   },
   // Save - generateRecordingSummary() above already wrote the summary into
   // the fixture store, so this just confirms that (fixture-store-only,

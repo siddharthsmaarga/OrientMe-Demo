@@ -16,6 +16,18 @@ export function formatAdded(iso) {
   });
 }
 
+// The real meeting date for a RecordingEvent, never detected_at - fixes a
+// real, reported bug: detected_at is only ever when this app's watcher
+// happened to notice the file (can be days later for anything synced from
+// OneDrive, or the same single backfill timestamp for every 'pre_existing'
+// row) - recording_date is the real one, parsed from the Teams filename or
+// the file's own mtime. Only falls back to detected_at for rows that have
+// neither (see fixtures.js's recordingEvents for how this demo bakes that
+// in).
+export function recordingDisplayDate(ev) {
+  return ev?.recording_date || ev?.detected_at;
+}
+
 export function formatMeetingDate(iso) {
   if (!iso) return "";
   const d = new Date(String(iso) + "T00:00:00");

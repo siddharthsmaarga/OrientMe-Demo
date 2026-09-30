@@ -22,6 +22,27 @@ function isoDaysAgo(n) {
   return d.toISOString();
 }
 
+// Parses the real meeting date out of a Teams-style recording filename
+// ("...-YYYYMMDD_HHMMSSutc-...") - mirrors the real app's own
+// ingestion._TEAMS_FILENAME_RE / core/recordings.py::_resolve_recording_date,
+// just baked once per fixture below instead of computed from a real file on
+// disk. This is the fix for a real, reported bug: this app's watcher only
+// ever recorded detected_at (when it happened to notice the file), never
+// the real meeting date - for anything bulk-classified as "pre_existing"
+// when the watcher first turned on, every recording showed the exact same
+// wrong date. recording_date below is the real one; detected_at is left
+// alone so the difference between the two is visible in this demo, same as
+// it was in the real bug. Returns null when the filename has no such stamp
+// (e.g. a random file dropped in the manual-drop folder) - recordingDisplayDate
+// (lib/format.js) falls back to detected_at in that case, same as the real
+// app's own fallback.
+function teamsFilenameDate(filePath) {
+  const m = /(\d{8})_(\d{6})UTC/i.exec(filePath);
+  if (!m) return null;
+  const [, ymd, hms] = m;
+  return `${ymd.slice(0, 4)}-${ymd.slice(4, 6)}-${ymd.slice(6, 8)}T${hms.slice(0, 2)}:${hms.slice(2, 4)}:${hms.slice(4, 6)}.000Z`;
+}
+
 export const DEMO_USER = {
   authenticated: true,
   username: "demo",
@@ -427,6 +448,8 @@ function buildInitialState() {
       file_path: "Acme Rebrand Weekly Sync-20260922_140000UTC-Meeting Recording.mp4",
       file_name: "Acme Rebrand Weekly Sync-20260922_140000UTC-Meeting Recording.mp4",
       detected_at: isoDaysAgo(7),
+      recording_date: teamsFilenameDate("Acme Rebrand Weekly Sync-20260922_140000UTC-Meeting Recording.mp4"),
+      source: "watched_folder",
       topic: 1,
       topic_name: "Acme Rebrand",
       ingested_file: null,
@@ -440,12 +463,27 @@ function buildInitialState() {
         "Jordan Lee: Quick update from my side — the extra logo lockup variant is basically done, I'll drop it in the shared folder tonight.\nPriya Nair: Good, because design sign-off is blocked on it. Any word from legal on the trademark check for the warm-neutral palette?\nJordan Lee: Not yet. I followed up again yesterday.\nSam Ortiz: I can start wiring the new wordmark into the marketing site footer in parallel, that doesn't need to wait on legal.\nPriya Nair: Do that. I'll chase legal again today and flag it as blocking if I don't hear back by Friday.\nJordan Lee: Sounds good. Once the variant's in, we should be ready for the next design review.\nSam Ortiz: Agreed — let's target early next week for that.",
       meeting_summary: "",
       summary_generated_at: null,
+      // Pre-baked "Diarize" and "Generate Transcript" output - matches the
+      // real app's on-demand LLM features (core/recordings.py's
+      // diarize_event/generate_speaker_transcript), just computed once here
+      // instead of called live (this static demo has no LLM behind it - see
+      // api.js's diarizeRecording/generateSpeakerTranscript). Content below
+      // is derived straight from this fixture's own transcript_text above,
+      // same "never invent what was said" rule the real feature follows.
+      diarization_result:
+        "# Meeting Summary: Acme Rebrand Weekly Sync-20260922_140000UTC-Meeting Recording\n\n**Meeting Participants:** Jordan Lee, Priya Nair, Sam Ortiz\n\n## Overall Meeting Summary\nThe team gave a quick status update on the Acme rebrand. Jordan Lee reported the extra logo lockup variant is nearly finished, while Priya Nair flagged that design sign-off is still blocked on legal's trademark review of the warm-neutral palette. Sam Ortiz proposed starting the marketing site footer wordmark update in parallel since it doesn't depend on legal's review, and the group agreed to target early next week for the next design review.\n\n## Decision Records\n1. Sam Ortiz will begin wiring the new wordmark into the marketing site footer immediately, without waiting on legal's trademark review. (Rationale: that work isn't blocked by legal sign-off; Decider: Group consensus)\n2. Priya Nair will escalate the trademark check to legal as a blocker if there's no response by Friday. (Rationale: design sign-off cannot proceed without it; Decider: Priya Nair)\n\n## Action Items\n1. Owner: Jordan Lee — Finish the extra logo lockup variant and drop it in the shared folder. (Deadline: tonight)\n2. Owner: Priya Nair — Follow up with legal on the trademark check for the warm-neutral palette and escalate if unresolved. (Deadline: Friday)\n3. Owner: Sam Ortiz — Start wiring the new wordmark into the marketing site footer.\n4. Owner: Unassigned — Hold the next Acme design review. (Deadline: early next week)\n\n## Parked Items\n- Broader marketing collateral rollout timing — not discussed this meeting, deferred to a later phase per the original 3-phase plan.\n\n## Per-Speaker Summary\n### Jordan Lee\nGave a status update that the extra logo lockup variant is nearly complete and will be dropped in the shared folder that night. Confirmed a second follow-up with legal on the trademark check is already in motion. Agreed the team should be ready for the next design review once the variant is in.\n\n### Priya Nair\nFlagged that design sign-off remains blocked pending legal's trademark check on the warm-neutral palette. Committed to chasing legal again today and escalating it as a blocker if there's no response by Friday.\n\n### Sam Ortiz\nProposed starting the marketing site footer wordmark update in parallel since it isn't blocked by legal review, and agreed with targeting early next week for the next design review.",
+      diarization_generated_at: null,
+      speaker_transcript:
+        "[00:00] Jordan Lee: Quick update from my side — the extra logo lockup variant is basically done, I'll drop it in the shared folder tonight.\n[00:18] Priya Nair: Good, because design sign-off is blocked on it. Any word from legal on the trademark check for the warm-neutral palette?\n[00:41] Jordan Lee: Not yet. I followed up again yesterday.\n[01:05] Sam Ortiz: I can start wiring the new wordmark into the marketing site footer in parallel, that doesn't need to wait on legal.\n[01:32] Priya Nair: Do that. I'll chase legal again today and flag it as blocking if I don't hear back by Friday.\n[02:01] Jordan Lee: Sounds good. Once the variant's in, we should be ready for the next design review.\n[02:24] Sam Ortiz: Agreed — let's target early next week for that.",
+      speaker_transcript_generated_at: null,
     },
     {
       id: 2,
       file_path: "Meridian Onboarding Call 2-20260920_093000UTC-Meeting Recording.mp4",
       file_name: "Meridian Onboarding Call 2-20260920_093000UTC-Meeting Recording.mp4",
       detected_at: isoDaysAgo(9),
+      recording_date: teamsFilenameDate("Meridian Onboarding Call 2-20260920_093000UTC-Meeting Recording.mp4"),
+      source: "watched_folder",
       topic: 2,
       topic_name: "Meridian Onboarding",
       ingested_file: null,
@@ -459,12 +497,18 @@ function buildInitialState() {
         "Taylor Brooks: Where are we on the data-import formatting issue? It's been open a few days past the original date.\nMorgan Diaz: Almost there — I found the root cause, a date field Meridian's export uses a different format than we expect. The corrected template is ready, I'll send it today.\nTaylor Brooks: Great, that'll unblock their import. Can we also lock the 30-day check-in call this week?\nMorgan Diaz: Yes, I'll send a few time options. Friday afternoon works on my end.\nTaylor Brooks: Friday works for me too. I'll loop in their team lead once we have a firm time.\nMorgan Diaz: Perfect, I'll follow up after I send the template.",
       meeting_summary: "",
       summary_generated_at: null,
+      diarization_result: "",
+      diarization_generated_at: null,
+      speaker_transcript: "",
+      speaker_transcript_generated_at: null,
     },
     {
       id: 3,
       file_path: "Vendor Security Review Kickoff-20260928_110000UTC-Meeting Recording.mp4",
       file_name: "Vendor Security Review Kickoff-20260928_110000UTC-Meeting Recording.mp4",
       detected_at: isoDaysAgo(1),
+      recording_date: teamsFilenameDate("Vendor Security Review Kickoff-20260928_110000UTC-Meeting Recording.mp4"),
+      source: "watched_folder",
       topic: null,
       topic_name: "",
       ingested_file: null,
@@ -478,12 +522,20 @@ function buildInitialState() {
         "Dana Okafor: Thanks for jumping on short notice — we need to scope the Q4 vendor security review before the compliance deadline.\nRiley Chen: From procurement's side, we've got twelve active vendors with system access that haven't been re-reviewed this year.\nCasey Lindqvist: IT can pull access logs for all twelve, but we should prioritize the ones with write access to production data first.\nDana Okafor: Agreed. Let's treat this as its own project rather than folding it into an existing one — it has a hard deadline and a distinct scope.\nRiley Chen: Makes sense. I'll get the vendor list over to Casey by tomorrow.\nCasey Lindqvist: I'll start pulling logs as soon as I have it. Let's check back in a week.",
       meeting_summary: "",
       summary_generated_at: null,
+      diarization_result:
+        "# Meeting Summary: Vendor Security Review Kickoff-20260928_110000UTC-Meeting Recording\n\n**Meeting Participants:** Dana Okafor, Riley Chen, Casey Lindqvist\n\n## Overall Meeting Summary\nThe group kicked off scoping for the Q4 vendor security review ahead of the compliance deadline. Procurement identified twelve active vendors with system access that haven't been re-reviewed this year, and IT agreed to prioritize pulling access logs for vendors with write access to production data first. The team decided to track this as its own standalone project given its hard deadline and distinct scope, with a check-in planned for one week out.\n\n## Decision Records\n1. Track the Q4 vendor security review as its own standalone project rather than folding it into an existing initiative. (Rationale: it has a hard compliance deadline and a distinct scope; Decider: Dana Okafor)\n2. Prioritize pulling access logs for vendors with write access to production data before the rest of the list. (Rationale: those pose the highest risk; Decider: Casey Lindqvist)\n\n## Action Items\n1. Owner: Riley Chen — Send the list of twelve active vendors with system access to Casey. (Deadline: tomorrow)\n2. Owner: Casey Lindqvist — Start pulling access logs for all twelve vendors, prioritizing write-access ones first.\n3. Owner: Unassigned — Reconvene to check progress. (Deadline: in a week)\n\n## Parked Items\nNone found\n\n## Per-Speaker Summary\n### Dana Okafor\nOpened the meeting and framed the need to scope the Q4 vendor security review ahead of the compliance deadline. Proposed tracking it as a standalone project given its hard deadline and distinct scope.\n\n### Riley Chen\nReported that procurement had identified twelve active vendors with system access that haven't been re-reviewed this year, and committed to sending the vendor list to Casey by the next day.\n\n### Casey Lindqvist\nConfirmed IT could pull access logs for all twelve vendors and proposed prioritizing the ones with write access to production data first, then agreed to start as soon as the vendor list arrived.",
+      diarization_generated_at: null,
+      speaker_transcript:
+        "[00:00] Dana Okafor: Thanks for jumping on short notice — we need to scope the Q4 vendor security review before the compliance deadline.\n[00:22] Riley Chen: From procurement's side, we've got twelve active vendors with system access that haven't been re-reviewed this year.\n[00:47] Casey Lindqvist: IT can pull access logs for all twelve, but we should prioritize the ones with write access to production data first.\n[01:10] Dana Okafor: Agreed. Let's treat this as its own project rather than folding it into an existing one — it has a hard deadline and a distinct scope.\n[01:35] Riley Chen: Makes sense. I'll get the vendor list over to Casey by tomorrow.\n[02:00] Casey Lindqvist: I'll start pulling logs as soon as I have it. Let's check back in a week.",
+      speaker_transcript_generated_at: null,
     },
     {
       id: 4,
       file_path: "Coffee Chat with Alex-20260926_163000UTC-Meeting Recording.mp4",
       file_name: "Coffee Chat with Alex-20260926_163000UTC-Meeting Recording.mp4",
       detected_at: isoDaysAgo(3),
+      recording_date: teamsFilenameDate("Coffee Chat with Alex-20260926_163000UTC-Meeting Recording.mp4"),
+      source: "watched_folder",
       topic: null,
       topic_name: "",
       ingested_file: null,
@@ -497,12 +549,24 @@ function buildInitialState() {
         "Alex: Hey, good to catch up — it's been a while since we just talked without an agenda.\nDemo Admin: Yeah, things have been busy. How was the trip you mentioned last time?\nAlex: Really good, actually — took a few extra days off, barely looked at email.\nDemo Admin: Good, you needed that. Anything new on your end work-wise, or are we just talking weekend plans?\nAlex: Mostly just weekend plans, honestly — thinking about finally trying that new place downtown. Want to grab lunch sometime next week?\nDemo Admin: Sure, let's find a day. No real work topics here, just good to reconnect.",
       meeting_summary: "",
       summary_generated_at: null,
+      diarization_result: "",
+      diarization_generated_at: null,
+      speaker_transcript: "",
+      speaker_transcript_generated_at: null,
     },
     {
       id: 5,
       file_path: "Q2 All Hands-20260615_150000UTC-Meeting Recording.mp4",
       file_name: "Q2 All Hands-20260615_150000UTC-Meeting Recording.mp4",
+      // detected_at is the real bug this fixture illustrates: it's when
+      // the watcher was first turned on and bulk-classified every
+      // already-existing recording as "pre_existing", not when the
+      // meeting actually happened - recording_date (below) is the real
+      // date, parsed from the filename, and is deliberately weeks apart
+      // from detected_at here.
       detected_at: isoDaysAgo(105),
+      recording_date: teamsFilenameDate("Q2 All Hands-20260615_150000UTC-Meeting Recording.mp4"),
+      source: "watched_folder",
       topic: null,
       topic_name: "",
       ingested_file: null,
@@ -516,12 +580,18 @@ function buildInitialState() {
         "CEO: Thanks everyone for joining the Q2 all-hands. Overall the quarter came in roughly on plan — revenue was up modestly versus Q1, and we closed a couple of the larger deals we'd been tracking.\nHead of Product: On the product side, the main roadmap items shipped close to schedule. We're prioritizing performance work next quarter based on customer feedback.\nHead of People: Hiring is on track against plan — a few open roles in engineering and support are still in process.\nCEO: Good to hear. Let's keep the momentum into Q3. Any questions from the floor before we wrap?\nEmployee: Just a quick one — will the roadmap doc be shared afterward?\nHead of Product: Yes, I'll post it right after this call.",
       meeting_summary: "",
       summary_generated_at: null,
+      diarization_result: "",
+      diarization_generated_at: null,
+      speaker_transcript: "",
+      speaker_transcript_generated_at: null,
     },
     {
       id: 6,
       file_path: "Founders Sync-20260601_090000UTC-Meeting Recording.mp4",
       file_name: "Founders Sync-20260601_090000UTC-Meeting Recording.mp4",
       detected_at: isoDaysAgo(119),
+      recording_date: teamsFilenameDate("Founders Sync-20260601_090000UTC-Meeting Recording.mp4"),
+      source: "watched_folder",
       topic: null,
       topic_name: "",
       ingested_file: null,
@@ -535,6 +605,71 @@ function buildInitialState() {
         "Founder A: Before we get into the roadmap, let's touch on the fundraising timeline — where do things stand?\nFounder B: A few conversations are progressing, nothing signed yet. I'd guess we're still a couple of months out from closing anything.\nFounder A: Okay, let's plan around that rather than counting on it landing sooner. On product, I think we should hold the line on the current roadmap rather than chasing the new feature request from last week.\nFounder B: Agreed — spreading thin this early would hurt more than it helps. Let's revisit priorities once we have more runway visibility.\nFounder A: Sounds right. Let's check back on both fronts in two weeks.",
       meeting_summary: "",
       summary_generated_at: null,
+      diarization_result: "",
+      diarization_generated_at: null,
+      speaker_transcript: "",
+      speaker_transcript_generated_at: null,
+    },
+    // The manual drop folder - a second, separate folder (distinct from the
+    // watched Recordings folder above) where anyone can drop any file type
+    // to get it quickly tagged to a project by hand. Deliberately never
+    // auto-routed by an LLM (a privacy/architecture decision: meeting
+    // transcripts should never be sent to an external API for
+    // classification) - everything dropped here always lands as
+    // "needs_review", tagged via the TopicAutocomplete search box instead.
+    {
+      id: 7,
+      file_path: "budget-notes.xlsx",
+      file_name: "budget-notes.xlsx",
+      detected_at: isoDaysAgo(2),
+      // No Teams-style filename stamp on a plain spreadsheet someone
+      // dropped by hand - recordingDisplayDate falls back to detected_at
+      // here, same as the real app's own fallback when neither a filename
+      // match nor a readable file date is available.
+      recording_date: teamsFilenameDate("budget-notes.xlsx"),
+      source: "manual_drop",
+      topic: null,
+      topic_name: "",
+      ingested_file: null,
+      status: "needs_review",
+      engine_used: "",
+      detail: "Dropped in the manual folder - no confident project name match; pick one below.",
+      suggested_topic_name: "",
+      suggested_topic_one_liner: "",
+      suggested_topic_type: "",
+      transcript_text:
+        "Q4 budget notes (extracted text)\n\nRebrand line item: logo + palette work tracking slightly under budget.\nOnboarding line item: Meridian's onboarding costs tracking on plan.\nOpen question: does the vendor security review need its own budget line, or does it fold into general IT spend?",
+      meeting_summary: "",
+      summary_generated_at: null,
+      diarization_result: "",
+      diarization_generated_at: null,
+      speaker_transcript: "",
+      speaker_transcript_generated_at: null,
+    },
+    {
+      id: 8,
+      file_path: "Quick voice memo - Acme colors-20260929_081500UTC.m4a",
+      file_name: "Quick voice memo - Acme colors-20260929_081500UTC.m4a",
+      detected_at: isoDaysAgo(1),
+      recording_date: teamsFilenameDate("Quick voice memo - Acme colors-20260929_081500UTC.m4a"),
+      source: "manual_drop",
+      topic: null,
+      topic_name: "",
+      ingested_file: null,
+      status: "needs_review",
+      engine_used: "local_whisper",
+      detail: "Dropped in the manual folder - no confident project name match; pick one below.",
+      suggested_topic_name: "",
+      suggested_topic_one_liner: "",
+      suggested_topic_type: "",
+      transcript_text:
+        "Jordan Lee: Leaving myself a quick note — thinking the warm-neutral palette could use one darker accent for the footer band, worth mocking up before the next review.",
+      meeting_summary: "",
+      summary_generated_at: null,
+      diarization_result: "",
+      diarization_generated_at: null,
+      speaker_transcript: "",
+      speaker_transcript_generated_at: null,
     },
   ];
 
@@ -567,6 +702,7 @@ function buildInitialState() {
       // recordingEvents above and its own header comment).
       recordings_watch_folder: "C:\\Demo\\Recordings",
       recordings_suggest_new_topics: "true",
+      manual_drop_folder: "C:\\Demo\\Recordings\\To Tag",
       transcription_engine: "local_whisper",
       external_transcription_url: "",
     },

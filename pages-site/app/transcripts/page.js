@@ -3,7 +3,8 @@
 import Link from "next/link";
 import { useEffect, useState } from "react";
 import { api } from "../lib/api";
-import { formatAdded, TYPE_LABELS } from "../lib/format";
+import { formatAdded, recordingDisplayDate, TYPE_LABELS } from "../lib/format";
+import TopicAutocomplete from "../components/TopicAutocomplete";
 
 export const STATUS_STYLES = {
   routed: { label: "Routed", bg: "bg-teal-tint", text: "text-teal-dark" },
@@ -14,7 +15,7 @@ export const STATUS_STYLES = {
 };
 
 function sortNewestFirst(events) {
-  return [...events].sort((a, b) => new Date(b.detected_at) - new Date(a.detected_at));
+  return [...events].sort((a, b) => new Date(recordingDisplayDate(b)) - new Date(recordingDisplayDate(a)));
 }
 
 export default function TranscriptsPage() {
@@ -98,7 +99,7 @@ export default function TranscriptsPage() {
   }
   const projectGroups = Object.values(groupsByTopic)
     .map((g) => ({ ...g, events: sortNewestFirst(g.events) }))
-    .sort((a, b) => new Date(b.events[0].detected_at) - new Date(a.events[0].detected_at));
+    .sort((a, b) => new Date(recordingDisplayDate(b.events[0])) - new Date(recordingDisplayDate(a.events[0])));
 
   return (
     <div className="max-w-4xl mx-auto px-6 py-10">
@@ -128,7 +129,7 @@ export default function TranscriptsPage() {
               return (
                 <div key={ev.id} className="rounded-lg border-2 border-dashed border-brand/40 bg-brand-tint/30 px-4 py-3.5">
                   <p className="text-xs font-medium text-ink-muted mb-2 truncate" title={ev.file_name}>
-                    {ev.file_name} · {formatAdded(ev.detected_at)}
+                    {ev.file_name} · {formatAdded(recordingDisplayDate(ev))}
                   </p>
                   <p className="text-sm text-[#1a1a1a] mb-3">
                     This recording looks like it might be a <strong>new project</strong> — not yet
@@ -176,6 +177,29 @@ export default function TranscriptsPage() {
                       Not a new project
                     </button>
                   </div>
+
+                  {/* Assigning directly to an existing project used to
+                      require "Not a new project" first (demoting to
+                      needs_review) as a detour - this makes it a
+                      first-class option right here, since the suggested
+                      new project is just a suggestion, not the only path. */}
+                  <div className="flex items-center gap-2 mt-2 pt-2 border-t border-brand/20 flex-wrap">
+                    <span className="text-xs text-ink-muted">or assign to an existing project:</span>
+                    <TopicAutocomplete
+                      topics={topics}
+                      value={assigning[ev.id] || ""}
+                      onChange={(id) => setAssigning({ ...assigning, [ev.id]: id })}
+                      placeholder="Choose a project…"
+                    />
+                    <button
+                      type="button"
+                      disabled={!assigning[ev.id]}
+                      onClick={() => handleAssign(ev.id)}
+                      className="px-3 py-1.5 text-xs font-medium rounded-md bg-brand text-white hover:bg-brand-dark disabled:opacity-40"
+                    >
+                      Assign
+                    </button>
+                  </div>
                 </div>
               );
             })}
@@ -203,7 +227,7 @@ export default function TranscriptsPage() {
                     >
                       {ev.file_name}
                     </Link>
-                    <p className="text-xs text-ink-muted mt-0.5">{formatAdded(ev.detected_at)}</p>
+                    <p className="text-xs text-ink-muted mt-0.5">{formatAdded(recordingDisplayDate(ev))}</p>
                   </div>
                   <span className={`shrink-0 text-[11px] font-semibold px-2 py-1 rounded-full ${style.bg} ${style.text}`}>
                     {style.label}
@@ -251,27 +275,27 @@ export default function TranscriptsPage() {
                     >
                       {ev.file_name}
                     </Link>
-                    <p className="text-xs text-ink-muted mt-0.5">{formatAdded(ev.detected_at)}</p>
+                    <p className="text-xs text-ink-muted mt-0.5">{formatAdded(recordingDisplayDate(ev))}</p>
                   </div>
-                  <span className={`shrink-0 text-[11px] font-semibold px-2 py-1 rounded-full ${style.bg} ${style.text}`}>
-                    {style.label}
-                  </span>
+                  <div className="shrink-0 flex items-center gap-1.5">
+                    {ev.source === "manual_drop" && (
+                      <span className="text-[11px] font-semibold px-2 py-1 rounded-full bg-[#f3f2ec] text-ink-muted">
+                        Manually dropped
+                      </span>
+                    )}
+                    <span className={`text-[11px] font-semibold px-2 py-1 rounded-full ${style.bg} ${style.text}`}>
+                      {style.label}
+                    </span>
+                  </div>
                 </div>
                 {ev.detail && <p className="text-xs text-ink-muted mt-2">{ev.detail}</p>}
                 {ev.status === "needs_review" && (
-                  <div className="flex items-center gap-2 mt-2">
-                    <select
-                      className="rounded-md border border-border-warm px-2 py-1.5 text-sm bg-white"
+                  <div className="flex items-center gap-2 mt-2 flex-wrap">
+                    <TopicAutocomplete
+                      topics={topics}
                       value={assigning[ev.id] || ""}
-                      onChange={(e) => setAssigning({ ...assigning, [ev.id]: e.target.value })}
-                    >
-                      <option value="">Assign to project…</option>
-                      {topics.map((t) => (
-                        <option key={t.id} value={t.id}>
-                          {t.name}
-                        </option>
-                      ))}
-                    </select>
+                      onChange={(id) => setAssigning({ ...assigning, [ev.id]: id })}
+                    />
                     <button
                       type="button"
                       disabled={!assigning[ev.id]}
