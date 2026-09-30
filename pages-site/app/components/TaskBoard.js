@@ -16,15 +16,17 @@ const STATUS_BADGE = {
 
 // Topic-agnostic action-item list - used both on a single topic's page
 // (where every task already belongs to that topic) and on the global
-// /tasks page (showTopic=true adds a small topic-name badge per card,
-// since cards there span every topic at once). Deliberately a flat grid of
-// rectangular cards, not a drag-and-drop Kanban board - ported from the
-// same change in the real app, made because the product owner's own
-// meeting was explicit that a Kanban board reads as a full task-management
-// system, which this app deliberately isn't trying to become. Status still
-// changes (via the select on each card), it just isn't the card's spatial
-// position anymore. Urgency (the colored dot) is always computed
-// automatically from due_date vs today (see lib/format.taskUrgency).
+// /tasks page (showTopic=true adds a small topic-name badge per row, since
+// rows there span every topic at once). A plain divided list, not a grid
+// of boxy cards (simplified again 30 Sep, ported from the same second pass
+// in the real app - the card-grid still "looked the same as a kanban
+// board"; this is deliberately closer to a simple to-do list) and not a
+// Kanban board either (removed earlier the same day - a drag-between-columns
+// board reads as a full task-management system, which is exactly what the
+// product owner's own 30 Sep meeting said this app should NOT become).
+// Status still changes (via the small select at the end of each row).
+// Urgency (the colored dot) is always computed automatically from
+// due_date vs today (see lib/format.taskUrgency).
 export default function TaskBoard({ tasks, onStatusChange, onDueDateChange, showTopic = false, emptyMessage }) {
   if (tasks.length === 0) {
     return (
@@ -36,55 +38,41 @@ export default function TaskBoard({ tasks, onStatusChange, onDueDateChange, show
   }
 
   return (
-    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+    <div className="divide-y divide-slate-100 border-t border-b border-slate-100">
       {tasks.map((t) => {
         const urgency = taskUrgency(t);
         const style = urgency ? URGENCY_STYLES[urgency] : null;
         return (
-          <div
-            key={t.id}
-            className="rounded-md bg-white border border-slate-200 px-3 py-2.5 text-xs shadow-sm"
-          >
-            <div className="flex items-center justify-between gap-2 mb-1.5">
-              {showTopic && t.topic_name ? (
-                <span className="inline-block text-[10px] font-medium text-teal-dark bg-teal-tint border border-teal-tint-strong px-1.5 py-0.5 rounded-full truncate">
-                  {t.topic_name}
-                </span>
-              ) : (
-                <span />
-              )}
-              <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-full shrink-0 ${STATUS_BADGE[t.status] || STATUS_BADGE.backlog}`}>
-                {TASK_COLUMNS.find((c) => c.key === t.status)?.label || t.status}
+          <div key={t.id} className="flex items-center gap-3 py-2 text-xs">
+            <span
+              title={style ? style.label : "No due date"}
+              className={`w-1.5 h-1.5 rounded-full shrink-0 ${style ? style.dot : "bg-slate-200"}`}
+            />
+            <p className={`flex-1 min-w-0 truncate ${t.status === "done" ? "text-slate-400 line-through" : "text-slate-800"}`}>
+              {t.title}
+            </p>
+            {showTopic && t.topic_name && (
+              <span className="hidden sm:inline text-[11px] text-teal-dark shrink-0 truncate max-w-[9rem]">
+                {t.topic_name}
               </span>
-            </div>
-            <div className="flex items-start gap-1.5">
-              {style && (
-                <span
-                  title={style.label}
-                  className={`mt-1 w-1.5 h-1.5 rounded-full shrink-0 ${style.dot}`}
-                />
-              )}
-              <p className="text-slate-800 font-medium">{t.title}</p>
-            </div>
-            <div className="flex items-center justify-between mt-1.5 gap-2 flex-wrap">
-              {t.assignee && (
-                <span className="text-[10px] text-slate-500 bg-slate-100 px-1.5 py-0.5 rounded-full truncate">
-                  {t.assignee}
-                </span>
-              )}
-              <input
-                type="date"
-                value={t.due_date || ""}
-                onChange={(e) => onDueDateChange && onDueDateChange(t.id, e.target.value)}
-                className={`text-[10px] border border-slate-200 rounded px-1 py-0.5 bg-white ${
-                  style ? style.text : "text-slate-500"
-                }`}
-              />
-            </div>
+            )}
+            {t.assignee && (
+              <span className="hidden sm:inline text-[11px] text-slate-500 shrink-0 truncate max-w-[7rem]">
+                {t.assignee}
+              </span>
+            )}
+            <input
+              type="date"
+              value={t.due_date || ""}
+              onChange={(e) => onDueDateChange && onDueDateChange(t.id, e.target.value)}
+              className={`text-[11px] border border-transparent hover:border-slate-200 rounded px-1 py-0.5 bg-transparent shrink-0 ${
+                style ? style.text : "text-slate-400"
+              }`}
+            />
             <select
               value={t.status}
               onChange={(e) => onStatusChange(t.id, e.target.value)}
-              className="w-full mt-1.5 text-[10px] border border-slate-200 rounded px-1 py-0.5 bg-white"
+              className={`text-[11px] rounded px-1.5 py-0.5 border-0 shrink-0 ${STATUS_BADGE[t.status] || STATUS_BADGE.backlog}`}
             >
               {TASK_COLUMNS.map((c) => (
                 <option key={c.key} value={c.key}>
