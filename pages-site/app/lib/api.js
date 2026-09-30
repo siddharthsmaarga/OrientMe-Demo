@@ -1002,6 +1002,79 @@ export const api = {
       })
       .sort((a, b) => new Date(b.first_added_at) - new Date(a.first_added_at));
   },
+  // Inbox - files that didn't match any project (see fixtures.js's
+  // inboxFiles). Backed by the in-memory store like everything else here
+  // (resets on reload). "Ask / Summarize" is deterministic code, not a model
+  // call - same approach as buildMeetingSummary above: blank question = the
+  // file's highlight lines; a question = the lines that share the most
+  // words with it.
+  getInboxFiles: async () => {
+    await wait();
+    return store.inboxFiles
+      .map(({ text, ...f }) => ({ ...f }))
+      .sort((a, b) => new Date(b.first_added_at) - new Date(a.first_added_at));
+  },
+  askInboxFile: async (fileId, question) => {
+    await wait(250);
+    const file = store.inboxFiles.find((f) => f.id === Number(fileId));
+    if (!file) throw new Error("404 Not Found: no such file in this demo");
+    const q = (question || "").trim();
+    const note = "Demo: lines picked by plain code, no AI model was called.";
+    if (!q) return { answer: buildMeetingSummary(file.text), is_llm: false, generation_note: note };
+    const qWords = lineWords(q);
+    const lines = file.text.split("\n").map((l) => l.trim()).filter(Boolean);
+    const scored = lines
+      .map((line, i) => {
+        const words = lineWords(line);
+        let hits = 0;
+        for (const w of qWords) if (words.has(w)) hits += 1;
+        return [hits, i];
+      })
+      .filter(([hits]) => hits > 0)
+      .sort((a, b) => b[0] - a[0])
+      .slice(0, 3)
+      .sort((a, b) => a[1] - b[1]);
+    if (scored.length === 0) {
+      return { answer: "Nothing in this file mentions that.", is_llm: false, generation_note: note };
+    }
+    return {
+      answer: "**Relevant lines:**\n" + scored.map(([, i]) => `- ${lines[i]}`).join("\n"),
+      is_llm: false,
+      generation_note: note,
+    };
+  },
+  moveFile: async (fileId, topicId) => api.bulkMoveFiles([fileId], topicId),
+  bulkMoveFiles: async (fileIds, topicId) => {
+    await wait();
+    const topic = findTopic(topicId);
+    if (!topic) throw new Error("404 Not Found: no such project in this demo");
+    const ids = new Set(fileIds.map(Number));
+    const moving = store.inboxFiles.filter((f) => ids.has(f.id));
+    store.inboxFiles = store.inboxFiles.filter((f) => !ids.has(f.id));
+    const now = new Date().toISOString();
+    moving.forEach((f) =>
+      store.files.push({
+        id: f.id,
+        topic: topic.id,
+        path: f.path,
+        display_name: f.display_name,
+        source_method: f.source_method,
+        content_hash: "demo",
+        extraction_error: "",
+        first_added_at: f.first_added_at,
+        last_ingested_at: now,
+        meta: null,
+      })
+    );
+    return { moved: moving.length };
+  },
+  deleteFile: async (fileId) => api.bulkDeleteFiles([fileId]),
+  bulkDeleteFiles: async (fileIds) => {
+    await wait();
+    const ids = new Set(fileIds.map(Number));
+    store.inboxFiles = store.inboxFiles.filter((f) => !ids.has(f.id));
+    return { deleted: ids.size };
+  },
   getGlobalTimeline: async (topicId) => {
     await wait();
     const events = [];

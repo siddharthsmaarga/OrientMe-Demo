@@ -23,6 +23,7 @@ const NAV_GROUPS = [
     label: "Workspace",
     items: [
       { href: "/dashboard", label: "Projects", icon: TopicsIcon, tile: "bg-teal" },
+      { href: "/inbox", label: "Inbox", icon: InboxIcon, tile: "bg-slate-500" },
       { href: "/transcripts", label: "Transcripts", icon: TranscriptsIcon, tile: "bg-brand" },
     ],
   },
@@ -265,6 +266,15 @@ function TopicsIcon() {
     <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
       <rect x="3" y="4" width="18" height="14" rx="2" />
       <path d="M3 9h18" />
+    </svg>
+  );
+}
+
+function InboxIcon() {
+  return (
+    <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M22 12h-6l-2 3h-4l-2-3H2" />
+      <path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z" />
     </svg>
   );
 }
