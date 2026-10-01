@@ -55,7 +55,6 @@ export default function SettingsPage() {
     stale_after_days: "14",
     recordings_watch_folder: "",
     recordings_suggest_new_topics: "true",
-    manual_drop_folder: "",
     transcription_engine: "local_whisper",
     external_transcription_url: "",
   });
@@ -296,24 +295,6 @@ export default function SettingsPage() {
           you&apos;ll always be asked to confirm or reject on the Transcripts page before anything is
           created (otherwise it&apos;s just flagged &quot;Needs review&quot;)
         </label>
-
-        <div>
-          <label className="block text-sm font-medium text-slate-700 mb-1">Manual drop folder</label>
-          <input
-            className="w-full rounded-md border border-slate-300 px-3 py-2 text-sm disabled:bg-slate-100 disabled:text-slate-400"
-            value={form.manual_drop_folder}
-            disabled={effectiveLocked}
-            onChange={(e) => setForm({ ...form, manual_drop_folder: e.target.value })}
-            placeholder="e.g. D:\OneDrive - Company\Recordings\To Tag"
-          />
-          <p className="text-xs text-slate-400 mt-1">
-            A second, separate folder for dropping any file — recordings, docs, whatever — that you
-            want to quickly tag to a project yourself. Unlike the watched folder above, nothing here
-            is ever auto-routed by an AI call; everything lands on the Transcripts page as
-            &quot;Needs review&quot; with a fast search box to pick the project (or a suggestion
-            pre-filled when the project&apos;s own name is clearly in the text).
-          </p>
-        </div>
 
         <div>
           <label className="block text-sm font-medium text-slate-700 mb-1">Transcription engine</label>

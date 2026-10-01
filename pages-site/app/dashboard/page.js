@@ -4,12 +4,16 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import { api } from "../lib/api";
-import { projectUrgency, TYPE_LABELS, TYPE_STYLES, URGENCY_STYLES } from "../lib/format";
+import {
+  projectUrgency,
+  TYPE_LABELS,
+  TYPE_STYLES,
+  URGENCY_STYLES,
+} from "../lib/format";
 
 // PRD Should-have: "flag stale... information" - a topic nobody has
 // touched (no fresh brief, no new file) in a while is easy to forget about
-// across many projects; this is what actually surfaces that on the
-// dashboard instead of requiring someone to open each one to check.
+// across many projects.
 function daysSince(isoDate) {
   if (!isoDate) return Infinity;
   return (Date.now() - new Date(isoDate).getTime()) / 86400000;
@@ -41,14 +45,18 @@ function ScanProgress({ job }) {
   );
 }
 
-// Project-list-first home page: adding a project is a deliberate, explicit
-// action ("+ Add Project"), never a side effect of typing a question - that
-// ambiguity ("looks like a chatbox, but chatting creates a project") is what
-// the earlier chat-first version got direct, pointed feedback for. There is
-// no cross-project chat surface anywhere in this app anymore (removed per
-// direct product feedback: "I don't want my chat to be fragmented... this
-// should be in the back end") - Ctrl/Cmd+K search (below) is navigation, not
-// conversation, and stays for that reason.
+// Projects - a clean, focused browse/create/manage list. Deliberately NOT
+// the landing page anymore (30 Sep, product feedback: "make another page... called
+// dashboard... move [transcripts/drop-zone/attention/summary] there") -
+// the KPI strip, New Transcripts, Needs Attention, and the structured
+// projects table all moved to /home, which is the new default landing
+// page. This page keeps exactly what it says on the tin: the project
+// grid itself, and creating/deleting one.
+//
+// Adding a project is a deliberate, explicit action ("+ Add Project"),
+// never a side effect of typing a question - that ambiguity ("looks like
+// a chatbox, but chatting creates a project") is what the earlier
+// chat-first version got direct, pointed feedback for.
 export default function Dashboard() {
   const router = useRouter();
   const [topics, setTopics] = useState([]);
@@ -56,12 +64,6 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [staleAfterDays, setStaleAfterDays] = useState(14);
-  // Cross-project quick stats - reuses the existing getCommitments()/
-  // getRisks() endpoints called with no topic id, which already return
-  // every commitment/risk across every project (see api.js), so no new
-  // backend endpoint is needed for this.
-  const [allCommitments, setAllCommitments] = useState([]);
-  const [allRisks, setAllRisks] = useState([]);
 
   const [createModalOpen, setCreateModalOpen] = useState(false);
   // The "Create Project" modal covers two paths under one entry point
@@ -103,17 +105,13 @@ export default function Dashboard() {
   async function load() {
     setLoading(true);
     try {
-      const [topicsData, tasksData, settingsData, commitmentsData, risksData] = await Promise.all([
+      const [topicsData, tasksData, settingsData] = await Promise.all([
         api.listTopics(),
         api.getTasks(),
         api.getSettings().catch(() => null),
-        api.getCommitments().catch(() => []),
-        api.getRisks().catch(() => []),
       ]);
       setTopics(topicsData);
       setTasks(tasksData);
-      setAllCommitments(commitmentsData);
-      setAllRisks(risksData);
       const parsedStaleDays = parseInt(settingsData?.stale_after_days, 10);
       if (!Number.isNaN(parsedStaleDays)) setStaleAfterDays(parsedStaleDays);
       setError(null);
@@ -205,86 +203,19 @@ export default function Dashboard() {
 
   return (
     <div className="max-w-6xl 2xl:max-w-[96rem] mx-auto px-6 py-10 w-full">
-      <header className="mb-8">
-        <h1 className="text-3xl font-extrabold tracking-tight text-brand">OrientMe</h1>
-        <p className="text-ink-muted mt-2">
-          Your projects, at a glance — open one, or press Ctrl/Cmd+K to search across all of them.
-        </p>
+      <header className="mb-8 flex items-start justify-between gap-4 flex-wrap">
+        <div>
+          <h1 className="text-3xl font-extrabold tracking-tight text-brand">Projects</h1>
+          <p className="text-ink-muted mt-2">
+            Browse, open, or create a project — press Ctrl/Cmd+K to search across all of them.
+          </p>
+        </div>
+        <Link href="/home" className="text-sm font-medium text-teal-dark hover:underline whitespace-nowrap">
+          ← Back to Dashboard
+        </Link>
       </header>
 
-      {!loading && (() => {
-        // Always render this quick-stat pair, even at zero - a stat that
-        // vanishes when there's nothing open reads as "this feature doesn't
-        // exist" rather than "0 right now", and the dashboard should always
-        // give a cross-project read on commitments/risks at a glance instead
-        // of only surfacing them one click away on /actions.
-        const openCommitmentsCount = allCommitments.filter((c) => c.status !== "done").length;
-        const activeRisksCount = allRisks.filter((r) => r.status === "open").length;
-        return (
-          <div className="mb-4 flex flex-wrap gap-3">
-            <Link
-              href="/actions"
-              className={`rounded-xl border border-border-warm border-l-4 bg-white shadow-sm px-4 py-3 min-w-[180px] hover:shadow transition-shadow ${
-                openCommitmentsCount > 0 ? "border-l-teal-dark" : "border-l-slate-200 opacity-70"
-              }`}
-            >
-              <p className="text-2xl font-bold text-[#1a1a1a] leading-none">{openCommitmentsCount}</p>
-              <p className="text-xs text-ink-muted mt-1">
-                open commitment{openCommitmentsCount === 1 ? "" : "s"} across all projects
-              </p>
-            </Link>
-            <div
-              className={`rounded-xl border border-border-warm border-l-4 bg-white shadow-sm px-4 py-3 min-w-[180px] ${
-                activeRisksCount > 0 ? "border-l-accent-orange" : "border-l-slate-200 opacity-70"
-              }`}
-            >
-              <p className="text-2xl font-bold text-[#1a1a1a] leading-none">{activeRisksCount}</p>
-              <p className="text-xs text-ink-muted mt-1">
-                active risk{activeRisksCount === 1 ? "" : "s"} across all projects
-              </p>
-            </div>
-          </div>
-        );
-      })()}
-
-      {!loading && (() => {
-        const stale = topics.filter((t) => daysSince(t.last_activity_at) > staleAfterDays);
-        const withRisks = topics.filter(
-          (t) => t.latest_risks_and_gaps && daysSince(t.last_activity_at) <= staleAfterDays
-        );
-        if (stale.length === 0 && withRisks.length === 0) return null;
-        return (
-          <section className="mb-8 rounded-xl border border-border-warm border-l-4 border-l-accent-orange bg-white shadow-sm p-4">
-            <h2 className="text-[15px] font-bold text-[#1a1a1a] mb-2">⚠ Needs attention</h2>
-            <ul className="space-y-1.5">
-              {withRisks.map((t) => (
-                <li key={`risk-${t.id}`} className="text-sm">
-                  <Link href={`/topics/?id=${encodeURIComponent(t.id)}`} className="font-medium text-[#1a1a1a] hover:underline">
-                    {t.name}
-                  </Link>
-                  <span className="text-ink-muted"> — {t.latest_risks_and_gaps}</span>
-                </li>
-              ))}
-              {stale.map((t) => (
-                <li key={`stale-${t.id}`} className="text-sm">
-                  <Link href={`/topics/?id=${encodeURIComponent(t.id)}`} className="font-medium text-[#1a1a1a] hover:underline">
-                    {t.name}
-                  </Link>
-                  <span className="text-ink-muted">
-                    {" "}
-                    — no activity in {Math.floor(daysSince(t.last_activity_at))} days
-                  </span>
-                </li>
-              ))}
-            </ul>
-          </section>
-        );
-      })()}
-
-      {/* Primary: the projects dashboard - full width, the main content of this page */}
       <section>
-        <h2 className="text-xl font-bold text-[#1a1a1a] mb-4">Your projects</h2>
-
         {error && (
           <div className="mb-4 rounded-md bg-red-50 border border-red-200 text-red-700 text-sm px-4 py-3">
             Couldn&apos;t reach the backend: {error}. Is it running on port 8010?

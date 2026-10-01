@@ -87,6 +87,45 @@ export function getCsrfToken() {
   return "";
 }
 
+// The excerpt shown for a content-matched search result - the plain text
+// around wherever the first token appears (ported from the real backend's
+// _search_snippet): collapsed to one line, ellipsized where it was cut.
+function searchSnippet(text, tokens, context = 70) {
+  const lower = text.toLowerCase();
+  let pos = -1;
+  for (const tok of tokens) {
+    pos = lower.indexOf(tok);
+    if (pos !== -1) break;
+  }
+  if (pos === -1) return "";
+  const start = Math.max(0, pos - context);
+  const end = Math.min(text.length, pos + context);
+  let snippet = text.slice(start, end).split(/\s+/).filter(Boolean).join(" ");
+  if (start > 0) snippet = "…" + snippet;
+  if (end < text.length) snippet += "…";
+  return snippet;
+}
+
+// Files a recording's transcript into a project, the way the real backend's
+// _ingest_into_topic does (one IngestedFile row carrying the transcript text),
+// so a project created from / assigned a recording shows a file straight away.
+function ingestEventIntoTopic(ev, topic) {
+  const now = new Date().toISOString();
+  store.files.push({
+    id: newId(),
+    topic: topic.id,
+    path: ev.file_name,
+    display_name: ev.file_name,
+    source_method: "folder",
+    content_hash: "demo",
+    extracted_text: ev.transcript_text || "",
+    extraction_error: "",
+    first_added_at: now,
+    last_ingested_at: now,
+    meta: null,
+  });
+}
+
 function wait(ms = 220) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -104,6 +143,9 @@ function fileWithMeta(f) {
     artifact_type: f.meta ? "meeting" : "file",
     content_hash: f.content_hash,
     extraction_error: f.extraction_error,
+    // Fixture-only: lets the "Edit" link on a cited source open the sample
+    // text in a read-only tab (the real API doesn't send this field).
+    extracted_text: f.extracted_text || "",
     first_added_at: f.first_added_at,
     last_ingested_at: f.last_ingested_at,
     meta: f.meta,
@@ -306,6 +348,7 @@ function recordMessages(topicId, question, answer) {
     source_files: answer.source_files,
     is_llm: answer.is_llm,
     generation_note: answer.generation_note,
+    feedback: "",
     created_at: new Date().toISOString(),
   });
 }
@@ -407,6 +450,22 @@ export const api = {
   },
   uploadFile: async (topicId, file) => {
     await wait(400);
+    // Plain-text files are read in the browser so they become searchable;
+    // everything else (and audio/video, which the full app transcribes
+    // locally) is recorded as a file with no extracted text - nothing is
+    // uploaded anywhere.
+    const isText = /\.(txt|md|csv)$/i.test(file.name);
+    const isMedia = /\.(mp4|mov|webm|wav|mp3|m4a)$/i.test(file.name);
+    let extracted = "";
+    if (isText) {
+      try {
+        extracted = await file.text();
+      } catch {
+        extracted = "";
+      }
+    } else if (isMedia) {
+      extracted = "(Demo mode - audio/video is not transcribed in this static build.)";
+    }
     store.files.push({
       id: newId(),
       topic: Number(topicId),
@@ -414,6 +473,7 @@ export const api = {
       display_name: file.name,
       source_method: "upload",
       content_hash: "demo",
+      extracted_text: extracted,
       extraction_error: "",
       first_added_at: new Date().toISOString(),
       last_ingested_at: new Date().toISOString(),
@@ -438,6 +498,7 @@ export const api = {
       display_name: label || "Pasted text",
       source_method: "paste",
       content_hash: "demo",
+      extracted_text: text || "",
       extraction_error: "",
       first_added_at: new Date().toISOString(),
       last_ingested_at: new Date().toISOString(),
@@ -457,6 +518,15 @@ export const api = {
     await wait();
     store.messages = store.messages.filter((m) => m.topic !== Number(topicId));
     return { ok: true };
+  },
+  // Thumbs up/down on one assistant answer (value "up" | "down" | "" to
+  // clear). Stored on the in-memory message only, so it resets on refresh
+  // like every other edit in this demo.
+  setMessageFeedback: async (kind, messageId, value) => {
+    await wait(120);
+    const m = store.messages.find((x) => x.id === Number(messageId));
+    if (m) m.feedback = value || "";
+    return { ok: true, feedback: value || "" };
   },
   uploadFolder: async (topicId) => {
     await wait(500);
@@ -840,6 +910,7 @@ export const api = {
       ev.topic_name = t ? t.name : "";
       ev.status = "routed";
       ev.detail = "Manually assigned.";
+      if (t) ingestEventIntoTopic(ev, t);
     }
     return ev;
   },
@@ -860,7 +931,56 @@ export const api = {
     ev.topic_name = topic.name;
     ev.status = "auto_created";
     ev.detail = "New project created from this recording.";
+    ingestEventIntoTopic(ev, topic);
     return ev;
+  },
+  // The manual counterpart to confirmNewProject - a person deciding that a
+  // recording (or dropped file) deserves its own project, from any status.
+  // Requires an explicit name, same as the real endpoint.
+  createProjectFromRecording: async (eventId, fields = {}) => {
+    await wait();
+    const ev = store.recordingEvents.find((e) => e.id === Number(eventId));
+    if (!ev) throw new Error("404 Not Found: no such recording in this demo");
+    const name = (fields.name || "").trim();
+    if (!name) throw new Error("A project name is required.");
+    const topic = {
+      id: newId(),
+      name: name.slice(0, 200),
+      topic_type: (fields.topic_type || "").trim() || "project",
+      one_liner: (fields.one_liner || "").trim().slice(0, 300),
+      related_people: "",
+      created_at: new Date().toISOString(),
+    };
+    store.topics.push(topic);
+    ev.topic = topic.id;
+    ev.topic_name = topic.name;
+    ev.status = "auto_created";
+    ev.detail = "New project created from this recording.";
+    ingestEventIntoTopic(ev, topic);
+    return { ...ev };
+  },
+  // The corner "x" on a pending card - never a hard delete, the row stays
+  // with status "dismissed" so it stops showing in any needs-review list.
+  dismissRecordingEvent: async (eventId) => {
+    await wait(120);
+    const ev = store.recordingEvents.find((e) => e.id === Number(eventId));
+    if (!ev) throw new Error("404 Not Found: no such recording in this demo");
+    ev.status = "dismissed";
+    ev.detail = "Dismissed - not tracked.";
+    return { ...ev };
+  },
+  bulkDismissRecordingEvents: async (eventIds) => {
+    await wait(150);
+    const ids = new Set((eventIds || []).map(Number));
+    if (ids.size === 0) throw new Error("event_ids is required");
+    let count = 0;
+    for (const ev of store.recordingEvents) {
+      if (!ids.has(ev.id)) continue;
+      ev.status = "dismissed";
+      ev.detail = "Dismissed - not tracked.";
+      count += 1;
+    }
+    return { dismissed_count: count };
   },
   rejectNewProject: async (eventId) => {
     await wait();
@@ -958,26 +1078,76 @@ export const api = {
     await wait();
     const ev = store.recordingEvents.find((e) => e.id === Number(eventId));
     if (!ev) throw new Error("404 Not Found: no such recording in this demo");
-    return { saved: true, summary_generated_at: ev.summary_generated_at };
+    if (!ev.topic) throw new Error("Assign this recording to a project before saving its summary.");
+    // The real app writes a .md file into the project's own folder; the demo
+    // has no disk, so this reports the fictional path it would have used.
+    const stem = ev.file_name.replace(/\.[^.]+$/, "");
+    return { saved_to: `C:\\Demo\\${ev.topic_name}\\${stem} - Summary.md`, summary_generated_at: ev.summary_generated_at };
   },
+  // Universal search (Ctrl/Cmd+K) - mirrors the real backend's GlobalSearchView
+  // (core/views.py): the query is split into tokens, every token must appear
+  // somewhere in the searched fields (any order), each group is capped at 8.
+  // Plain substring checks over the fixture store, no model call. Groups:
+  // projects (name/one-liner/related people, with file_count + last_indexed),
+  // stakeholders ("People" - meeting attendees, grouped by name with the
+  // projects they appear in), topics (content matches inside a file's
+  // extracted text, with a real excerpt), files (filename matches), tasks.
   search: async (q) => {
     await wait(150);
-    const lowered = q.toLowerCase();
-    const projects = store.topics.filter((t) => t.name.toLowerCase().includes(lowered)).map(topicBrief);
-    const stakeholders = [];
-    store.topics.forEach((t) => {
-      (t.related_people || "").split(",").map((s) => s.trim()).filter(Boolean).forEach((name) => {
-        if (name.toLowerCase().includes(lowered)) stakeholders.push({ name, topic_id: t.id, topic_name: t.name });
+    const tokens = (q || "").toLowerCase().split(/\s+/).filter(Boolean);
+    const empty = { projects: [], stakeholders: [], topics: [], files: [], tasks: [] };
+    if (tokens.length === 0) return empty;
+    const matchAll = (...fields) =>
+      tokens.every((tok) => fields.some((f) => (f || "").toLowerCase().includes(tok)));
+    const latestIndexed = (files) =>
+      files.length ? files.map((f) => f.last_ingested_at).sort().slice(-1)[0] : null;
+
+    const projects = store.topics
+      .filter((t) => matchAll(t.name, t.one_liner, t.related_people))
+      .slice(0, 8)
+      .map((t) => {
+        const files = topicFiles(t.id);
+        return { ...topicBrief(t), file_count: files.length, last_indexed: latestIndexed(files) };
       });
-    });
+
+    const people = new Map();
+    for (const f of store.files) {
+      for (const name of f.meta?.attendees || []) {
+        const lname = name.toLowerCase();
+        if (!tokens.every((tok) => lname.includes(tok))) continue;
+        const entry = people.get(lname) || { name, projects: [] };
+        if (!entry.projects.some((p) => p.topic_id === f.topic)) {
+          entry.projects.push({ topic_id: f.topic, topic_name: findTopic(f.topic)?.name || "" });
+        }
+        people.set(lname, entry);
+      }
+    }
+    const stakeholders = [...people.values()].slice(0, 8);
+
     const tasks = store.tasks
-      .filter((t) => t.title.toLowerCase().includes(lowered))
+      .filter((t) => matchAll(t.title))
+      .slice(0, 8)
       .map((t) => ({ id: t.id, title: t.title, topic_id: t.topic, topic_name: findTopic(t.topic)?.name || "" }));
-    const files = store.files
-      .filter((f) => f.display_name.toLowerCase().includes(lowered))
-      .map((f) => ({ id: f.id, display_name: f.display_name, topic_id: f.topic, topic_name: findTopic(f.topic)?.name || "" }));
-    return { projects, stakeholders, tasks, files };
+
+    const fileRow = (f) => ({
+      id: f.id,
+      display_name: f.display_name || f.path,
+      topic_id: f.topic,
+      topic_name: findTopic(f.topic)?.name || "",
+      last_indexed: f.last_ingested_at,
+    });
+    const files = store.files.filter((f) => matchAll(f.display_name)).slice(0, 8).map(fileRow);
+    const topics = store.files
+      .filter((f) => f.extracted_text && matchAll(f.extracted_text))
+      .slice(0, 8)
+      .map((f) => ({ ...fileRow(f), snippet: searchSnippet(f.extracted_text, tokens) }));
+
+    return { projects, stakeholders, topics, files, tasks };
   },
+  // Fire-and-forget in the real app (records each search outcome server-side
+  // for review). Nothing to log to here - the demo has no backend - so it
+  // resolves immediately and stores nothing.
+  logSearchOutcome: async () => ({ ok: true }),
   // Cross-project library/feed - every ingested file, and a merged activity
   // feed (meetings/status updates/tasks), across every project at once.
   // Mirrors the real backend's GlobalSourcesView/GlobalTimelineView logic,

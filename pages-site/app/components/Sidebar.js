@@ -6,13 +6,11 @@ import { useEffect, useRef, useState } from "react";
 import { api } from "../lib/api";
 import { useAuth } from "../lib/AuthContext";
 
-// GitHub Pages serves this app under /OrientMe-Demo/ (see next.config.mjs),
-// so any static asset referenced by an absolute "/..." path needs this
-// prefix or it 404s against the domain root instead of the actual deploy
-// path - same fix already applied in app/page.js.
+// Each item gets its own solid brand-colored square "logo tile" instead of
+// GitHub Pages serves this app under /OrientMe-Demo/ (see next.config.mjs), so
+// any static asset referenced by an absolute "/..." path needs this prefix.
 const BASE_PATH = process.env.NEXT_PUBLIC_BASE_PATH || "";
 
-// Each item gets its own solid brand-colored square "logo tile" instead of
 // a thin stroke icon - matches the demo's multi-accent palette (cyan/
 // green/orange/purple/brand) so each section reads as a distinct, filled
 // icon rather than a plain text list. Grouped into "Workspace" (the things
@@ -22,7 +20,8 @@ const NAV_GROUPS = [
   {
     label: "Workspace",
     items: [
-      { href: "/dashboard", label: "Projects", icon: TopicsIcon, tile: "bg-teal" },
+      { href: "/home", label: "Dashboard", icon: DashboardIcon, tile: "bg-purple-500", exact: true },
+      { href: "/dashboard", label: "Projects", icon: TopicsIcon, tile: "bg-teal", exact: true },
       { href: "/transcripts", label: "Transcripts", icon: TranscriptsIcon, tile: "bg-brand" },
     ],
   },
@@ -39,6 +38,7 @@ export default function Sidebar() {
   const [profileMenuOpen, setProfileMenuOpen] = useState(false);
   const profileMenuRef = useRef(null);
   const [recentTopics, setRecentTopics] = useState([]);
+  const [newTranscriptsCount, setNewTranscriptsCount] = useState(0);
 
   // "Recent" - the sidebar's own real content instead of empty space below
   // nav, and genuinely useful: the last few projects with any activity,
@@ -55,6 +55,39 @@ export default function Sidebar() {
         setRecentTopics(sorted.slice(0, 3));
       })
       .catch(() => setRecentTopics([]));
+  }, [pathname]);
+
+  // A live count of recordings still waiting on a person - a pending
+  // new-project suggestion, or an unmatched "needs review" one - shown as a
+  // badge on "Transcripts" so a new recording is discoverable from anywhere
+  // in the app, not only by opening that page to check. Polled the same way
+  // the Transcripts page itself polls (the watcher runs in the background,
+  // unrelated to anything clicked here).
+  //
+  // source !== "manual_drop" is required here (product feedback, 30 Sep: "why this
+  // count showing here") - manual drops moved entirely to the Dashboard's
+  // own review section and are excluded from the Transcripts page itself
+  // (see that page's own filtering), so counting them into THIS badge
+  // showed a number with nothing behind it once you actually opened
+  // Transcripts - this badge must count exactly what that page shows.
+  useEffect(() => {
+    function loadCount() {
+      api
+        .getRecordingEvents()
+        .then((events) =>
+          setNewTranscriptsCount(
+            events.filter(
+              (ev) =>
+                ev.source !== "manual_drop" &&
+                (ev.status === "pending_new_project" || ev.status === "needs_review")
+            ).length
+          )
+        )
+        .catch(() => {});
+    }
+    loadCount();
+    const id = setInterval(loadCount, 15000);
+    return () => clearInterval(id);
   }, [pathname]);
 
   // Close the profile popover on outside click, and whenever the route
@@ -76,7 +109,7 @@ export default function Sidebar() {
   return (
     <aside className="w-56 shrink-0 bg-[#fcfbf7] border-r border-border-warm flex flex-col h-screen sticky top-0 px-3.5 py-5">
       <Link
-        href="/dashboard"
+        href="/home"
         className="flex items-center gap-2 px-2 pb-4 mb-2 border-b border-border-warm"
       >
         <img src={`${BASE_PATH}/logo-icon.png`} alt="" width={28} height={28} className="shrink-0" />
@@ -108,8 +141,7 @@ export default function Sidebar() {
               {group.label}
             </p>
             {group.items.map((item) => {
-              const active =
-                item.href === "/dashboard" ? pathname === "/dashboard" : pathname.startsWith(item.href);
+              const active = item.exact ? pathname === item.href : pathname.startsWith(item.href);
               const Icon = item.icon;
               return (
                 <Link
@@ -127,6 +159,11 @@ export default function Sidebar() {
                     <Icon />
                   </span>
                   <span className={`flex-1 ${active ? "text-[#1a1a1a]" : "text-ink-muted"}`}>{item.label}</span>
+                  {item.href === "/transcripts" && newTranscriptsCount > 0 && (
+                    <span className="shrink-0 min-w-[18px] h-[18px] px-1 rounded-full bg-brand text-white text-[10px] font-bold flex items-center justify-center">
+                      {newTranscriptsCount}
+                    </span>
+                  )}
                 </Link>
               );
             })}
@@ -260,6 +297,17 @@ function SearchIcon() {
 
 // Nav tile icons always sit on a solid brand-color square now, so they're
 // always white - no more active/inactive stroke-color branching.
+function DashboardIcon() {
+  return (
+    <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="3" y="3" width="7" height="9" rx="1" />
+      <rect x="14" y="3" width="7" height="5" rx="1" />
+      <rect x="14" y="12" width="7" height="9" rx="1" />
+      <rect x="3" y="16" width="7" height="5" rx="1" />
+    </svg>
+  );
+}
+
 function TopicsIcon() {
   return (
     <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">

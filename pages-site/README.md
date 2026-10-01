@@ -18,6 +18,8 @@ The `Deploy OrientMe static demo to GitHub Pages` workflow builds this app and d
 ## Static demo behavior and limits
 
 - The frontend uses the supplied fictional sample records. Tasks, commitments, decisions, and risks can be changed during a session; those fixture edits reset on refresh.
+- Route semantics match the full app: `/home/` is the Dashboard (KPI tiles, All Projects table, Recent Activity, unreadable-file notice), `/dashboard/` is the Projects list (existing links and bookmarks keep working), and the sidebar lists Dashboard, Projects, Transcripts, Settings.
+- Search (Ctrl/Cmd+K), the thumbs up/down on past answers, the Export / Import downloads (brief .md/.csv, tasks .csv), the index.html launcher and the "Edit" links on cited sources are simulated in the browser from the fictional sample data. Nothing is uploaded or logged, and feedback resets on refresh.
 - Projects created with the manual form are stored in this browser only. They do not sync to other people or devices. Use fictional information in this public demo.
 - Folder scanning, file imports, recordings-folder watching, audio/video transcription, external transcription tools, account services, and backend workflows require the Django service and are not connected on GitHub Pages. Their controls show demo behavior; files are not uploaded or transcribed, and no business systems are contacted.
 - The provider/model settings, protected API-key handling, server-side Ask generation, and backend exports in the full application are not available on Pages. Ask/Orient uses only the browser model described below; no provider key is shipped to the public site.

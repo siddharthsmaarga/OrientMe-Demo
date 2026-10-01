@@ -25,7 +25,7 @@ export default function LoginPage() {
       await api.primeCsrf();
       await api.login(username.trim(), password);
       await refresh();
-      router.replace("/dashboard");
+      router.replace("/home");
     } catch (err) {
       setError("Incorrect username or password.");
     } finally {

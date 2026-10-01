@@ -6,83 +6,63 @@ import { api } from "../../lib/api";
 import { formatAdded, recordingDisplayDate } from "../../lib/format";
 import { STATUS_STYLES } from "../page";
 
-// Detail view for one Transcripts row (see ../page.js). Two-column layout:
-// Transcript (raw text, with an on-demand "Generate Transcript" speaker
-// split) + the honest empty-state / generated-summary Summary panel below
-// it - the Summary panel's own logic is untouched here (see api.js's
-// buildMeetingSummary; it's never generated automatically, only on a
-// click). A third, full-width Diarize section sits below the two-column
-// grid - a separate structured participants/decisions/action-items/
-// parked-items/per-speaker breakdown, matching the real app's own layout.
-// Neither Generate Transcript nor Diarize call a real model in this static
-// demo - both just reveal a pre-baked fixture (fixtures.js's
-// speaker_transcript / diarization_result) when one exists for this
-// recording, and show an honest not-available message otherwise (see
-// api.js's generateSpeakerTranscript / diarizeRecording).
+// One recording's own detail page - the transcript text plus an on-demand
+// summary panel. The summary is deliberately NEVER generated automatically
+// on load; it only appears once a person clicks "Generate Summary" (see
+// api.js's buildMeetingSummary - deterministic code, not a model call).
+// Generate Transcript / Diarize reveal pre-baked fixture output when one
+// exists for this recording (this static demo has no model behind them) and
+// show an honest not-available message otherwise.
 export default function TranscriptDetailClient({ id }) {
   const [event, setEvent] = useState(null);
   const [text, setText] = useState("");
+  const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState(null);
 
   const [generating, setGenerating] = useState(false);
   const [summaryError, setSummaryError] = useState(null);
-
-  const [generatingTranscript, setGeneratingTranscript] = useState(false);
-  const [transcriptError, setTranscriptError] = useState(null);
-  const [transcriptView, setTranscriptView] = useState("raw"); // "raw" | "speaker"
+  const [summaryNote, setSummaryNote] = useState(null); // the graceful no-key/failed-call message, when there is one
 
   const [diarizing, setDiarizing] = useState(false);
   const [diarizeError, setDiarizeError] = useState(null);
   const [diarizeNote, setDiarizeNote] = useState(null);
 
-  const [saveState, setSaveState] = useState("idle"); // idle | loading | done | error
+  const [generatingTranscript, setGeneratingTranscript] = useState(false);
+  const [transcriptError, setTranscriptError] = useState(null);
+  const [transcriptView, setTranscriptView] = useState("raw"); // "raw" | "speaker"
+
+  const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState(null);
+  const [savedTo, setSavedTo] = useState(null);
+
+  function load() {
+    setLoading(true);
+    setLoadError(null);
+    Promise.all([api.getRecordingEvent(id), api.getRecordingEventText(id)])
+      .then(([ev, t]) => {
+        setEvent(ev);
+        setText(t.text || "");
+      })
+      .catch((e) => setLoadError(e.message))
+      .finally(() => setLoading(false));
+  }
 
   useEffect(() => {
-    let cancelled = false;
-    async function load() {
-      try {
-        const [ev, textResult] = await Promise.all([api.getRecordingEvent(id), api.getRecordingEventText(id)]);
-        if (cancelled) return;
-        setEvent(ev);
-        setText(textResult.text || "");
-      } catch (e) {
-        if (!cancelled) setLoadError(e.message);
-      }
-    }
     load();
-    return () => {
-      cancelled = true;
-    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
 
   async function handleGenerateSummary() {
     setGenerating(true);
     setSummaryError(null);
-    setSaveState("idle");
-    setSaveError(null);
     try {
       const updated = await api.generateRecordingSummary(id);
       setEvent(updated);
+      setSummaryNote(updated.is_llm ? null : updated.message);
     } catch (e) {
       setSummaryError(e.message);
     } finally {
       setGenerating(false);
-    }
-  }
-
-  async function handleGenerateTranscript() {
-    setGeneratingTranscript(true);
-    setTranscriptError(null);
-    try {
-      const updated = await api.generateSpeakerTranscript(id);
-      setEvent(updated);
-      if (updated.succeeded) setTranscriptView("speaker");
-      else setTranscriptError(updated.message);
-    } catch (e) {
-      setTranscriptError(e.message);
-    } finally {
-      setGeneratingTranscript(false);
     }
   }
 
@@ -101,33 +81,46 @@ export default function TranscriptDetailClient({ id }) {
     }
   }
 
-  async function handleSave() {
-    setSaveState("loading");
-    setSaveError(null);
+  async function handleGenerateTranscript() {
+    setGeneratingTranscript(true);
+    setTranscriptError(null);
     try {
-      await api.saveRecordingSummary(id);
-      setSaveState("done");
+      const updated = await api.generateSpeakerTranscript(id);
+      setEvent(updated);
+      if (updated.succeeded) setTranscriptView("speaker");
+      else setTranscriptError(updated.message);
     } catch (e) {
-      setSaveError(e.message);
-      setSaveState("error");
+      setTranscriptError(e.message);
+    } finally {
+      setGeneratingTranscript(false);
     }
   }
 
-  if (loadError) {
-    return (
-      <div className="max-w-5xl mx-auto px-6 py-10">
-        <Link href="/transcripts" className="text-sm text-teal-dark hover:underline mb-4 inline-block">
-          ← Back to Transcripts
-        </Link>
-        <div className="rounded-md bg-red-50 border border-red-200 text-red-700 text-sm px-4 py-3">{loadError}</div>
-      </div>
-    );
+  async function handleSave() {
+    setSaving(true);
+    setSaveError(null);
+    setSavedTo(null);
+    try {
+      const res = await api.saveRecordingSummary(id);
+      setSavedTo(res.saved_to);
+    } catch (e) {
+      setSaveError(e.message);
+    } finally {
+      setSaving(false);
+    }
   }
 
-  if (!event) {
+  if (loading) {
+    return <div className="max-w-5xl mx-auto px-6 py-10 text-ink-muted text-sm">Loading…</div>;
+  }
+
+  if (loadError || !event) {
     return (
       <div className="max-w-5xl mx-auto px-6 py-10">
-        <p className="text-ink-muted text-sm">Loading…</p>
+        <p className="text-red-600 text-sm mb-3">{loadError || "Recording not found."}</p>
+        <Link href="/transcripts" className="text-teal-dark text-sm hover:underline">
+          ← Back to Transcripts
+        </Link>
       </div>
     );
   }
@@ -136,49 +129,50 @@ export default function TranscriptDetailClient({ id }) {
 
   return (
     <div className="max-w-5xl mx-auto px-6 py-10">
-      <Link href="/transcripts" className="text-sm text-teal-dark hover:underline mb-4 inline-block">
+      <Link href="/transcripts" className="text-sm text-teal-dark hover:underline">
         ← Back to Transcripts
       </Link>
 
-      <div className="mb-6">
-        <h1 className="text-xl font-semibold text-[#1a1a1a] mb-1 break-all">{event.file_name}</h1>
-        <div className="flex flex-wrap items-center gap-2 text-xs text-ink-muted">
-          <span>{formatAdded(recordingDisplayDate(event))}</span>
-          <span className={`text-[11px] font-semibold px-2 py-1 rounded-full ${style.bg} ${style.text}`}>{style.label}</span>
-          {event.source === "manual_drop" && (
-            <span className="text-[11px] font-semibold px-2 py-1 rounded-full bg-[#f3f2ec] text-ink-muted">
-              Manually dropped
-            </span>
-          )}
-          {event.topic && (
-            <Link href={`/topics/?id=${encodeURIComponent(event.topic)}`} className="text-teal-dark hover:underline">
-              {event.topic_name || "View project"} →
-            </Link>
-          )}
+      <div className="mt-3 mb-6">
+        <div className="flex items-center gap-3 flex-wrap">
+          <h1 className="text-2xl font-semibold text-[#1a1a1a] break-all">{event.file_name}</h1>
+          <span className={`shrink-0 text-[11px] font-semibold px-2 py-1 rounded-full ${style.bg} ${style.text}`}>
+            {style.label}
+          </span>
         </div>
-        {event.detail && <p className="text-xs text-ink-muted mt-2">{event.detail}</p>}
+        <p className="text-sm text-ink-muted mt-1">
+          Recorded {formatAdded(recordingDisplayDate(event))}
+          {event.topic && (
+            <>
+              {" · "}
+              <Link href={`/topics/?id=${encodeURIComponent(event.topic)}`} className="text-teal-dark hover:underline">
+                {event.topic_name}
+              </Link>
+            </>
+          )}
+        </p>
+        {event.detail && <p className="text-sm text-ink-muted mt-1">{event.detail}</p>}
       </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-6 items-start">
-        <section className="rounded-lg border border-border-warm bg-white p-5">
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        {/* Transcript */}
+        <div className="rounded-lg border border-border-warm bg-white p-4">
           <div className="flex items-center justify-between mb-3 gap-2 flex-wrap">
             <h2 className="text-sm font-bold uppercase tracking-wider text-ink-muted">Transcript</h2>
             <button
               type="button"
               onClick={handleGenerateTranscript}
               disabled={generatingTranscript}
-              className="shrink-0 px-3 py-1.5 text-xs font-medium rounded-md border border-border-warm text-ink-muted hover:bg-cream disabled:opacity-50"
+              className="shrink-0 px-3 py-1.5 text-xs font-semibold rounded-md border border-border-warm text-[#1a1a1a] hover:bg-brand-tint/30 disabled:opacity-40"
             >
               {generatingTranscript ? "Generating…" : event.speaker_transcript ? "Regenerate Transcript" : "Generate Transcript"}
             </button>
           </div>
 
-          {transcriptError && (
-            <div className="mb-3 rounded-md bg-red-50 border border-red-200 text-red-700 text-xs px-3 py-2">{transcriptError}</div>
-          )}
+          {transcriptError && <p className="text-red-600 text-xs mb-2">{transcriptError}</p>}
 
           {event.speaker_transcript && (
-            <div className="flex items-center gap-1 mb-3 text-xs">
+            <div className="flex items-center gap-1 mb-2 text-xs">
               <button
                 type="button"
                 onClick={() => setTranscriptView("raw")}
@@ -200,99 +194,83 @@ export default function TranscriptDetailClient({ id }) {
             </div>
           )}
 
-          {(transcriptView === "speaker" && event.speaker_transcript ? event.speaker_transcript : text) ? (
-            <div className="max-h-[28rem] overflow-y-auto whitespace-pre-wrap font-mono text-xs text-[#1a1a1a] leading-relaxed rounded-md bg-[#faf9f5] border border-border-warm px-3 py-3">
-              {transcriptView === "speaker" && event.speaker_transcript ? event.speaker_transcript : text}
-            </div>
-          ) : (
-            <p className="text-sm text-ink-muted border border-dashed border-border-warm rounded-lg px-4 py-6 text-center">
-              No transcript text captured for this recording in this demo.
-            </p>
-          )}
+          <div className="whitespace-pre-wrap font-mono text-xs text-[#1a1a1a] leading-relaxed max-h-[70vh] overflow-y-auto rounded-md bg-[#faf9f5] border border-border-warm px-3 py-3">
+            {transcriptView === "speaker" && event.speaker_transcript
+              ? event.speaker_transcript
+              : text || "(no transcript text available)"}
+          </div>
           {transcriptView === "speaker" && event.speaker_transcript_generated_at && (
             <p className="text-[11px] text-ink-muted mt-2">
               Generated {formatAdded(event.speaker_transcript_generated_at)} · speaker labels are a
-              best-effort read of who&apos;s speaking, not verified audio-based diarization
+              best-effort read of who&apos;s speaking, not verified audio-based
+              diarization
             </p>
           )}
-        </section>
+        </div>
 
-        <section className="rounded-lg border border-border-warm bg-white p-5">
+        {/* Summary - never generated automatically, only on this click. */}
+        <div className="rounded-lg border border-border-warm bg-white p-4">
           <h2 className="text-sm font-bold uppercase tracking-wider text-ink-muted mb-3">Summary</h2>
 
-          {summaryError && (
-            <div className="mb-3 rounded-md bg-red-50 border border-red-200 text-red-700 text-xs px-3 py-2">{summaryError}</div>
-          )}
+          {summaryError && <p className="text-red-600 text-xs mb-2">{summaryError}</p>}
+          {summaryNote && <p className="text-xs text-ink-muted mb-2">{summaryNote}</p>}
 
-          {generating && (
-            <div className="mb-3 rounded-md bg-teal-tint border border-teal-tint-strong text-teal-dark text-xs px-3 py-2">
-              Generating…
-            </div>
-          )}
-
-          {event.meeting_summary ? (
+          {!event.meeting_summary ? (
             <>
-              <p className="text-sm text-[#1a1a1a] whitespace-pre-wrap leading-relaxed mb-3">{event.meeting_summary}</p>
-              <p className="text-xs text-ink-muted bg-[#f3f2ec] border border-border-warm rounded px-3 py-2 mb-3">
-                Built from this transcript by plain extractive scoring (which words repeat most, which lines carry
-                them) — deterministic code, not a model call.
-              </p>
-              {event.summary_generated_at && (
-                <p className="text-xs text-ink-muted mb-4">Generated {formatAdded(event.summary_generated_at)}</p>
-              )}
-              <div className="flex flex-wrap items-center gap-2">
-                <button
-                  type="button"
-                  onClick={handleGenerateSummary}
-                  disabled={generating || !text}
-                  className="px-3 py-1.5 text-xs font-medium rounded-md border border-border-warm text-ink-muted hover:bg-cream disabled:opacity-50"
-                >
-                  {generating ? "Regenerating…" : "Regenerate"}
-                </button>
-                <button
-                  type="button"
-                  onClick={handleSave}
-                  disabled={saveState === "loading"}
-                  className="px-3 py-1.5 text-xs font-semibold rounded-md bg-brand text-white hover:bg-brand-dark disabled:opacity-50"
-                >
-                  {saveState === "loading" ? "Saving…" : saveState === "done" ? "Saved ✓" : "Save"}
-                </button>
-              </div>
-              {saveError && <p className="text-xs text-red-600 mt-2">{saveError}</p>}
-              <p className="text-[11px] text-ink-muted mt-2">
-                Saved to this browser session only (fixture demo data) — resets on refresh, same as every other edit
-                in this demo.
-              </p>
-            </>
-          ) : (
-            <>
-              <p className="text-sm text-ink-muted border border-dashed border-border-warm rounded-lg px-4 py-6 text-center mb-3">
-                No summary yet — generate one from the transcript on the left.
-              </p>
+              <p className="text-sm text-ink-muted mb-3">No summary yet.</p>
               <button
                 type="button"
                 onClick={handleGenerateSummary}
-                disabled={generating || !text}
+                disabled={generating}
                 className="px-3 py-1.5 text-xs font-semibold rounded-md bg-brand text-white hover:bg-brand-dark disabled:opacity-40"
               >
                 {generating ? "Generating…" : "Generate Summary"}
               </button>
-              {!text && (
-                <p className="text-xs text-ink-muted mt-2">
-                  No transcript text captured for this recording, so there&apos;s nothing to summarize.
+            </>
+          ) : (
+            <>
+              <div className="whitespace-pre-wrap text-sm text-[#1a1a1a] leading-relaxed mb-3 max-h-[55vh] overflow-y-auto">
+                {event.meeting_summary}
+              </div>
+              {event.summary_generated_at && (
+                <p className="text-[11px] text-ink-muted mb-3">
+                  Generated {formatAdded(event.summary_generated_at)}
                 </p>
               )}
+              <div className="flex items-center gap-2 flex-wrap">
+                <button
+                  type="button"
+                  onClick={handleGenerateSummary}
+                  disabled={generating}
+                  className="px-3 py-1.5 text-xs font-semibold rounded-md bg-brand text-white hover:bg-brand-dark disabled:opacity-40"
+                >
+                  {generating ? "Generating…" : "Regenerate"}
+                </button>
+                {event.topic && (
+                  <button
+                    type="button"
+                    onClick={handleSave}
+                    disabled={saving}
+                    className="px-3 py-1.5 text-xs font-semibold rounded-md border border-border-warm text-[#1a1a1a] hover:bg-brand-tint/30 disabled:opacity-40"
+                  >
+                    {saving ? "Saving…" : "Save to project folder"}
+                  </button>
+                )}
+              </div>
+              {saveError && <p className="text-red-600 text-xs mt-2">{saveError}</p>}
+              {savedTo && <p className="text-teal-dark text-xs mt-2">Saved to {savedTo}</p>}
             </>
           )}
-        </section>
+        </div>
       </div>
 
       {/* Diarize - a structured participants/decisions/action-items/
-          parked-items/per-speaker breakdown, matching the real app's own
-          shape (core/recordings.py's _render_diarization_markdown). Its own
-          full-width section, separate from the plain code-based Summary
-          above. */}
-      <div className="rounded-lg border border-border-warm bg-white p-5 mt-6">
+          parked-items/per-speaker breakdown, matching the shape of the
+          supplied reference example (30 Sep) - a local-only LLM call
+          (core/local_llm.py), never the raw transcript being sent anywhere
+          external. Deliberately its own full-width section, separate from
+          the plain code-based Summary above. */}
+      <div className="rounded-lg border border-border-warm bg-white p-4 mt-6">
         <div className="flex items-center justify-between mb-3 gap-2 flex-wrap">
           <h2 className="text-sm font-bold uppercase tracking-wider text-ink-muted">Diarize</h2>
           <button
@@ -305,12 +283,8 @@ export default function TranscriptDetailClient({ id }) {
           </button>
         </div>
 
-        {diarizeError && (
-          <div className="mb-3 rounded-md bg-red-50 border border-red-200 text-red-700 text-xs px-3 py-2">{diarizeError}</div>
-        )}
-        {diarizeNote && (
-          <p className="text-xs mb-3 rounded-md px-2.5 py-1.5 bg-[#f3f2ec] text-ink-muted">{diarizeNote}</p>
-        )}
+        {diarizeError && <p className="text-red-600 text-xs mb-2">{diarizeError}</p>}
+        {diarizeNote && <p className="text-xs mb-2 rounded-md px-2.5 py-1.5 bg-[#f3f2ec] text-ink-muted">{diarizeNote}</p>}
 
         {event.diarization_result ? (
           <>
@@ -320,15 +294,15 @@ export default function TranscriptDetailClient({ id }) {
             {event.diarization_generated_at && (
               <p className="text-[11px] text-ink-muted mt-3">
                 Generated {formatAdded(event.diarization_generated_at)} — participants and per-speaker
-                attribution come from reading the transcript text itself, not real audio-based speaker
-                diarization
+                attribution come from reading the transcript text itself, not real
+                audio-based speaker diarization
               </p>
             )}
           </>
         ) : (
           <p className="text-sm text-ink-muted">
-            No breakdown yet — click Diarize to get participants, decisions, action items, parked items
-            and a per-speaker summary from this transcript.
+            No breakdown yet — click Diarize to get participants, decisions, action items, parked
+            items and a per-speaker summary from this transcript.
           </p>
         )}
       </div>

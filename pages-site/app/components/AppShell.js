@@ -1,7 +1,7 @@
 "use client";
 
 import { usePathname } from "next/navigation";
-import { AuthProvider, useAuth } from "../lib/AuthContext";
+import { AuthProvider, PUBLIC_PATHS, useAuth } from "../lib/AuthContext";
 import Sidebar from "./Sidebar";
 import CommandPalette from "./CommandPalette";
 
@@ -9,10 +9,10 @@ function Guarded({ children }) {
   const { user, loading } = useAuth();
   const pathname = usePathname();
 
-  // The login page and the public search page ("/") render standalone - no
-  // sidebar/search chrome for a logged-out person to see. Everything else
-  // is the admin console and needs a real session.
-  if (pathname === "/login" || pathname === "/") return children;
+  // Public auth pages render standalone - no sidebar/search chrome for a
+  // logged-out person to see. Everything else is the admin console and
+  // needs a real session.
+  if (PUBLIC_PATHS.has(pathname)) return children;
 
   if (loading) {
     return (
@@ -22,6 +22,8 @@ function Guarded({ children }) {
     );
   }
 
+  // Not logged in - nothing to render. (The demo's AuthProvider always
+  // provides the fixture demo user, so this is only a safety net.)
   if (!user) return null;
 
   return (

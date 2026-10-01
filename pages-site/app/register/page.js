@@ -38,7 +38,7 @@ export default function RegisterPage() {
       await api.primeCsrf();
       await api.register(username.trim(), email.trim(), password, displayName.trim());
       await refresh();
-      router.replace("/dashboard");
+      router.replace("/home");
     } catch (err) {
       const match = err.message.match(/"error":\s*"([^"]+)"/);
       setError(match ? match[1] : "Couldn't create that account. Please try again.");

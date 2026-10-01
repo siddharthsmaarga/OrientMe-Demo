@@ -3,14 +3,35 @@
 import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { api } from "../lib/api";
+import { formatRelativeDay } from "../lib/format";
 
 // Universal search - Ctrl+K (Cmd+K on Mac), invoked from anywhere in the
 // app. Mounted once in the root layout, not per-page, so the shortcut works
 // regardless of which screen is open. Debounced live search against the
-// backend (project names, stakeholders, tasks, files) rather than shipping
-// everything to the client to filter - the same reasoning behind every
-// other search built server-side in this app.
+// backend (projects, people, topics/content, files, tasks) rather than
+// shipping everything to the client to filter - the same reasoning behind
+// every other search built server-side in this app.
+//
+// Shape follows the "Website Search Journey" design (product feedback, 30 Sep): type a
+// few words -> grouped suggestions -> pick a result -> land on a
+// destination that shows provenance (file counts) and freshness ("Last
+// indexed"). "Person" opens the projects that person appears in, not a
+// standalone profile - the design's own behavior contract. Every real pick
+// (and every real query that never led to one) is logged server-side via
+// api.logSearchOutcome() so search quality can be reviewed later, not
+// guessed at - see backend SearchLog/Django admin.
 const DEBOUNCE_MS = 150;
+const EMPTY_RESULTS = { projects: [], stakeholders: [], topics: [], files: [], tasks: [] };
+
+// display_name is sometimes a full disk path (folder-scanned files keep
+// their original absolute path as the label) - shown as just the filename
+// here so a long path can't blow out the palette's fixed width; the full
+// path is still what the destination page shows.
+function basename(pathLike) {
+  if (!pathLike) return pathLike;
+  const parts = pathLike.split(/[\\/]/);
+  return parts[parts.length - 1] || pathLike;
+}
 
 export default function CommandPalette() {
   const router = useRouter();
@@ -21,15 +42,43 @@ export default function CommandPalette() {
   const [activeIndex, setActiveIndex] = useState(0);
   const inputRef = useRef(null);
   const debounceRef = useRef(null);
+  // Tracks whether THIS session's query ever produced a pick, so closing
+  // without one (Escape, click-away) can still log "searched but nothing
+  // was chosen" - the "No useful match" / abandoned-search signal.
+  const pickedRef = useRef(false);
+  const lastLoggedQueryRef = useRef("");
+
+  function logOutcome(item) {
+    const q = query.trim();
+    if (!q) return;
+    lastLoggedQueryRef.current = q;
+    api
+      .logSearchOutcome({
+        query: q,
+        result_count: results ? Object.values(results).reduce((sum, arr) => sum + arr.length, 0) : 0,
+        chosen_kind: item ? item.kind : "none",
+        chosen_label: item ? item.name || item.title || item.display_name || "" : "",
+        topic_id: item ? item.topic_id ?? item.id ?? null : null,
+      })
+      .catch(() => {}); // review logging must never surface an error to the user
+  }
+
+  function closePalette() {
+    if (!pickedRef.current && query.trim() && query.trim() !== lastLoggedQueryRef.current) {
+      logOutcome(null);
+    }
+    setOpen(false);
+  }
 
   useEffect(() => {
     function handleKeyDown(e) {
       const isMod = e.metaKey || e.ctrlKey;
       if (isMod && e.key.toLowerCase() === "k") {
         e.preventDefault();
-        setOpen((o) => !o);
+        if (open) closePalette();
+        else setOpen(true);
       } else if (e.key === "Escape" && open) {
-        setOpen(false);
+        closePalette();
       }
     }
     // A visible button (the Sidebar's search hint) can't reach this
@@ -45,13 +94,16 @@ export default function CommandPalette() {
       window.removeEventListener("keydown", handleKeyDown);
       window.removeEventListener("orientme:open-search", handleOpenEvent);
     };
-  }, [open]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, query, results]);
 
   useEffect(() => {
     if (open) {
       setQuery("");
       setResults(null);
       setActiveIndex(0);
+      pickedRef.current = false;
+      lastLoggedQueryRef.current = "";
       setTimeout(() => inputRef.current?.focus(), 10);
     }
   }, [open]);
@@ -70,7 +122,7 @@ export default function CommandPalette() {
         const data = await api.search(query.trim());
         setResults(data);
       } catch {
-        setResults({ projects: [], stakeholders: [], tasks: [], files: [] });
+        setResults(EMPTY_RESULTS);
       } finally {
         setLoading(false);
       }
@@ -81,18 +133,22 @@ export default function CommandPalette() {
   const flatItems = results
     ? [
         ...results.projects.map((p) => ({ kind: "project", ...p })),
-        ...results.stakeholders.map((s) => ({ kind: "stakeholder", ...s })),
-        ...results.tasks.map((t) => ({ kind: "task", ...t })),
+        ...results.stakeholders.map((s) => ({ kind: "person", ...s })),
+        ...results.topics.map((t) => ({ kind: "topic", ...t })),
         ...results.files.map((f) => ({ kind: "file", ...f })),
+        ...results.tasks.map((t) => ({ kind: "task", ...t })),
       ]
     : [];
 
   function go(item) {
+    pickedRef.current = true;
+    logOutcome(item);
     setOpen(false);
     if (item.kind === "project") router.push(`/topics/?id=${encodeURIComponent(item.id)}`);
-    else if (item.kind === "stakeholder") router.push(`/topics/?id=${encodeURIComponent(item.topic_id)}`);
+    else if (item.kind === "person") router.push(`/topics/?id=${encodeURIComponent(item.projects[0]?.topic_id)}`);
     else if (item.kind === "task") router.push(`/topics/?id=${encodeURIComponent(item.topic_id)}`);
     else if (item.kind === "file") router.push(`/topics/?id=${encodeURIComponent(item.topic_id)}`);
+    else if (item.kind === "topic") router.push(`/topics/?id=${encodeURIComponent(item.topic_id)}`);
   }
 
   function handleInputKeyDown(e) {
@@ -115,7 +171,7 @@ export default function CommandPalette() {
   return (
     <div
       className="fixed inset-0 bg-black/40 flex items-start justify-center pt-[12vh] p-4 z-[100]"
-      onClick={() => setOpen(false)}
+      onClick={closePalette}
     >
       <div
         className="bg-white rounded-lg shadow-2xl w-full max-w-xl overflow-hidden"
@@ -131,7 +187,7 @@ export default function CommandPalette() {
               setActiveIndex(0);
             }}
             onKeyDown={handleInputKeyDown}
-            placeholder="Search projects, stakeholders, tasks, files…"
+            placeholder="Search projects, people, topics, files…"
             className="flex-1 text-sm outline-none placeholder:text-slate-400"
           />
           <kbd className="text-[10px] text-slate-400 border border-slate-200 rounded px-1.5 py-0.5">
@@ -142,16 +198,20 @@ export default function CommandPalette() {
         <div className="max-h-[60vh] overflow-y-auto py-2">
           {!query.trim() && (
             <p className="px-4 py-6 text-sm text-slate-400 text-center">
-              Type to search across every project — names, stakeholders, tasks, files.
+              Type to search across every project — names, people, topics, files.
             </p>
           )}
           {query.trim() && loading && !results && (
             <p className="px-4 py-6 text-sm text-slate-400 text-center">Searching…</p>
           )}
           {results && flatItems.length === 0 && !loading && (
-            <p className="px-4 py-6 text-sm text-slate-400 text-center">
-              No matches for &ldquo;{query}&rdquo;.
-            </p>
+            <div className="px-4 py-6 text-sm text-slate-400 text-center space-y-1">
+              <p>No matches for &ldquo;{query}&rdquo;.</p>
+              <p className="text-xs text-slate-400">
+                Try a shorter term or a name. Check spelling. Only authorized, indexed sources
+                appear here.
+              </p>
+            </div>
           )}
 
           {results && results.projects.length > 0 && (
@@ -168,6 +228,7 @@ export default function CommandPalette() {
                     {p.one_liner && (
                       <span className="text-slate-400 truncate"> — {p.one_liner}</span>
                     )}
+                    <Provenance fileCount={p.file_count} lastIndexed={p.last_indexed} />
                   </ResultRow>
                 );
               })}
@@ -175,17 +236,74 @@ export default function CommandPalette() {
           )}
 
           {results && results.stakeholders.length > 0 && (
-            <ResultGroup label="Stakeholders">
+            <ResultGroup label="People">
               {results.stakeholders.map((s, i) => {
                 runningIndex++;
                 return (
                   <ResultRow
-                    key={`stakeholder-${i}`}
+                    key={`person-${i}`}
                     active={runningIndex === activeIndex}
-                    onClick={() => go({ kind: "stakeholder", ...s })}
+                    onClick={() => go({ kind: "person", ...s })}
                   >
                     <HighlightText text={s.name} query={query} className="font-medium text-slate-800" />
-                    <span className="text-slate-400"> — {s.topic_name}</span>
+                    <span className="text-slate-400">
+                      {" "}
+                      — projects: {s.projects.map((pr) => pr.topic_name).join(", ")}
+                    </span>
+                  </ResultRow>
+                );
+              })}
+            </ResultGroup>
+          )}
+
+          {results && results.topics.length > 0 && (
+            <ResultGroup label="Topics">
+              {results.topics.map((t) => {
+                runningIndex++;
+                return (
+                  <ResultRow
+                    key={`topic-${t.id}`}
+                    active={runningIndex === activeIndex}
+                    onClick={() => go({ kind: "topic", ...t })}
+                    stacked
+                  >
+                    <div className="flex items-center gap-1 min-w-0 w-full">
+                      <span className="font-medium text-slate-800 truncate">
+                        {basename(t.display_name)}
+                      </span>
+                      <span className="text-slate-400 shrink-0"> — {t.topic_name}</span>
+                      <Provenance lastIndexed={t.last_indexed} />
+                    </div>
+                    {t.snippet && (
+                      <HighlightText
+                        text={t.snippet}
+                        query={query}
+                        className="block text-slate-400 truncate italic text-xs w-full"
+                      />
+                    )}
+                  </ResultRow>
+                );
+              })}
+            </ResultGroup>
+          )}
+
+          {results && results.files.length > 0 && (
+            <ResultGroup label="Files">
+              {results.files.map((f) => {
+                runningIndex++;
+                return (
+                  <ResultRow
+                    key={`file-${f.id}`}
+                    active={runningIndex === activeIndex}
+                    onClick={() => go({ kind: "file", ...f })}
+                  >
+                    <HighlightText
+                      text={basename(f.display_name)}
+                      query={query}
+                      className="text-slate-800 truncate font-mono text-xs"
+                    />
+                    <span className="text-slate-400"> — {f.topic_name}</span>
+                    <Provenance lastIndexed={f.last_indexed} />
                   </ResultRow>
                 );
               })}
@@ -209,28 +327,6 @@ export default function CommandPalette() {
               })}
             </ResultGroup>
           )}
-
-          {results && results.files.length > 0 && (
-            <ResultGroup label="Files">
-              {results.files.map((f) => {
-                runningIndex++;
-                return (
-                  <ResultRow
-                    key={`file-${f.id}`}
-                    active={runningIndex === activeIndex}
-                    onClick={() => go({ kind: "file", ...f })}
-                  >
-                    <HighlightText
-                      text={f.display_name}
-                      query={query}
-                      className="text-slate-800 truncate font-mono text-xs"
-                    />
-                    <span className="text-slate-400"> — {f.topic_name}</span>
-                  </ResultRow>
-                );
-              })}
-            </ResultGroup>
-          )}
         </div>
       </div>
     </div>
@@ -248,18 +344,33 @@ function ResultGroup({ label, children }) {
   );
 }
 
-function ResultRow({ children, active, onClick }) {
+function ResultRow({ children, active, onClick, stacked = false }) {
   return (
     <button
       type="button"
       onClick={onClick}
-      className={`w-full text-left px-4 py-2 text-sm flex items-center gap-1 min-w-0 ${
-        active ? "bg-brand/10" : "hover:bg-slate-50"
-      }`}
+      className={`w-full text-left px-4 py-2 text-sm min-w-0 ${
+        stacked ? "flex flex-col gap-0.5" : "flex items-center gap-1"
+      } ${active ? "bg-brand/10" : "hover:bg-slate-50"}`}
     >
-      <span className="flex items-center gap-1 min-w-0 truncate">{children}</span>
+      {stacked ? (
+        children
+      ) : (
+        <span className="flex items-center gap-1 min-w-0 truncate flex-1">{children}</span>
+      )}
     </button>
   );
+}
+
+// Provenance/freshness, per the design's "Evidence links | N source items |
+// Last indexed: today" - shown as a small trailing badge so it reads as
+// metadata, not part of the match itself.
+function Provenance({ fileCount, lastIndexed }) {
+  if (fileCount == null && !lastIndexed) return null;
+  const parts = [];
+  if (fileCount != null) parts.push(`${fileCount} file${fileCount === 1 ? "" : "s"}`);
+  if (lastIndexed) parts.push(`updated ${formatRelativeDay(new Date(lastIndexed).getTime())}`);
+  return <span className="text-[11px] text-slate-300 shrink-0 ml-auto pl-2">{parts.join(" · ")}</span>;
 }
 
 // Live highlight of the matched substring - the same pattern every command

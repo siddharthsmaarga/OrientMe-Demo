@@ -51,7 +51,7 @@ export default function PublicOrient() {
 
   return (
     <div className="min-h-screen bg-cream flex flex-col items-center px-4 py-16">
-      <Link href="/dashboard" className="absolute top-4 right-5 text-xs text-slate-400 hover:text-teal-dark">
+      <Link href="/home" className="absolute top-4 right-5 text-xs text-slate-400 hover:text-teal-dark">
         Admin login →
       </Link>
 

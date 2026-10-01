@@ -18,6 +18,15 @@ import {
 import CalendarWidget from "../components/CalendarWidget";
 import ProjectTabs from "../components/ProjectTabs";
 import TaskBoard from "../components/TaskBoard";
+import {
+  briefHtmlPage,
+  briefMarkdown,
+  downloadText,
+  openInNewTab,
+  openSourceFile,
+  summaryCsv,
+  tasksCsv,
+} from "../lib/demoFiles";
 
 const PROJECT_TABS = [
   { key: "overview", label: "Overview" },
@@ -517,6 +526,24 @@ function TopicDetailContent() {
     URL.revokeObjectURL(url);
   }
 
+  // Client-side stand-ins for the backend's export endpoints (see
+  // lib/demoFiles.js) - built in the browser from the fixture data.
+  function exportBaseName() {
+    return topic.name.replace(/[^a-z0-9]+/gi, "-").replace(/^-|-$/g, "") || "project";
+  }
+
+  function handleExportBriefOnly() {
+    downloadText(`${exportBaseName()}-brief.md`, "text/markdown", briefMarkdown(topic, summary));
+  }
+
+  function handleExportSummaryCsv() {
+    downloadText(`${exportBaseName()}-brief-fields.csv`, "text/csv", summaryCsv(summary));
+  }
+
+  function handleExportTasksCsv() {
+    downloadText(`${exportBaseName()}-tasks.csv`, "text/csv", tasksCsv(tasks));
+  }
+
   async function handleAddFolder(e) {
     e.preventDefault();
     if (!newFolder.trim()) return;
@@ -578,8 +605,18 @@ function TopicDetailContent() {
     runBulkJob(api.ingest(id), setIngesting, setIngestResult);
   }
 
+  const MEDIA_EXTENSIONS = [".mp4", ".mov", ".webm", ".wav", ".mp3", ".m4a"];
+
   async function handleFileUpload(file) {
     if (!file) return;
+    const ext = file.name.slice(file.name.lastIndexOf(".")).toLowerCase();
+    // Audio/video goes through the background-job path (transcription can
+    // take minutes) - same polling runBulkJob already does for folder scans.
+    if (MEDIA_EXTENSIONS.includes(ext)) {
+      runBulkJob(api.uploadFile(id, file), setUploading, () => {});
+      if (fileInputRef.current) fileInputRef.current.value = "";
+      return;
+    }
     setUploading(true);
     try {
       await api.uploadFile(id, file);
@@ -761,6 +798,21 @@ function TopicDetailContent() {
                 </button>
                 <button
                   type="button"
+                  onClick={() => { handleExportBriefOnly(); setDataMenuOpen(false); }}
+                  className="w-full text-left px-3 py-1.5 text-slate-700 hover:bg-slate-50"
+                  title="AI Context Brief fields only"
+                >
+                  ↓ AI brief only (.md)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => { handleExportSummaryCsv(); setDataMenuOpen(false); }}
+                  className="w-full text-left px-3 py-1.5 text-slate-700 hover:bg-slate-50"
+                >
+                  ↓ AI brief fields (.csv)
+                </button>
+                <button
+                  type="button"
                   onClick={() => { summaryCsvInputRef.current?.click(); setDataMenuOpen(false); }}
                   disabled={importingSummaryCsv}
                   className="w-full text-left px-3 py-1.5 text-slate-700 hover:bg-slate-50 disabled:opacity-50"
@@ -770,6 +822,13 @@ function TopicDetailContent() {
                 <div className="mt-1 px-3 py-1.5 text-[11px] font-semibold uppercase tracking-wider text-ink-muted border-t border-border-warm">
                   Tasks
                 </div>
+                <button
+                  type="button"
+                  onClick={() => { handleExportTasksCsv(); setDataMenuOpen(false); }}
+                  className="w-full text-left px-3 py-1.5 text-slate-700 hover:bg-slate-50"
+                >
+                  ↓ Tasks (.csv)
+                </button>
                 <button
                   type="button"
                   onClick={() => { tasksCsvInputRef.current?.click(); setDataMenuOpen(false); }}
@@ -1044,11 +1103,13 @@ function TopicDetailContent() {
                       {uploading ? "Uploading…" : "Click or drag and drop to upload a file"}
                     </p>
                     <p className="text-[10px] text-slate-400 mt-1">
-                      .txt, .md, .docx, .pdf, .xlsx, .pptx
+                      .txt, .md, .docx, .pdf, .xlsx, .pptx, .eml, .msg — or a meeting recording
+                      (.mp4, .mov, .webm, .wav, .mp3, .m4a), transcribed locally on upload
                     </p>
                     <input
                       ref={fileInputRef}
                       type="file"
+                      accept=".txt,.md,.docx,.pdf,.xlsx,.xlsm,.pptx,.eml,.msg,.mp4,.mov,.webm,.wav,.mp3,.m4a"
                       onChange={(e) => {
                         const file = e.target.files?.[0];
                         if (file) handleFileUpload(file);
@@ -1057,6 +1118,8 @@ function TopicDetailContent() {
                       className="hidden"
                     />
                   </div>
+
+                  <BulkJobProgress busy={uploading} job={scanJob} />
                 </div>
               )}
 
@@ -1275,7 +1338,14 @@ function buildPromptHistory(messages) {
   const pairs = [];
   for (let i = 0; i < msgs.length; i++) {
     if (msgs[i].role === "user" && msgs[i + 1]?.role === "assistant") {
-      pairs.push({ id: msgs[i].id, question: msgs[i].content, answer: msgs[i + 1].content, date: msgs[i].created_at });
+      pairs.push({
+        id: msgs[i].id,
+        question: msgs[i].content,
+        answer: msgs[i + 1].content,
+        date: msgs[i].created_at,
+        answerId: msgs[i + 1].id,
+        feedback: msgs[i + 1].feedback || "",
+      });
     }
   }
   return pairs.reverse(); // newest first
@@ -1301,23 +1371,37 @@ function ContextBriefPanel({
   const fieldSources = summary?.field_sources || {};
   const [promptHistoryOpen, setPromptHistoryOpen] = useState(false);
   const [expandedPromptId, setExpandedPromptId] = useState(null);
-  const promptHistory = buildPromptHistory(topic.messages);
+  const [feedbackOverrides, setFeedbackOverrides] = useState({});
+  const promptHistory = buildPromptHistory(topic.messages).map((p) => ({
+    ...p,
+    feedback: feedbackOverrides[p.answerId] ?? p.feedback,
+  }));
 
-  // Demo build has no backend/real files to open, so this just cites the
-  // source file name (no broken "Edit ↗" link to a page that can't exist).
+  async function handleFeedback(answerId, value) {
+    setFeedbackOverrides((prev) => ({ ...prev, [answerId]: value }));
+    try {
+      await api.setMessageFeedback("topic", answerId, value);
+    } catch {
+      // Unobtrusive by design - a failed feedback click isn't worth
+      // surfacing an error for; it just won't have persisted.
+    }
+  }
+
   function EditLinks({ paths }) {
     const matched = (paths || []).map((p) => byPath[p]).filter(Boolean);
     if (matched.length === 0) return null;
     return (
       <p className="mt-1 flex flex-wrap gap-x-2 gap-y-0.5">
         {matched.map((f) => (
-          <span
+          <button
             key={f.id}
-            title={f.display_name || f.path}
-            className="text-[11px] text-ink-muted whitespace-nowrap"
+            type="button"
+            onClick={() => openSourceFile(f)}
+            title={`Open ${f.display_name || f.path} in its own application to edit it`}
+            className="text-[11px] text-brand hover:underline whitespace-nowrap"
           >
-            {(f.display_name || f.path).split(/[\\/]/).pop()}
-          </span>
+            {(f.display_name || f.path).split(/[\\/]/).pop()} · Edit ↗
+          </button>
         ))}
       </p>
     );
@@ -1353,11 +1437,25 @@ function ContextBriefPanel({
     : [];
 
   const stakeholderNames = collectStakeholders(meetingMetadata, topic.related_people);
-  // This standalone demo build has no backend, so the two launchers that
-  // pointed at backend-served pages (a shareable brief_html page, opening
-  // the project's real folder on disk) are left out entirely rather than
-  // shown as broken links - "Tasks" is a real in-app route, so it stays.
-  const launchers = [{ icon: "✅", label: "Tasks", href: "/tasks" }].filter(Boolean);
+  const firstFolder = topic.folders?.[0];
+
+  // Meetings/Documents/Full history dropped from here - all three are
+  // already visible further down this same page. In this static demo the
+  // two backend-backed launchers are simulated client-side: index.html opens
+  // a page generated in the browser from the brief, and Project folder
+  // explains that opening a local folder needs the full app.
+  const launchers = [
+    { icon: "✅", label: "Tasks", href: "/tasks" },
+    { icon: "🌐", label: "index.html", onClick: () => openInNewTab(briefHtmlPage(topic, summary)) },
+    firstFolder && {
+      icon: "📁",
+      label: "Project folder",
+      onClick: () =>
+        window.alert(
+          `Demo mode - the full app opens ${firstFolder.path} in File Explorer. A static web page can't open folders on your computer.`
+        ),
+    },
+  ].filter(Boolean);
 
   return (
     <section className="rounded-xl border border-border-warm border-l-4 border-l-brand bg-white shadow-sm p-4 min-w-0">
@@ -1624,7 +1722,32 @@ function ContextBriefPanel({
                           </span>
                         </button>
                         {expanded && (
-                          <p className="text-sm text-slate-600 px-2.5 pb-2 whitespace-pre-wrap">{p.answer}</p>
+                          <div className="px-2.5 pb-2">
+                            <p className="text-sm text-slate-600 whitespace-pre-wrap">{p.answer}</p>
+                            <div className="flex items-center gap-1 mt-1.5">
+                              <span className="text-[10px] text-slate-400 mr-0.5">Helpful?</span>
+                              <button
+                                type="button"
+                                title="Helpful"
+                                onClick={() => handleFeedback(p.answerId, p.feedback === "up" ? "" : "up")}
+                                className={`text-xs rounded px-1.5 py-0.5 ${
+                                  p.feedback === "up" ? "bg-emerald-100 text-emerald-700" : "text-slate-300 hover:bg-slate-100"
+                                }`}
+                              >
+                                👍
+                              </button>
+                              <button
+                                type="button"
+                                title="Not helpful"
+                                onClick={() => handleFeedback(p.answerId, p.feedback === "down" ? "" : "down")}
+                                className={`text-xs rounded px-1.5 py-0.5 ${
+                                  p.feedback === "down" ? "bg-red-100 text-red-700" : "text-slate-300 hover:bg-slate-100"
+                                }`}
+                              >
+                                👎
+                              </button>
+                            </div>
+                          </div>
                         )}
                       </li>
                     );
