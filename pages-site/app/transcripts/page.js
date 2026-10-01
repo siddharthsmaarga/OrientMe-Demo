@@ -85,20 +85,12 @@ export default function TranscriptsPage() {
     }
   }
 
-  // Watched-folder recordings only - files someone dragged in by hand
-  // never belong on this page (ported from the real app); in this demo
-  // they live in Inbox instead.
-  const watchedFolderEvents = events.filter((ev) => ev.source !== "manual_drop");
-  const pending = sortNewestFirst(watchedFolderEvents.filter((ev) => ev.status === "pending_new_project"));
-  const routed = watchedFolderEvents.filter(
-    (ev) => ev.topic && (ev.status === "routed" || ev.status === "auto_created")
-  );
+  const pending = sortNewestFirst(events.filter((ev) => ev.status === "pending_new_project"));
+  const routed = events.filter((ev) => ev.topic && (ev.status === "routed" || ev.status === "auto_created"));
   const other = sortNewestFirst(
-    watchedFolderEvents.filter(
-      (ev) => !ev.topic && ev.status !== "pre_existing" && ev.status !== "pending_new_project"
-    )
+    events.filter((ev) => !ev.topic && ev.status !== "pre_existing" && ev.status !== "pending_new_project")
   );
-  const preExisting = watchedFolderEvents.filter((ev) => ev.status === "pre_existing");
+  const preExisting = events.filter((ev) => ev.status === "pre_existing");
 
   const groupsByTopic = {};
   for (const ev of routed) {
@@ -116,19 +108,12 @@ export default function TranscriptsPage() {
         Recordings dropped into the shared Recordings folder are picked up automatically and
         transcribed, then grouped below by the project they belong to.
       </p>
-      <p className="text-ink-muted text-sm mb-1">
+      <p className="text-ink-muted text-sm mb-8">
         Configure the watched folder and transcription engine on the{" "}
         <Link href="/settings" className="text-teal-dark hover:underline">
           Settings page
         </Link>
         .
-      </p>
-      <p className="text-ink-muted text-sm mb-8">
-        Looking for a file you added yourself? That lives in the{" "}
-        <Link href="/inbox" className="text-teal-dark hover:underline">
-          Inbox
-        </Link>{" "}
-        instead — move it to a project or delete it from there.
       </p>
 
       {error && <p className="text-red-600 text-sm mb-4">{error}</p>}
@@ -293,6 +278,11 @@ export default function TranscriptsPage() {
                     <p className="text-xs text-ink-muted mt-0.5">{formatAdded(recordingDisplayDate(ev))}</p>
                   </div>
                   <div className="shrink-0 flex items-center gap-1.5">
+                    {ev.source === "manual_drop" && (
+                      <span className="text-[11px] font-semibold px-2 py-1 rounded-full bg-[#f3f2ec] text-ink-muted">
+                        Manually dropped
+                      </span>
+                    )}
                     <span className={`text-[11px] font-semibold px-2 py-1 rounded-full ${style.bg} ${style.text}`}>
                       {style.label}
                     </span>

@@ -610,40 +610,66 @@ function buildInitialState() {
       speaker_transcript: "",
       speaker_transcript_generated_at: null,
     },
-  ];
-
-  // Inbox - files that didn't confidently match any project (real app: a
-  // singleton topic_type "general" topic that dropped files auto-file into).
-  // Kept out of store.topics here so no project list/count/search in this
-  // static demo ever has to special-case it; see api.js's inbox methods.
-  // "text" is the file's extracted text (real app: extracted on ingest).
-  const inboxFiles = [
+    // The manual drop folder - a second, separate folder (distinct from the
+    // watched Recordings folder above) where anyone can drop any file type
+    // to get it quickly tagged to a project by hand. Deliberately never
+    // auto-routed by an LLM (a privacy/architecture decision: meeting
+    // transcripts should never be sent to an external API for
+    // classification) - everything dropped here always lands as
+    // "needs_review", tagged via the TopicAutocomplete search box instead.
     {
-      id: 901,
-      path: "budget-notes.xlsx",
-      display_name: "budget-notes.xlsx",
-      source_method: "upload",
-      first_added_at: isoDaysAgo(2),
-      text:
+      id: 7,
+      file_path: "budget-notes.xlsx",
+      file_name: "budget-notes.xlsx",
+      detected_at: isoDaysAgo(2),
+      // No Teams-style filename stamp on a plain spreadsheet someone
+      // dropped by hand - recordingDisplayDate falls back to detected_at
+      // here, same as the real app's own fallback when neither a filename
+      // match nor a readable file date is available.
+      recording_date: teamsFilenameDate("budget-notes.xlsx"),
+      source: "manual_drop",
+      topic: null,
+      topic_name: "",
+      ingested_file: null,
+      status: "needs_review",
+      engine_used: "",
+      detail: "Dropped in the manual folder - no confident project name match; pick one below.",
+      suggested_topic_name: "",
+      suggested_topic_one_liner: "",
+      suggested_topic_type: "",
+      transcript_text:
         "Q4 budget notes (extracted text)\n\nRebrand line item: logo + palette work tracking slightly under budget.\nOnboarding line item: Meridian's onboarding costs tracking on plan.\nOpen question: does the vendor security review need its own budget line, or does it fold into general IT spend?",
+      meeting_summary: "",
+      summary_generated_at: null,
+      diarization_result: "",
+      diarization_generated_at: null,
+      speaker_transcript: "",
+      speaker_transcript_generated_at: null,
     },
     {
-      id: 902,
-      path: "Quick voice memo - Acme colors-20260929_081500UTC.m4a",
-      display_name: "Quick voice memo - Acme colors-20260929_081500UTC.m4a",
-      source_method: "upload",
-      first_added_at: isoDaysAgo(1),
-      text:
-        "Jordan Lee: Leaving myself a quick note - thinking the warm-neutral palette could use one darker accent for the footer band, worth mocking up before the next review.",
-    },
-    {
-      id: 903,
-      path: "Offsite ideas.txt",
-      display_name: "Offsite ideas.txt",
-      source_method: "folder_upload",
-      first_added_at: isoDaysAgo(1),
-      text:
-        "Team offsite ideas\n\nOption A: two days at the lakeside venue, workshops in the morning.\nOption B: one day in the city office with an external facilitator.\nBudget cap still to be confirmed with finance.",
+      id: 8,
+      file_path: "Quick voice memo - Acme colors-20260929_081500UTC.m4a",
+      file_name: "Quick voice memo - Acme colors-20260929_081500UTC.m4a",
+      detected_at: isoDaysAgo(1),
+      recording_date: teamsFilenameDate("Quick voice memo - Acme colors-20260929_081500UTC.m4a"),
+      source: "manual_drop",
+      topic: null,
+      topic_name: "",
+      ingested_file: null,
+      status: "needs_review",
+      engine_used: "local_whisper",
+      detail: "Dropped in the manual folder - no confident project name match; pick one below.",
+      suggested_topic_name: "",
+      suggested_topic_one_liner: "",
+      suggested_topic_type: "",
+      transcript_text:
+        "Jordan Lee: Leaving myself a quick note — thinking the warm-neutral palette could use one darker accent for the footer band, worth mocking up before the next review.",
+      meeting_summary: "",
+      summary_generated_at: null,
+      diarization_result: "",
+      diarization_generated_at: null,
+      speaker_transcript: "",
+      speaker_transcript_generated_at: null,
     },
   ];
 
@@ -662,7 +688,6 @@ function buildInitialState() {
     loops: [],
     connectors,
     recordingEvents,
-    inboxFiles,
     settings: {
       llm_provider: "openrouter",
       llm_api_key_set: false,
@@ -677,6 +702,7 @@ function buildInitialState() {
       // recordingEvents above and its own header comment).
       recordings_watch_folder: "C:\\Demo\\Recordings",
       recordings_suggest_new_topics: "true",
+      manual_drop_folder: "C:\\Demo\\Recordings\\To Tag",
       transcription_engine: "local_whisper",
       external_transcription_url: "",
     },
