@@ -79,6 +79,17 @@ export default function TranscriptsPage() {
     }
   }
 
+  // Small corner cross: stop tracking a "new transcript" that isn't needed.
+  // Never deletes the file - the event is just marked dismissed.
+  async function handleDismiss(eventId) {
+    try {
+      await api.dismissRecordingEvent(eventId);
+      loadEvents();
+    } catch (e) {
+      setError(e.message);
+    }
+  }
+
   async function handleAssign(eventId) {
     const topicId = assigning[eventId];
     if (!topicId) return;
@@ -129,7 +140,7 @@ export default function TranscriptsPage() {
   );
   const other = sortNewestFirst(
     watchedFolderEvents.filter(
-      (ev) => !ev.topic && ev.status !== "pre_existing" && ev.status !== "pending_new_project"
+      (ev) => !ev.topic && ev.status !== "pre_existing" && ev.status !== "pending_new_project" && ev.status !== "dismissed"
     )
   );
   const preExisting = watchedFolderEvents.filter((ev) => ev.status === "pre_existing");
@@ -165,6 +176,14 @@ export default function TranscriptsPage() {
             <span className={`text-[11px] font-semibold px-2 py-1 rounded-full ${style.bg} ${style.text}`}>
               {style.label}
             </span>
+            <button
+              type="button"
+              title="Dismiss - stop tracking this file"
+              onClick={() => handleDismiss(ev.id)}
+              className="w-5 h-5 flex items-center justify-center rounded-full bg-slate-100 text-slate-400 text-[11px] leading-none hover:bg-red-500 hover:text-white"
+            >
+              ✕
+            </button>
           </div>
         </div>
         {ev.detail && <p className="text-xs text-ink-muted mt-2">{ev.detail}</p>}
@@ -290,9 +309,19 @@ export default function TranscriptsPage() {
               const draft = draftFor(ev);
               return (
                 <div key={ev.id} className="rounded-lg border-2 border-dashed border-brand/40 bg-brand-tint/30 px-4 py-3.5">
-                  <p className="text-xs font-medium text-ink-muted mb-2 truncate" title={ev.file_name}>
-                    {ev.file_name} · {formatAdded(recordingDisplayDate(ev))}
-                  </p>
+                  <div className="flex items-start justify-between gap-3 mb-2">
+                    <p className="text-xs font-medium text-ink-muted truncate" title={ev.file_name}>
+                      {ev.file_name} · {formatAdded(recordingDisplayDate(ev))}
+                    </p>
+                    <button
+                      type="button"
+                      title="Dismiss - stop tracking this file"
+                      onClick={() => handleDismiss(ev.id)}
+                      className="shrink-0 w-5 h-5 flex items-center justify-center rounded-full bg-slate-100 text-slate-400 text-[11px] leading-none hover:bg-red-500 hover:text-white"
+                    >
+                      ✕
+                    </button>
+                  </div>
                   <p className="text-sm text-[#1a1a1a] mb-3">
                     This recording looks like it might be a <strong>new project</strong> — not yet
                     tracked in OrientMe. Review the suggested name below, then confirm or dismiss.
