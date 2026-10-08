@@ -16,11 +16,13 @@
 
 import { store, newId } from "./fixtures";
 import { generateDemoAnswer } from "./localModel";
+import { findSupportingPassage } from "./evidence";
 import {
   DOC_TYPE_LABELS,
   MEETING_TYPE_LABELS,
   TIMELINE_DOC_TYPES,
   csvPhase,
+  displayTitle,
   ensureFileMeta,
   meetingTimelineTitle,
   normaliseTags,
@@ -138,6 +140,14 @@ function ingestEventIntoTopic(ev, topic) {
   });
 }
 
+export const DEMO_SETTINGS_PASSWORD = "demo";
+
+function requireSettingsPassword(supplied) {
+  if (supplied !== DEMO_SETTINGS_PASSWORD) {
+    throw new Error('403 Forbidden: {"error": "The settings password is missing or wrong.", "code": "settings_password"}');
+  }
+}
+
 function wait(ms = 220) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -168,6 +178,8 @@ function metaKeys(f) {
     doc_type: f.doc_type,
     doc_type_label: DOC_TYPE_LABELS[f.doc_type] || "",
     doc_type_source: f.doc_type_source || "",
+    // What the file IS ("Proposal V2"), shown ahead of its real file name.
+    display_title: displayTitle(f),
     topic_tags: tags.join(", "),
     topic_tag_list: tags,
     signal: f.signal || "",
@@ -254,6 +266,12 @@ function topicDetail(topic) {
     files: topicFiles(topic.id).map(fileWithMeta),
     messages: store.messages.filter((m) => m.topic === topic.id),
   };
+}
+
+// The task shape the API returns: action items carry no due date.
+function taskOut(t) {
+  const { due_date, ...rest } = t;
+  return { ...rest, topic_name: findTopic(t.topic)?.name || "" };
 }
 
 function findTopic(id) {
@@ -888,32 +906,14 @@ export const api = {
         meeting_sequence: f.meta.meeting_sequence ?? null,
       });
     });
-    store.tasks.forEach((t) => {
-      if (!t.due_date) return;
-      if (topicId && t.topic !== Number(topicId)) return;
-      const topic = findTopic(t.topic);
-      events.push({
-        kind: "task",
-        date: t.due_date,
-        topic_id: topic.id,
-        topic_name: topic.name,
-        topic_type: topic.topic_type,
-        id: t.id,
-        title: t.title,
-        assignee: t.assignee,
-        status: t.status,
-        due_date: t.due_date,
-      });
-    });
+    // Action items have no due date, so the calendar shows meetings only.
     return events.sort((a, b) => b.date.localeCompare(a.date));
   },
   getTasks: async (topicId) => {
     await wait();
-    return store.tasks
-      .filter((t) => !topicId || t.topic === Number(topicId))
-      .map((t) => ({ ...t, topic_name: findTopic(t.topic)?.name || "" }));
+    return store.tasks.filter((t) => !topicId || t.topic === Number(topicId)).map(taskOut);
   },
-  createTask: async (topicId, { title, assignee, due_date }) => {
+  createTask: async (topicId, { title, assignee }) => {
     await wait();
     const task = {
       id: newId(),
@@ -921,25 +921,54 @@ export const api = {
       source_file: null,
       title,
       assignee: assignee || "",
-      due_date: due_date || null,
+      due_date: null,
       status: "backlog",
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
     };
     store.tasks.push(task);
-    return { ...task, topic_name: findTopic(task.topic)?.name || "" };
+    return taskOut(task);
   },
   updateTask: async (taskId, fields) => {
     await wait();
     const task = store.tasks.find((t) => t.id === Number(taskId));
     if (!task) throw new Error("404 Not Found");
     Object.assign(task, fields, { updated_at: new Date().toISOString() });
-    return { ...task, topic_name: findTopic(task.topic)?.name || "" };
+    return taskOut(task);
   },
   deleteTask: async (taskId) => {
     await wait();
     store.tasks = store.tasks.filter((t) => t.id !== Number(taskId));
     return null;
+  },
+  // Where an action item came from: its file (template name first, real name
+  // second) and the closest-matching passage of it - the demo's stand-in for
+  // the real app's GET /api/tasks/<id>/source/.
+  getTaskSource: async (taskId) => {
+    await wait(120);
+    const task = store.tasks.find((t) => t.id === Number(taskId));
+    if (!task) throw new Error("404 Not Found");
+    const f = task.source_file ? store.files.find((x) => x.id === Number(task.source_file)) : null;
+    if (!f) return { added_by_hand: true, file: null, passage: null };
+    ensureFileMeta(f);
+    return {
+      added_by_hand: false,
+      file: {
+        id: f.id,
+        name: f.display_name || f.path,
+        label: displayTitle(f),
+        doc_type: f.doc_type,
+        read_by_ai: f.doc_type_source === "llm",
+        meeting_title: f.meta?.meeting_title || "",
+        date: f.meta?.meeting_date || f.document_date || String(f.first_added_at || "").slice(0, 10),
+        openable: true,
+        // Fixture-only: lets "Open file" show the sample text in a read-only tab.
+        display_name: f.display_name,
+        path: f.path,
+        extracted_text: f.extracted_text || "",
+      },
+      passage: findSupportingPassage(f, task.title),
+    };
   },
   getCommitments: async (topicId) => {
     await wait();
@@ -1083,8 +1112,6 @@ export const api = {
     return { content: "No project matches that question in this demo.", is_llm: false, generation_note: "No model was called because no sample project matched.", source_files: [] };
   },
   clearGlobalChat: async () => null,
-  updateTaskStatus: (taskId, status) => api.updateTask(taskId, { status }),
-  updateTaskDueDate: (taskId, dueDate) => api.updateTask(taskId, { due_date: dueDate || null }),
   deleteTopic: async (topicId) => {
     await wait();
     store.topics = store.topics.filter((t) => t.id !== Number(topicId));
@@ -1096,8 +1123,17 @@ export const api = {
     const { llm_api_key, ...rest } = store.settings;
     return rest;
   },
-  saveSettings: async (data) => {
+  // The real app checks a settings password on every save. The demo has no
+  // backend, so this plays that part with a published demo password (the real
+  // password is never in the repository).
+  unlockSettings: async (settingsPassword) => {
+    await wait(150);
+    requireSettingsPassword(settingsPassword);
+    return { ok: true };
+  },
+  saveSettings: async (data, settingsPassword) => {
     await wait();
+    requireSettingsPassword(settingsPassword);
     const keySet = data.llm_api_key ? true : store.settings.llm_api_key_set;
     store.settings = { ...store.settings, ...data, llm_api_key_set: keySet };
     delete store.settings.llm_api_key;
@@ -1543,24 +1579,7 @@ export const api = {
   },
   primeCsrf: async () => ({ ok: true }),
   login: async () => ({ ...store.user }),
-  // Demo mode has one fixed user and no real account store, so "creating an
-  // account" here just renames the existing demo user and signs them in -
-  // same honest, no-fabrication approach as updateProfile() below, not a
-  // simulation of a real multi-user signup.
-  register: async (username, email, password, displayName) => {
-    await wait();
-    store.user.display_name = displayName || username || store.user.display_name;
-    store.user.username = username || store.user.username;
-    return { ...store.user };
-  },
-  requestPasswordReset: async () => {
-    await wait();
-    return { ok: true };
-  },
-  confirmPasswordReset: async () => {
-    await wait();
-    return { ok: true };
-  },
+  // One shared login: sign-up and email password reset do not exist.
   logout: async () => ({ ok: true }),
   me: async () => {
     await api.loadLocalProjects();

@@ -4,12 +4,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import { api } from "../lib/api";
-import {
-  projectUrgency,
-  TYPE_LABELS,
-  TYPE_STYLES,
-  URGENCY_STYLES,
-} from "../lib/format";
+import { TYPE_LABELS, TYPE_STYLES } from "../lib/format";
 
 // PRD Should-have: "flag stale... information" - a topic nobody has
 // touched (no fresh brief, no new file) in a while is easy to forget about
@@ -60,7 +55,6 @@ function ScanProgress({ job }) {
 export default function Dashboard() {
   const router = useRouter();
   const [topics, setTopics] = useState([]);
-  const [tasks, setTasks] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [staleAfterDays, setStaleAfterDays] = useState(14);
@@ -105,13 +99,11 @@ export default function Dashboard() {
   async function load() {
     setLoading(true);
     try {
-      const [topicsData, tasksData, settingsData] = await Promise.all([
+      const [topicsData, settingsData] = await Promise.all([
         api.listTopics(),
-        api.getTasks(),
         api.getSettings().catch(() => null),
       ]);
       setTopics(topicsData);
-      setTasks(tasksData);
       const parsedStaleDays = parseInt(settingsData?.stale_after_days, 10);
       if (!Number.isNaN(parsedStaleDays)) setStaleAfterDays(parsedStaleDays);
       setError(null);
@@ -243,8 +235,6 @@ export default function Dashboard() {
             )}
 
             {topics.map((t) => {
-              const urgency = projectUrgency(tasks.filter((task) => task.topic === t.id));
-              const style = urgency ? URGENCY_STYLES[urgency] : null;
               return (
                 <Link
                   key={t.id}
@@ -270,14 +260,6 @@ export default function Dashboard() {
                     >
                       {TYPE_LABELS[t.topic_type] || t.topic_type}
                     </span>
-                    {style && (
-                      <span
-                        className={`inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full font-medium ${style.bg} ${style.text} border ${style.border}`}
-                      >
-                        <span className={`w-1.5 h-1.5 rounded-full ${style.dot}`} />
-                        {style.label}
-                      </span>
-                    )}
                     {daysSince(t.last_activity_at) > staleAfterDays && (
                       <span
                         title={`No new brief or file in over ${staleAfterDays} days`}

@@ -70,7 +70,10 @@ export default function SourcesPage() {
     const q = query.trim().toLowerCase();
     if (!q) return files;
     return files.filter(
-      (f) => f.display_name.toLowerCase().includes(q) || f.topic_name.toLowerCase().includes(q)
+      (f) =>
+        f.display_name.toLowerCase().includes(q) ||
+        (f.display_title || "").toLowerCase().includes(q) ||
+        f.topic_name.toLowerCase().includes(q)
     );
   }, [files, query]);
 
@@ -135,7 +138,11 @@ export default function SourcesPage() {
               {filtered.map((f) => (
                 <tr key={f.id} className="border-b border-slate-50 last:border-0 hover:bg-slate-50/60">
                   <td className="px-4 py-2.5 text-slate-800 truncate max-w-[320px]" title={f.display_name}>
-                    {f.display_name}
+                    {/* The file's template name first, its real name second. */}
+                    <span className="block font-medium truncate">{f.display_title || f.display_name}</span>
+                    {f.display_title && f.display_title !== f.display_name && (
+                      <span className="block text-[11px] font-mono text-slate-400 truncate">{f.display_name}</span>
+                    )}
                   </td>
                   <td className="px-4 py-2.5">
                     <span

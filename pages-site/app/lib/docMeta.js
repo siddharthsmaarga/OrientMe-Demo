@@ -15,6 +15,7 @@ export const DOC_TYPE_LABELS = {
   prd_brd: "PRD / BRD",
   project_charter: "Project Charter",
   project_plan: "Project Plan",
+  opportunity_scorecard: "Opportunity Scorecard",
   stakeholder_map: "Stakeholder Map",
   report: "Report",
   notes: "Notes",
@@ -33,7 +34,7 @@ export const MEETING_TYPE_LABELS = {
 };
 
 // Document types that become their own event on the topic timeline.
-export const TIMELINE_DOC_TYPES = ["proposal", "quotation_sow", "prd_brd", "project_charter", "project_plan"];
+export const TIMELINE_DOC_TYPES = ["proposal", "quotation_sow", "prd_brd", "project_charter", "project_plan", "opportunity_scorecard"];
 
 const DELIVERY_DOC_TYPES = ["prd_brd", "project_charter", "project_plan", "stakeholder_map"];
 const DELIVERY_MEETING_TYPES = ["kickoff", "standup", "review"];
@@ -42,6 +43,7 @@ export function classifyDocType(name, text, hasMeeting) {
   const n = (name || "").toLowerCase();
   if (/\.(eml|msg)$/.test(n)) return "email";
   if (hasMeeting) return "meeting_transcript";
+  if (/score[ _-]?card/.test(n)) return "opportunity_scorecard";
   if (/quotation|quote|\bsow\b/.test(n)) return "quotation_sow";
   if (/proposal/.test(n)) return "proposal";
   if (/\b(prd|brd)\b/.test(n)) return "prd_brd";
@@ -53,6 +55,15 @@ export function classifyDocType(name, text, hasMeeting) {
   if (/guideline|report|review/.test(n)) return "report";
   if (/^\s*(from|subject):/im.test(text || "")) return "email";
   return "other";
+}
+
+// What a file IS, not what it is called: "<type name> <version>" (e.g.
+// "Proposal V2"). Notes, "other" and untyped files keep their own file name.
+export function displayTitle(f) {
+  const label = DOC_TYPE_LABELS[f.doc_type];
+  const name = String(f.display_name || f.path || "").split(/[\\/]/).pop();
+  if (!label || f.doc_type === "notes" || f.doc_type === "other") return name;
+  return `${label} ${f.version_label || ""}`.trim();
 }
 
 export function versionFromName(name) {

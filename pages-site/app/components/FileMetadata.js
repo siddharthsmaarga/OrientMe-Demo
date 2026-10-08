@@ -14,6 +14,7 @@ export const DOC_TYPE_OPTIONS = [
   { key: "prd_brd", label: "PRD / BRD" },
   { key: "project_charter", label: "Project Charter" },
   { key: "project_plan", label: "Project Plan" },
+  { key: "opportunity_scorecard", label: "Opportunity Scorecard" },
   { key: "stakeholder_map", label: "Stakeholder Map" },
   { key: "report", label: "Report" },
   { key: "notes", label: "Notes" },
@@ -127,6 +128,14 @@ export default function FileMetadata({ file, onChanged }) {
         >
           {(DOC_TYPE_OPTIONS.find((o) => o.key === file.doc_type) || {}).label || "Type: not set"}
         </span>
+        {file.doc_type_source === "llm" && (
+          <span
+            title="The file name did not say what this document is, so OrientMe read its content to decide. Use Edit details if it got it wrong."
+            className="text-[10px] font-medium text-brand bg-brand-tint px-1.5 py-0.5 rounded-full"
+          >
+            Read by AI
+          </span>
+        )}
         {file.version_label && (
           <span className="text-[10px] font-semibold text-violet-700 bg-violet-50 px-1.5 py-0.5 rounded-full">
             {file.version_label}

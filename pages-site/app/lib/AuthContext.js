@@ -7,9 +7,10 @@ import { api } from "./api";
 const AuthContext = createContext(null);
 
 // Public routes that render standalone (no sidebar/search chrome) - the
-// search page plus the account-creation/password-reset pages. Exported so
-// AppShell's render guard stays in sync with the real app's own list.
-export const PUBLIC_PATHS = new Set(["/", "/login", "/register", "/forgot-password", "/reset-password"]);
+// search page and the login page. (Sign-up and email password reset are
+// switched off: the app has one shared login.) Exported so AppShell's render
+// guard stays in sync with the real app's own list.
+export const PUBLIC_PATHS = new Set(["/", "/login"]);
 
 // Standalone demo build: there's no Django backend to hold a real session,
 // so this always provides the fixture demo user immediately - no login
@@ -43,7 +44,6 @@ export function AuthProvider({ children }) {
       value={{
         user,
         loading,
-        isAdmin: user?.role === "admin",
         refresh,
         logout,
       }}

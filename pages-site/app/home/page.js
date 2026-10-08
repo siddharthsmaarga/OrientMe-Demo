@@ -5,10 +5,8 @@ import { useEffect, useState } from "react";
 import { api } from "../lib/api";
 import {
   formatRelativeDay,
-  projectUrgency,
   recordingDisplayDate,
   TYPE_LABELS,
-  URGENCY_STYLES,
 } from "../lib/format";
 import TopicAutocomplete from "../components/TopicAutocomplete";
 
@@ -223,7 +221,7 @@ export default function HomeDashboard() {
   );
 
   // Structured summary row per project - health/status derived the same
-  // way the card grid already computes it (task urgency, staleness), just
+  // way the card grid already computes it (staleness), just
   // rendered as a scannable table instead of a grid of boxes - "all
   // projects summary in a structured projects manner", distinct from the
   // free-browsing card grid that stays on the Projects page. No "Type"
@@ -239,12 +237,11 @@ export default function HomeDashboard() {
 
   const projectRows = [...realProjects]
     .map((t) => {
-      const urgency = projectUrgency(tasks.filter((task) => task.topic === t.id));
       const isStale = daysSince(t.last_activity_at) > staleAfterDays;
-      return { topic: t, urgency, isStale, lastActivity: latestActivityByTopic[t.id] };
+      return { topic: t, isStale, lastActivity: latestActivityByTopic[t.id] };
     })
     .sort((a, b) => {
-      const rank = (r) => (r.urgency === "red" ? 0 : r.isStale ? 1 : r.urgency === "yellow" ? 2 : 3);
+      const rank = (r) => (r.isStale ? 0 : 1);
       return rank(a) - rank(b) || new Date(b.topic.last_activity_at || 0) - new Date(a.topic.last_activity_at || 0);
     });
 
@@ -449,8 +446,7 @@ export default function HomeDashboard() {
                     </tr>
                   </thead>
                   <tbody>
-                    {projectRows.map(({ topic: t, urgency, isStale, lastActivity }) => {
-                      const style = urgency ? URGENCY_STYLES[urgency] : null;
+                    {projectRows.map(({ topic: t, isStale, lastActivity }) => {
                       return (
                         <tr key={t.id} className="border-b border-border-warm last:border-0 hover:bg-cream/40">
                           <td className="px-4 py-2.5">
@@ -460,18 +456,12 @@ export default function HomeDashboard() {
                           </td>
                           <td className="px-4 py-2.5">
                             <div className="flex items-center gap-1.5 flex-wrap">
-                              {style && (
-                                <span className={`inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded-full font-medium ${style.bg} ${style.text} border ${style.border}`}>
-                                  <span className={`w-1.5 h-1.5 rounded-full ${style.dot}`} />
-                                  {style.label}
-                                </span>
-                              )}
                               {isStale && (
                                 <span className="text-[11px] px-2 py-0.5 rounded-full font-medium bg-amber-100 text-amber-800 border border-amber-200">
                                   Stale
                                 </span>
                               )}
-                              {!style && !isStale && <span className="text-xs text-ink-muted">On track</span>}
+                              {!isStale && <span className="text-xs text-ink-muted">On track</span>}
                             </div>
                           </td>
                           <td className="px-4 py-2.5 hidden sm:table-cell text-xs text-ink-muted">

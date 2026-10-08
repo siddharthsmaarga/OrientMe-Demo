@@ -60,28 +60,6 @@ export default function TasksPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedTopicId]);
 
-  async function handleStatusChange(taskId, status) {
-    setTasks((ts) => ts.map((t) => (t.id === taskId ? { ...t, status } : t)));
-    try {
-      await api.updateTaskStatus(taskId, status);
-      loadCalendar(selectedTopicId);
-    } catch (e) {
-      setError(e.message);
-      loadTasks(selectedTopicId);
-    }
-  }
-
-  async function handleDueDateChange(taskId, dueDate) {
-    setTasks((ts) => ts.map((t) => (t.id === taskId ? { ...t, due_date: dueDate || null } : t)));
-    try {
-      await api.updateTaskDueDate(taskId, dueDate);
-      loadCalendar(selectedTopicId);
-    } catch (e) {
-      setError(e.message);
-      loadTasks(selectedTopicId);
-    }
-  }
-
   return (
     <div className="max-w-6xl 2xl:max-w-[96rem] mx-auto px-6 py-10 w-full">
       <header className="mb-8 flex items-center justify-between flex-wrap gap-4">
@@ -123,8 +101,6 @@ export default function TasksPage() {
           <section className="rounded-lg border border-slate-200 bg-white p-4">
             <TaskBoard
               tasks={tasks}
-              onStatusChange={handleStatusChange}
-              onDueDateChange={handleDueDateChange}
               showTopic={!selectedTopicId}
               emptyMessage={
                 selectedTopicId

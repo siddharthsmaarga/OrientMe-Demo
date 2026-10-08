@@ -2,7 +2,6 @@
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
-import Link from "next/link";
 import { api } from "../lib/api";
 import { useAuth } from "../lib/AuthContext";
 
@@ -65,12 +64,7 @@ export default function LoginPage() {
             />
           </div>
           <div>
-            <div className="flex items-center justify-between mb-1">
-              <label className="block text-sm font-medium text-slate-700">Password</label>
-              <Link href="/forgot-password" className="text-xs text-teal-dark hover:underline">
-                Forgot password?
-              </Link>
-            </div>
+            <label className="block text-sm font-medium text-slate-700 mb-1">Password</label>
             <input
               type="password"
               className="w-full rounded-md border border-slate-300 px-3 py-2 text-sm"
@@ -86,13 +80,6 @@ export default function LoginPage() {
           >
             {loading ? "Signing in…" : "Sign in"}
           </button>
-
-          <p className="text-center text-sm text-slate-500">
-            Don&apos;t have an account?{" "}
-            <Link href="/register" className="text-teal-dark hover:underline font-medium">
-              Create account
-            </Link>
-          </p>
         </form>
       </div>
     </div>

@@ -289,6 +289,20 @@ export function buildSalesTopic({ daysFromNow, isoDaysAgo }) {
       document_date: daysFromNow(-8),
       version_label: "",
     }),
+
+    // A file saved under a meaningless name. Its name gives nothing away, so the
+    // app read its content and decided what it is (shown as "Read by AI").
+    base(135, 6, "inbox/scan_0042 (2).docx", {
+      extracted_text:
+        "Opportunity Score Card - Larkspur Beverages Co.\n\nBudget: confirmed for the pilot, fixed fee approved in principle by the sponsor.\nAuthority: sponsor (Meera Vasquez) and Finance gatekeeper (Hannah Brandt) both engaged.\nNeed: strong - the weekly promotion payback process is manual and slow.\nTimeline: pilot start targeted for next month, pending Finance sign-off.\nOverall score: 78 out of 100. Recommendation: pursue.",
+      doc_type: "opportunity_scorecard",
+      doc_type_source: "llm",
+      topic_tags: "Commercial, Risks",
+      signal: "Scorecard: 78 out of 100 - budget and sponsor confirmed, Finance sign-off still pending. Recommend pursuing.",
+      meta_state: "generated_unconfirmed",
+      document_date: daysFromNow(-6),
+      version_label: "",
+    }),
   ];
 
   // ---- Human notes (1-2 lines, written by a person right after a meeting) --

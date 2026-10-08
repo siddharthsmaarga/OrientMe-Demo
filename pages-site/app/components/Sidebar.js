@@ -16,12 +16,24 @@ const BASE_PATH = process.env.NEXT_PUBLIC_BASE_PATH || "";
 // icon rather than a plain text list. Grouped into "Workspace" (the things
 // people work inside day to day) and "Configure" (account/system setup) so
 // 5 items still read as organized, not just a longer flat list.
+//
+// `also` lists other routes that belong to the same section, so the section
+// stays highlighted while you are inside it - a project's own page
+// (/topics/?id=<id>) is part of "Projects", a single transcript is part of
+// "Transcripts".
+function isActive(item, rawPathname) {
+  // The static export serves every page with a trailing slash ("/home/").
+  const pathname = rawPathname.length > 1 && rawPathname.endsWith("/") ? rawPathname.slice(0, -1) : rawPathname;
+  const own = item.exact ? pathname === item.href : pathname === item.href || pathname.startsWith(`${item.href}/`);
+  return own || (item.also || []).some((prefix) => pathname === prefix || pathname.startsWith(`${prefix}/`));
+}
+
 const NAV_GROUPS = [
   {
     label: "Workspace",
     items: [
       { href: "/home", label: "Dashboard", icon: DashboardIcon, tile: "bg-purple-500", exact: true },
-      { href: "/dashboard", label: "Projects", icon: TopicsIcon, tile: "bg-teal", exact: true },
+      { href: "/dashboard", label: "Projects", icon: TopicsIcon, tile: "bg-teal", exact: true, also: ["/topics"] },
       { href: "/transcripts", label: "Transcripts", icon: TranscriptsIcon, tile: "bg-brand" },
     ],
   },
@@ -34,7 +46,7 @@ const NAV_GROUPS = [
 export default function Sidebar() {
   const pathname = usePathname();
   const router = useRouter();
-  const { user, isAdmin, logout } = useAuth();
+  const { user, logout } = useAuth();
   const [profileMenuOpen, setProfileMenuOpen] = useState(false);
   const profileMenuRef = useRef(null);
   const [recentTopics, setRecentTopics] = useState([]);
@@ -141,16 +153,18 @@ export default function Sidebar() {
               {group.label}
             </p>
             {group.items.map((item) => {
-              const active = item.exact ? pathname === item.href : pathname.startsWith(item.href);
+              const active = isActive(item, pathname);
               const Icon = item.icon;
               return (
                 <Link
                   key={item.href}
                   href={item.href}
-                  className={`flex items-center gap-3 px-2 py-2 rounded-xl text-sm font-semibold transition-colors ${
-                    active ? "bg-[#1a1a1a]/[0.05]" : "hover:bg-[#1a1a1a]/[0.03]"
+                  aria-current={active ? "page" : undefined}
+                  className={`relative flex items-center gap-3 px-2 py-2 rounded-xl text-sm font-semibold transition-colors ${
+                    active ? "bg-teal-tint-strong/60 shadow-[inset_0_0_0_1px_rgba(0,166,192,0.35)]" : "hover:bg-[#1a1a1a]/[0.03]"
                   }`}
                 >
+                  {active && <span className="absolute left-0 top-2.5 bottom-2.5 w-[3px] rounded-full bg-teal" aria-hidden="true" />}
                   <span
                     className={`w-10 h-10 rounded-lg flex items-center justify-center shrink-0 shadow-[0_1px_2px_rgba(0,0,0,0.06),inset_0_1px_0_rgba(255,255,255,0.4)] ${item.tile} ${
                       active ? "ring-2 ring-offset-1 ring-offset-[#fcfbf7] ring-[#1a1a1a]/15" : ""
@@ -158,7 +172,7 @@ export default function Sidebar() {
                   >
                     <Icon />
                   </span>
-                  <span className={`flex-1 ${active ? "text-[#1a1a1a]" : "text-ink-muted"}`}>{item.label}</span>
+                  <span className={`flex-1 ${active ? "text-[#1a1a1a] font-bold" : "text-ink-muted"}`}>{item.label}</span>
                   {item.href === "/transcripts" && newTranscriptsCount > 0 && (
                     <span className="shrink-0 min-w-[18px] h-[18px] px-1 rounded-full bg-brand text-white text-[10px] font-bold flex items-center justify-center">
                       {newTranscriptsCount}
@@ -232,7 +246,7 @@ export default function Sidebar() {
             <span className="block text-sm font-semibold text-[#1a1a1a] truncate">
               {user?.display_name || "…"}
             </span>
-            <span className="block text-[11px] text-ink-muted capitalize">{isAdmin ? "Admin" : "User"}</span>
+            <span className="block text-[11px] text-ink-muted">Shared login</span>
           </span>
         </button>
       </div>
