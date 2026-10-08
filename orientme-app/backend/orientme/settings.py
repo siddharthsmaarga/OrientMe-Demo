@@ -95,6 +95,24 @@ REST_FRAMEWORK = {
     ],
 }
 
+# One shared login only (Ayush, 8 Oct 2026: "there will be one log in only that
+# will be the user"). Sign-up and the email password-reset are switched off, and
+# only this username can sign in - other accounts that already exist in the
+# database are left alone, they just can't sign in.
+SINGLE_LOGIN_USERNAME = "user"
+
+# Changing anything on the Settings page (API key, model, folders...) needs a
+# password on top of being signed in (Ayush, 8 Oct 2026: "the password will be
+# hardcoded"). The backend checks it on every save, so it cannot be skipped from
+# the browser. It is a fixed value, but it lives in orientme/local_secrets.py
+# (git-ignored; see local_secrets.example.py), so it never goes to GitHub with
+# the code. To change it, edit that file and restart the backend. With no
+# password set, Settings cannot be changed at all.
+try:
+    from .local_secrets import SETTINGS_EDIT_PASSWORD
+except ImportError:
+    SETTINGS_EDIT_PASSWORD = os.environ.get("ORIENTME_SETTINGS_PASSWORD", "")
+
 ROOT_URLCONF = 'orientme.urls'
 
 TEMPLATES = [

@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { api } from "../lib/api";
-import { formatMeetingDate, taskUrgency, URGENCY_STYLES } from "../lib/format";
+import { formatAddedDate } from "../lib/format";
 
 // The Action Center: every open task across every project, grouped by
 // project, each one "AI Execute"-able - a ready-to-edit draft (a status
@@ -80,22 +80,13 @@ export default function ActionsPage() {
 }
 
 function TaskRow({ task, onExecute }) {
-  const urgency = taskUrgency(task);
-  const style = urgency ? URGENCY_STYLES[urgency] : null;
   return (
     <li className="flex items-center justify-between gap-3 px-4 py-3">
       <div className="min-w-0">
         <p className="text-sm text-slate-800 truncate">{task.title}</p>
         <div className="flex items-center gap-2 mt-1 flex-wrap">
           {task.assignee && <span className="text-xs text-slate-400">{task.assignee}</span>}
-          {task.due_date && style && (
-            <span
-              className={`inline-flex items-center gap-1 text-[11px] px-1.5 py-0.5 rounded-full font-medium ${style.bg} ${style.text} border ${style.border}`}
-            >
-              <span className={`w-1.5 h-1.5 rounded-full ${style.dot}`} />
-              {formatMeetingDate(task.due_date)}
-            </span>
-          )}
+          <span className="text-xs text-slate-400">Added {formatAddedDate(task.created_at)}</span>
         </div>
       </div>
       <button

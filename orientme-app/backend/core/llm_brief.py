@@ -48,11 +48,12 @@ SUBMIT_BRIEF_TOOL_OPENAI = {
     "function": {
         "name": "submit_orientme_brief",
         "description": (
-            "Submit the answer. Up to 7 possible sections (why now, current state, history, "
-            "what the customer thinks, promises made/waiting-on, next actions, open questions/"
+            "Submit the answer. Up to 12 possible sections (why now, current state, history, "
+            "what the customer thinks, customer need, proposed solution, latest updates, "
+            "decisions made, meeting prep, promises made/waiting-on, next actions, open questions/"
             "risks) plus top links (sources_used) - but this is a MENU, not a fixed template. "
             "Fill in only the sections the actual question calls for; leave the rest as empty "
-            "strings. A narrow question gets a narrow answer, not all 7 sections padded out."
+            "strings. A narrow question gets a narrow answer, not all 12 sections padded out."
         ),
         "parameters": {
             "type": "object",
@@ -77,7 +78,19 @@ SUBMIT_BRIEF_TOOL_OPENAI = {
                     "type": "array", "items": {"type": "string"},
                     "description": "Which of the provided file paths this specific why_now text came from. Empty list if why_now is empty or not grounded in a specific file.",
                 },
-                "current_state": {"type": "string", "description": "Where things stand today - Venki's own framing: 'what are the recent activities' - based only on the ingested files."},
+                "current_state": {
+                    "type": "string",
+                    "description": (
+                        "\"Current Position\" - the executive-recap section: where things actually stand "
+                        "right now, based only on the ingested files. Write as 2-6 short bullet facts (one "
+                        "per line, each starting with \"- \"), not a flowing paragraph - concrete things "
+                        "established/done, not a narrative summary. This is read first and read fastest, so "
+                        "it should work as a standalone 5-8 bullet recap of the whole thing even if every "
+                        "other section is empty. Example shape: \"- Procurement conversation completed\\n"
+                        "- Researching the DMS/SFA landscape\\n- Need a sharper proposal for distributor "
+                        "forecasting\"."
+                    ),
+                },
                 "current_state_sources": {
                     "type": "array", "items": {"type": "string"},
                     "description": "Which file paths current_state actually came from.",
@@ -100,9 +113,77 @@ SUBMIT_BRIEF_TOOL_OPENAI = {
                     "type": "array", "items": {"type": "string"},
                     "description": "Which file paths customer_thoughts actually came from.",
                 },
+                "customer_need": {
+                    "type": "string",
+                    "description": (
+                        "What problem the customer/other party is actually trying to solve - only if this "
+                        "topic involves one. Write as 1-3 short bullet lines (each starting with \"- \"). "
+                        "Empty string if not applicable or not stated."
+                    ),
+                },
+                "customer_need_sources": {
+                    "type": "array", "items": {"type": "string"},
+                    "description": "Which file paths customer_need actually came from.",
+                },
+                "proposed_solution": {
+                    "type": "string",
+                    "description": (
+                        "What has actually been proposed or committed to so far (by us, not a "
+                        "recommendation for what to do next - that's next_step). Write as 1-3 short bullet "
+                        "lines (each starting with \"- \"). Empty string if nothing's been proposed yet."
+                    ),
+                },
+                "proposed_solution_sources": {
+                    "type": "array", "items": {"type": "string"},
+                    "description": "Which file paths proposed_solution actually came from.",
+                },
+                "latest_updates": {
+                    "type": "string",
+                    "description": (
+                        "What specifically changed since the last meeting/update - only fill this when the "
+                        "question is about what's new/changed, not a general status question (that's "
+                        "current_state). Write as 1-3 short bullet lines (each starting with \"- \"). Empty "
+                        "string otherwise."
+                    ),
+                },
+                "latest_updates_sources": {
+                    "type": "array", "items": {"type": "string"},
+                    "description": "Which file paths latest_updates actually came from.",
+                },
+                "decisions_made": {
+                    "type": "string",
+                    "description": (
+                        "Important decisions already agreed upon and settled - distinct from next_step "
+                        "(a recommendation) and promises_made (still open). Write as 1-3 short bullet lines "
+                        "(each starting with \"- \"). Empty string if none were actually decided."
+                    ),
+                },
+                "decisions_made_sources": {
+                    "type": "array", "items": {"type": "string"},
+                    "description": "Which file paths decisions_made actually came from.",
+                },
+                "meeting_prep": {
+                    "type": "string",
+                    "description": (
+                        "Only fill this when the question is specifically about preparing for an upcoming "
+                        "meeting (e.g. 'what should I focus on today', 'prep me for this call') - "
+                        "3-5 short bullet lines (each starting with \"- \") naming the specific things to "
+                        "focus on in that meeting. Empty string for any other kind of question, including "
+                        "general status questions."
+                    ),
+                },
+                "meeting_prep_sources": {
+                    "type": "array", "items": {"type": "string"},
+                    "description": "Which file paths meeting_prep actually came from.",
+                },
                 "promises_made": {
                     "type": "string",
-                    "description": "Open commitments made by either side that haven't been closed out yet - Venki's own framing: 'what am I waiting for'. Empty string if none.",
+                    "description": (
+                        "\"Waiting\" - open commitments made by either side that haven't been closed out "
+                        "yet, Venki's own framing: 'what am I waiting for'. Write as short bullet lines "
+                        "(one per line, each starting with \"- \"), e.g. \"- Ravi feedback\\n- Procurement "
+                        "response\" - not full sentences. Empty string if none."
+                    ),
                 },
                 "promises_made_sources": {
                     "type": "array", "items": {"type": "string"},
@@ -110,13 +191,34 @@ SUBMIT_BRIEF_TOOL_OPENAI = {
                 },
                 "next_step": {
                     "type": "string",
-                    "description": "Venki's own framing: 'what are the next actions'. State the recommended best action AND, where this is an opportunity/commitment-style topic, the minimum acceptable commitment to walk away with (the floor, not just the ideal outcome) - per the PRD's own output contract. Usually one best move - but if there are genuinely 2-3 distinct open next actions (not a sprawling to-do list), name them all rather than picking just one arbitrarily. This is a RECOMMENDATION, not a stated fact.",
+                    "description": (
+                        "\"Next\" - Venki's own framing: 'what are the next actions'. Write as short "
+                        "bullet lines (one per line, each starting with \"- \"), e.g. \"- Draft AI "
+                        "proposition\\n- Talk to Category IT\" - not full sentences. Usually 1-3 distinct "
+                        "next actions. Where this is an opportunity/commitment-style topic, one bullet can "
+                        "be the minimum acceptable commitment to walk away with (the floor, not just the "
+                        "ideal outcome) - per the PRD's own output contract. This is a RECOMMENDATION, not "
+                        "a stated fact."
+                    ),
                 },
                 "next_step_sources": {
                     "type": "array", "items": {"type": "string"},
                     "description": "Which file paths the reasoning behind next_step actually came from. Can be empty if next_step is purely a recommendation with no single supporting file.",
                 },
-                "risks_and_gaps": {"type": "string", "description": "Venki's own framing: 'what are the open questions' - contradictions, stale information, or missing inputs. State plainly if nothing stands out."},
+                "risks_and_gaps": {
+                    "type": "string",
+                    "description": (
+                        "\"Open questions\" - Venki's own framing: 'what are the open questions' - "
+                        "contradictions, stale information, or missing inputs. Write as short bullet lines "
+                        "(one per line, each starting with \"- \"), e.g. \"- DMS API availability\\n- Data "
+                        "ownership?\" - not full sentences. State plainly if nothing stands out. When the "
+                        "source material makes clear WHO an open question is actually directed at (e.g. "
+                        "a manager assigned it to a specific person, or a question is waiting on a named "
+                        "person's answer), name that person in the bullet - e.g. \"- Data ownership - "
+                        "open question to Venki\" rather than a bare, unaddressed question. Never invent a "
+                        "name that isn't actually in the source material."
+                    ),
+                },
                 "risks_and_gaps_sources": {
                     "type": "array", "items": {"type": "string"},
                     "description": "Which file paths risks_and_gaps actually came from.",
@@ -164,13 +266,20 @@ Rules:
 - Mechanical rule, apply it literally: before writing anything, count how many DISTINCT things \
   the question is actually asking for. "What's the next task for Ayush" asks for exactly ONE \
   thing (the next action) - fill in next_step and STOP; do not also add current_state, history, \
-  why_now, customer_thoughts, or risks_and_gaps just because you know them - knowing more than \
+  why_now, customer_thoughts, or any other section just because you know them - knowing more than \
   was asked is not a reason to say more than was asked. "What's the status and what are the \
   risks" asks for exactly TWO things - fill in current_state and risks_and_gaps, nothing else. \
   Only a genuinely open-ended request ("orient me", "give me the full picture", "catch me up") \
   has no fixed count and may use every section that has real content. A one-thing question that \
   gets a four-or-five-section answer is a mistake every time - re-read the question and cut it \
   down before submitting.
+- Several sections exist ONLY for a specific kind of question and should almost always stay empty: \
+  meeting_prep is ONLY for "help me prepare for [a meeting]" style questions, never a general \
+  status question. latest_updates is ONLY for "what changed / what's new since last time" \
+  questions, never a general status question (current_state covers that). decisions_made, \
+  customer_need, and proposed_solution only get filled when the question specifically asks about \
+  decisions, the customer's problem, or what's been proposed, respectively - not as a default \
+  add-on to a broader answer.
 - Every claim must be traceable to one of the source files below. List exactly which files \
   actually informed your answer in sources_used.
 - ALSO fill in the matching "_sources" list for each section you write (why_now_sources, \
@@ -187,19 +296,138 @@ Rules:
   by its framing), and UNCERTAINTY/MISSING EVIDENCE (if something is genuinely unclear or unstated, \
   say so plainly in the relevant section or in gaps_no_source_found - never paper over a gap with a \
   confident-sounding guess).
+- current_state, promises_made, next_step, and risks_and_gaps are each rendered as a short bullet \
+  list on screen, not a paragraph - write them that way: one short fact/item per line, each line \
+  starting with "- ", never a flowing sentence joined with "and"/commas. 2-4 bullets per section is \
+  plenty; a single very short section can be just one bullet.
 - Keep every section factual and concise - this is meant to be read in under a minute. As a concrete \
   target: the sections you DO fill in, combined, should read as roughly 25-30 lines or fewer when \
   rendered - tighten your wording rather than write long paragraphs. This is a target for the sections \
   you choose to fill, not a reason to add sections that weren't asked for.
 
 Scope: {topic_name} ({topic_type})
-
+{manual_state_block}{manual_notes_block}{sales_recap_block}
 Question being asked: {question}
 
 Source files available (path, then content):
 {files_block}
 
 Call submit_orientme_brief with the finished brief."""
+
+
+# Rendered only when a ProjectState row with real text exists for this topic
+# (see models.ProjectState) - a person's own explicit statement of where
+# things stand, distinct from and higher-priority than the source files,
+# per the manual/AI precedence the product spec asked for ("manual > recent
+# verified > structured > source docs", surfaced rather than silently
+# overridden on conflict).
+MANUAL_STATE_BLOCK_TEMPLATE = """
+The user has manually confirmed the following as the CURRENT STATE of this project - treat it as \
+more current and authoritative than the source files below unless a source file is clearly newer. \
+If a source file conflicts with it, say so plainly in your answer rather than silently picking one.
+
+Manually confirmed current state (as of {updated_at}):
+{current_position}
+"""
+
+
+# Rendered only when the topic has MeetingNote rows (5 Oct 2026) - the short
+# human notes people add after a meeting. Same style as the block above, next
+# to it in the prompt. HIGH-SIGNAL: trusted over inference, conflicts flagged.
+MANUAL_NOTES_BLOCK_TEMPLATE = """
+The team has added the following short HUMAN NOTES (usually one or two lines written right after a \
+meeting). They are HIGH-SIGNAL and TRUSTED: treat them as more reliable than anything you would \
+infer from the source files, and let them guide what matters most. If a note conflicts with a source \
+file, say so plainly in your answer (for example in risks_and_gaps) rather than silently picking one. \
+A note is not a file: never put a note in a _sources list - cite only the file paths below.
+
+Human notes (trusted), oldest first:
+{notes}
+"""
+
+MAX_NOTES_IN_PROMPT = 40
+MAX_NOTE_CHARS = 600
+
+
+def _build_notes_block(topic):
+    """Dated "Human notes (trusted)" block, or "" when the topic has no notes
+    (so a topic without notes gets exactly the prompt it always got)."""
+    if topic is None or not getattr(topic, "pk", None):
+        return ""
+    notes = list(topic.meeting_notes.select_related("meta").order_by("-created_at", "-id")[:MAX_NOTES_IN_PROMPT])
+    notes.reverse()  # oldest first
+    lines = []
+    for n in notes:
+        text = " ".join((n.text or "").split())
+        if not text:
+            continue
+        if len(text) > MAX_NOTE_CHARS:
+            text = text[: MAX_NOTE_CHARS - 3].rstrip() + "..."
+        about = ""
+        if n.meta_id:
+            when = n.meta.meeting_date.strftime("%d %b %Y") if n.meta.meeting_date else "undated"
+            about = f" (about the meeting '{(n.meta.meeting_title or 'untitled').strip()}', {when})"
+        author = f" - {n.author}" if n.author else ""
+        lines.append(f"- {n.created_at.strftime('%d %b %Y')}{about}: {text}{author}")
+    if not lines:
+        return ""
+    return MANUAL_NOTES_BLOCK_TEMPLATE.format(notes="\n".join(lines))
+
+
+# Appended ONLY for opportunity / customer topics (5 Oct 2026): a sales-
+# oriented structure for a broad recap, mapped onto the EXISTING 12 fields (no
+# schema change). Every other topic type keeps the exact prompt it had.
+SALES_RECAP_BLOCK_TEMPLATE = """
+This topic is a sales {kind}.{facts} When the request is a broad one (a recap, "catch me up", "where do \
+things stand", preparing for the next meeting), cover the following WHERE EVIDENCE EXISTS in the files \
+or the human notes - and leave a part out entirely when there is no evidence, never invent it - using \
+the existing sections like this:
+- Account snapshot, the opportunity and its scope (what the customer is exploring, scope, current \
+stage): current_state, and customer_need for the problem they want solved.
+- Stakeholders with role and stance (who is who on the customer side and on ours, and where each one \
+stands - only what was actually said or clearly shown): customer_thoughts.
+- Meeting-by-meeting recap, in DATE ORDER, oldest first - for each meeting: its type (intro, discovery, \
+solution, commercial, ...), date and outcome: history.
+- Proposal / quotation / SOW status with the VERSION (V1, V2, Final), its date, what changed and what \
+feedback it drew: proposed_solution.
+- Open items - what is waiting on whom: promises_made; open questions and risks: risks_and_gaps.
+- Next step - the single best next step: next_step.
+A narrow question still gets a narrow answer - this structure is for broad requests.
+"""
+
+SALES_TOPIC_TYPES = ("opportunity", "customer")
+
+
+def _build_sales_recap_block(topic):
+    if topic is None or getattr(topic, "topic_type", "") not in SALES_TOPIC_TYPES:
+        return ""
+    facts = []
+    if (getattr(topic, "customer_name", "") or "").strip():
+        facts.append(f"Customer: {topic.customer_name.strip()}.")
+    if getattr(topic, "stage", ""):
+        facts.append(f"Stage (set by a person): {topic.get_stage_display()}.")
+    return SALES_RECAP_BLOCK_TEMPLATE.format(
+        kind=topic.topic_type, facts=(" " + " ".join(facts)) if facts else ""
+    )
+
+
+def _doc_meta_line(f):
+    """One "[Document: ...]" line for a file block - only for sales topics, and
+    only when something is actually known (so unclassified files add nothing)."""
+    bits = []
+    label = f.get_doc_type_display() if getattr(f, "doc_type", "") else ""
+    if label:
+        bits.append(label)
+    if getattr(f, "version_label", ""):
+        bits.append(f"version {f.version_label}")
+    meta = getattr(f, "meta", None)
+    if meta is not None and getattr(meta, "meeting_type", ""):
+        mt = meta.get_meeting_type_display()
+        bits.append(f"{mt} {meta.meeting_sequence}" if meta.meeting_sequence else mt)
+    when = getattr(f, "document_date", None) or (meta.meeting_date if meta is not None else None)
+    if when:
+        bits.append(f"dated {when.isoformat()}")
+    return f"[Document: {', '.join(bits)}]\n" if bits else ""
 
 
 # A per-file cap alone doesn't bound the total request size once a topic
@@ -212,7 +440,7 @@ MAX_PER_FILE_CHARS = 6000
 MAX_TOTAL_FILE_CHARS = 18000
 
 
-def _format_files(ingested_files, with_topic=False):
+def _format_files(ingested_files, with_topic=False, with_doc_meta=False):
     blocks = []
     omitted = []
     remaining = MAX_TOTAL_FILE_CHARS
@@ -233,7 +461,8 @@ def _format_files(ingested_files, with_topic=False):
         # where it would otherwise break that exact-match lookup and silently
         # drop every citation.
         topic_line = f"[Topic: {f.topic.name}]\n" if with_topic else ""
-        blocks.append(f"--- FILE: {f.path} ---\n{topic_line}{snippet}")
+        doc_line = _doc_meta_line(f) if with_doc_meta else ""
+        blocks.append(f"--- FILE: {f.path} ---\n{topic_line}{doc_line}{snippet}")
     if omitted:
         blocks.append(
             "--- NOTE: {} more file(s) exist but weren't included in this pass due to size "
@@ -273,77 +502,61 @@ def _via_openrouter(prompt, settings):
     return json.loads(tool_calls[0]["function"]["arguments"])
 
 
-EXTRACT_META_TOOL_OPENAI = {
+def call_structured(prompt, tool_name, description, parameters, settings, timeout=120):
+    """One schema-constrained call to the app's configured API model (the same
+    OpenRouter-compatible endpoint, key and model the brief uses) via a forced
+    tool call. Returns the parsed arguments dict. Raises MissingApiKeyError
+    when no key is configured and any httpx/parsing error on failure - callers
+    decide how to degrade. The key is only ever sent in the Authorization
+    header; it is never logged or put in an error message."""
+    api_key = settings.get("llm_api_key")
+    if not api_key:
+        raise MissingApiKeyError("No API key configured.")
+    import httpx
+
+    tool = {
+        "type": "function",
+        "function": {"name": tool_name, "description": description, "parameters": parameters},
+    }
+    response = httpx.post(
+        f"{settings.get('llm_base_url') or 'https://openrouter.ai/api/v1'}/chat/completions",
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json={
+            "model": settings.get("llm_model") or "openai/gpt-5.4",
+            "messages": [{"role": "user", "content": prompt}],
+            "tools": [tool],
+            "tool_choice": {"type": "function", "function": {"name": tool_name}},
+        },
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    data = response.json()
+    tool_calls = data["choices"][0]["message"].get("tool_calls") or []
+    if not tool_calls:
+        raise RuntimeError("Model did not return a result via tool use.")
+    return json.loads(tool_calls[0]["function"]["arguments"])
+
+
+# Meeting classification + title/date/time/attendees/agenda/achieved/hours
+# all moved to pure-Python (extraction.py's looks_like_meeting_transcript +
+# extract_meeting_metadata/extract_employee_hours) - "less LLM, more
+# automation and code-based operation" (Ayush, 24 Sep). Those fields are all
+# reliably regex-extractable and the classification gate is what caught a
+# real false positive earlier ("Meeting Diarizer" security review) purely
+# from a genuine transcript signal (speaker lines / an Attendees: header),
+# no model judgment needed. The one thing regex genuinely can't do is pull
+# structured action items out of free-flowing meeting speech - that's the
+# one LLM call left here, and it only ever runs for files the deterministic
+# gate already confirmed look like a real meeting, asking for action items
+# alone (a much smaller prompt than the old full classify+extract call).
+EXTRACT_ACTION_ITEMS_TOOL_OPENAI = {
     "type": "function",
     "function": {
-        "name": "submit_document_meeting_metadata",
-        "description": (
-            "Report whether this document is a meeting record (transcript, minutes, or notes) "
-            "and, if so, the structured facts found in it. Never invent a fact that isn't in the text."
-        ),
+        "name": "submit_action_items",
+        "description": "Report the concrete action items/commitments people agreed to do in this meeting text.",
         "parameters": {
             "type": "object",
             "properties": {
-                "is_meeting": {
-                    "type": "boolean",
-                    "description": (
-                        "True only if this document is actually a meeting transcript, meeting "
-                        "minutes, or meeting notes - false for any other kind of document (reports, "
-                        "policies, README files, generic notes, etc.). The word 'meeting' appearing "
-                        "in the title or filename is NOT itself a signal - e.g. a security review of "
-                        "a tool literally named 'Meeting Diarizer' is a REPORT, not a meeting record. "
-                        "Judge only from real meeting substance: an actual date/time it was held, "
-                        "named attendees, and a discussion/decision narrative - not the word 'meeting' "
-                        "appearing anywhere in the text."
-                    ),
-                },
-                "meeting_title": {
-                    "type": "string",
-                    "description": "The meeting's title or subject. Empty string if not a meeting or not stated.",
-                },
-                "meeting_date": {
-                    "type": "string",
-                    "description": (
-                        "The meeting's date, formatted as YYYY-MM-DD. Often written explicitly near "
-                        "the top (e.g. 'July 10, 2026'), but auto-generated recordings frequently "
-                        "embed it as a compact YYYYMMDD run of 8 digits inside the filename-style "
-                        "title line instead (e.g. '...-20260710_040005UTC-Meeting Recording' means "
-                        "2026-07-10) - check for that pattern too before leaving this empty."
-                    ),
-                },
-                "meeting_time": {
-                    "type": "string",
-                    "description": "The meeting's start time as stated in the text (e.g. '10:15 AM'), else empty string.",
-                },
-                "attendees": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Names of people who attended or spoke, exactly as they appear in the text. Empty list if not a meeting.",
-                },
-                "agenda": {
-                    "type": "string",
-                    "description": "What the meeting was meant to accomplish / its target, in one or two sentences. Empty string if not stated.",
-                },
-                "achieved": {
-                    "type": "string",
-                    "description": "What was actually decided, completed, or achieved, in one or two sentences. Empty string if not stated.",
-                },
-                "employee_hours": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "name": {"type": "string"},
-                            "hours": {"type": "number"},
-                        },
-                        "required": ["name", "hours"],
-                    },
-                    "description": (
-                        "Only employees whose worked hours are EXPLICITLY stated in the text (e.g. "
-                        "'Ravi Kumar: 42 hours'). Empty list if none are mentioned - never estimate "
-                        "or guess hours."
-                    ),
-                },
                 "action_items": {
                     "type": "array",
                     "items": {
@@ -361,64 +574,62 @@ EXTRACT_META_TOOL_OPENAI = {
                                 "type": "string",
                                 "description": (
                                     "Due date as YYYY-MM-DD if stated or clearly implied. Resolve relative "
-                                    "wording ('today', 'by tomorrow') against this document's own meeting_date. "
-                                    "Empty string if there's no real due date."
+                                    "wording ('today', 'by tomorrow') against this meeting's own date, given "
+                                    "below. Empty string if there's no real due date."
                                 ),
                             },
                         },
                         "required": ["title"],
                     },
                     "description": (
-                        "Concrete action items, commitments, or next steps someone agreed to do - only if "
-                        "this document is a meeting record. Empty list if not a meeting, or none were "
-                        "actually stated - never invent a task that wasn't discussed."
+                        "Concrete action items, commitments, or next steps someone agreed to do. Empty "
+                        "list if none were actually stated - never invent a task that wasn't discussed."
                     ),
                 },
             },
-            "required": ["is_meeting"],
+            "required": ["action_items"],
         },
     },
 }
 
-META_PROMPT_TEMPLATE = """You are extracting structured metadata from ONE document for OrientMe. \
-Read the document text below and determine whether it is a meeting transcript, meeting minutes, or \
-meeting notes. If it is not a meeting record of any kind (e.g. it's a report, a README, a policy \
-document, general notes), set is_meeting to false and leave the other fields empty - do not force \
-a meeting interpretation onto a non-meeting document.
+ACTION_ITEMS_PROMPT_TEMPLATE = """You are extracting action items from ONE meeting's text for OrientMe. \
+This document has already been confirmed to be a real meeting record - your only job is to pull out \
+concrete action items / commitments / next steps someone agreed to do. Never invent one that isn't \
+genuinely present in the text.
 
-If it IS a meeting record, extract only what the text actually states - never invent a title, date, \
-attendee, hours figure, or action item that isn't genuinely present. Also pull out any concrete \
-action items / commitments / next steps someone agreed to do, resolving relative due dates \
-("today", "by tomorrow") against this meeting's own date.
+This meeting's own date is: {meeting_date}
+Resolve relative due-date wording ("today", "by tomorrow") against that date.
 
 Document text:
 {text}
 
-Call submit_document_meeting_metadata with your findings."""
+Call submit_action_items with your findings."""
 
 
-def extract_meeting_metadata_llm(text, settings):
-    """LLM-based replacement for extraction.extract_meeting_metadata's blind
-    first-line heuristic: asks the model to both judge whether this document
-    is actually a meeting record AND, if so, pull the structured facts out of
-    it, so a random report/README no longer gets mislabeled as a meeting.
+def extract_action_items_llm(text, meeting_date, settings):
+    """The one remaining LLM call in meeting extraction - everything else
+    (is-it-a-meeting, title, date, attendees, agenda, achieved, hours) is
+    now pure-Python (see core/extraction.py), called before this ever runs.
     Raises (MissingApiKeyError or any httpx/parsing error) on failure - the
-    caller (core/views.py's _extract_and_store) falls back to the pure-Python
-    heuristic when this raises."""
+    caller (core/views.py's _extract_and_store) treats action items as a
+    bonus, never fatal to storing the rest of a file's metadata."""
     api_key = settings.get("llm_api_key")
     if not api_key:
         raise MissingApiKeyError("No OpenRouter API key set.")
     import httpx
 
-    prompt = META_PROMPT_TEMPLATE.format(text=text[:8000])
+    prompt = ACTION_ITEMS_PROMPT_TEMPLATE.format(
+        meeting_date=meeting_date.isoformat() if meeting_date else "(unknown)",
+        text=text[:8000],
+    )
     response = httpx.post(
         f"{settings.get('llm_base_url') or 'https://openrouter.ai/api/v1'}/chat/completions",
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         json={
             "model": settings.get("llm_model") or "openai/gpt-5.4",
             "messages": [{"role": "user", "content": prompt}],
-            "tools": [EXTRACT_META_TOOL_OPENAI],
-            "tool_choice": {"type": "function", "function": {"name": "submit_document_meeting_metadata"}},
+            "tools": [EXTRACT_ACTION_ITEMS_TOOL_OPENAI],
+            "tool_choice": {"type": "function", "function": {"name": "submit_action_items"}},
         },
         timeout=120,
     )
@@ -426,8 +637,8 @@ def extract_meeting_metadata_llm(text, settings):
     data = response.json()
     tool_calls = data["choices"][0]["message"].get("tool_calls") or []
     if not tool_calls:
-        raise RuntimeError("Model did not return metadata via tool use.")
-    return json.loads(tool_calls[0]["function"]["arguments"])
+        raise RuntimeError("Model did not return action items via tool use.")
+    return json.loads(tool_calls[0]["function"]["arguments"]).get("action_items") or []
 
 
 def _render_plain(brief_fields):
@@ -449,23 +660,29 @@ def _render_plain(brief_fields):
     if brief_fields.get("is_conversational"):
         return brief_fields.get("answer_summary") or "Hi! Ask me anything about this project."
 
+    # Same section set/order as views.py's _BRIEF_SECTION_LABELS - kept as a
+    # loop (not one if-per-field) so a new section only needs adding here
+    # once, not copy-pasted as another if-block.
+    SECTION_LABELS = [
+        ("why_now", "Why now"),
+        ("current_state", "Current Position"),
+        ("history", "History"),
+        ("customer_thoughts", "What the customer thinks"),
+        ("customer_need", "Customer need"),
+        ("proposed_solution", "Proposed solution"),
+        ("latest_updates", "Latest updates"),
+        ("decisions_made", "Decisions made"),
+        ("meeting_prep", "Meeting prep"),
+        ("promises_made", "Promises made"),
+        ("next_step", "Next step"),
+        ("risks_and_gaps", "Risks & gaps"),
+    ]
     parts = []
     if brief_fields.get("answer_summary"):
         parts.append(brief_fields["answer_summary"])
-    if brief_fields.get("why_now"):
-        parts.append(f"**Why now:** {brief_fields['why_now']}")
-    if brief_fields.get("current_state"):
-        parts.append(f"**Current state:** {brief_fields['current_state']}")
-    if brief_fields.get("history"):
-        parts.append(f"**History:** {brief_fields['history']}")
-    if brief_fields.get("customer_thoughts"):
-        parts.append(f"**What the customer thinks:** {brief_fields['customer_thoughts']}")
-    if brief_fields.get("promises_made"):
-        parts.append(f"**Promises made:** {brief_fields['promises_made']}")
-    if brief_fields.get("next_step"):
-        parts.append(f"**Next step:** {brief_fields['next_step']}")
-    if brief_fields.get("risks_and_gaps"):
-        parts.append(f"**Risks & gaps:** {brief_fields['risks_and_gaps']}")
+    for key, label in SECTION_LABELS:
+        if brief_fields.get(key):
+            parts.append(f"**{label}:** {brief_fields[key]}")
     if brief_fields.get("gaps_no_source_found"):
         parts.append(f"**Not covered by ingested files:** {brief_fields['gaps_no_source_found']}")
     return "\n\n".join(parts)
@@ -516,6 +733,14 @@ def generate_brief(topic, question, ingested_files, settings=None):
             None,
         )
 
+    manual_state_block = ""
+    project_state = getattr(topic, "state", None) if topic else None
+    if project_state and (project_state.current_position or "").strip():
+        manual_state_block = MANUAL_STATE_BLOCK_TEMPLATE.format(
+            updated_at=project_state.updated_at.strftime("%d %b %Y"),
+            current_position=project_state.current_position.strip(),
+        )
+
     prompt = PROMPT_TEMPLATE.format(
         topic_name=topic.name if topic else "All projects",
         topic_type=(
@@ -523,8 +748,15 @@ def generate_brief(topic, question, ingested_files, settings=None):
             if topic
             else "everything OrientMe has ingested, across every project"
         ),
+        manual_state_block=manual_state_block,
+        manual_notes_block=_build_notes_block(topic),
+        sales_recap_block=_build_sales_recap_block(topic),
         question=question,
-        files_block=_format_files(files_with_text, with_topic=topic is None),
+        files_block=_format_files(
+            files_with_text,
+            with_topic=topic is None,
+            with_doc_meta=bool(topic is not None and topic.topic_type in SALES_TOPIC_TYPES),
+        ),
     )
     try:
         fields = _via_openrouter(prompt, settings)
@@ -578,6 +810,19 @@ Decide the format this task's own wording calls for (a short status-update email
 one-line metric update, or a plain note) and write ONLY that - no preamble, no "Here is a draft:".
 
 Call submit_task_draft with the finished text."""
+
+
+# The Transcripts detail page's "Generate Summary" used to be an LLM call
+# here (a submit_meeting_summary tool + prompt, in the same shape as
+# generate_task_draft above). Removed and rebuilt as pure code instead -
+# see extraction.build_meeting_summary and recordings.generate_summary_
+# for_event - per an explicit correction (29 Sep): "you are using too much
+# llm... focus on codded thing rather than using llm - llm is for tuff
+# works which is imposible to code." A per-recording summary is well
+# within reach of deterministic extraction (structured Agenda/Achieved
+# headers when a transcript actually has them, frequency-based extractive
+# highlights when it doesn't, real already-extracted Task rows for action
+# items) - it never needed a live model call at all.
 
 
 def generate_task_draft(task, settings=None):

@@ -6,7 +6,7 @@ import { api } from "../lib/api";
 import { useAuth } from "../lib/AuthContext";
 
 export default function ProfilePage() {
-  const { user, isAdmin, refresh } = useAuth();
+  const { user, refresh } = useAuth();
   const [displayName, setDisplayName] = useState(user?.display_name || "");
   const [savingName, setSavingName] = useState(false);
   const [nameSaved, setNameSaved] = useState(false);
@@ -65,11 +65,8 @@ export default function ProfilePage() {
       </Link>
       <h1 className="text-2xl font-semibold text-slate-900 mt-3 mb-1">Profile</h1>
       <p className="text-slate-500 text-sm mb-8">
-        Signed in as <span className="font-medium">{user?.username}</span> —{" "}
-        <span className="capitalize">{isAdmin ? "Admin" : "User"}</span>
-        {isAdmin
-          ? ": full access to Settings and Connectors."
-          : ": can view Settings and Connectors, not change them."}
+        Signed in as <span className="font-medium">{user?.username}</span> — the one shared login for
+        this app. Changing anything on the Settings page needs the settings password as well.
       </p>
 
       <form onSubmit={handleSaveName} className="space-y-3 mb-10 pb-8 border-b border-slate-200">

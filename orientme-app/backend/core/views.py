@@ -1,4 +1,8 @@
+import csv
 import hashlib
+import hmac
+import io
+import logging
 import os
 import re
 import subprocess
@@ -12,17 +16,12 @@ from django.contrib.auth import authenticate
 from django.contrib.auth import login as django_login
 from django.contrib.auth import logout as django_logout
 from django.contrib.auth import update_session_auth_hash
-from django.contrib.auth.models import User
-from django.contrib.auth.tokens import default_token_generator
-from django.core.mail import send_mail
 from django.db import connection
 from django.db.models import F, Q
 from django.http import HttpResponse
 from django.middleware.csrf import get_token
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
-from django.utils.encoding import force_bytes, force_str
-from django.utils.http import urlsafe_base64_decode, urlsafe_base64_encode
 from html import escape as html_escape
 from rest_framework import viewsets
 from rest_framework.decorators import action
@@ -31,18 +30,21 @@ from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from . import corrections, extraction, ics_import, ingestion, llm_brief, mbox_import, recordings
+from . import corrections, doc_meta, evidence, extraction, ics_import, ingestion, llm_brief, mbox_import, recordings
 from .models import (
     CaseSummary,
     ChatMessage,
     Commitment,
     ConnectorStatus,
+    Contact,
+    DOC_TYPES,
     Decision,
     ExtractedMeta,
     GlobalChatMessage,
     IngestedFile,
     Loop,
-    Profile,
+    MEETING_TYPES,
+    MeetingNote,
     ProjectState,
     RecordingEvent,
     Risk,
@@ -57,10 +59,13 @@ from .models import (
 )
 from .serializers import (
     CaseSummarySerializer,
+    ChatMessageSerializer,
     CommitmentSerializer,
+    ContactSerializer,
     DecisionSerializer,
     GlobalChatMessageSerializer,
     LoopSerializer,
+    MeetingNoteSerializer,
     ProjectStateSerializer,
     RecordingEventSerializer,
     RiskSerializer,
@@ -69,7 +74,11 @@ from .serializers import (
     TopicDetailSerializer,
     TopicSerializer,
     WorkflowSerializer,
+    artifact_type_for,
+    file_metadata_payload,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _profile_payload(user):
@@ -82,17 +91,31 @@ def _profile_payload(user):
     }
 
 
-def _user_role(request):
-    profile = getattr(request.user, "profile", None)
-    return profile.role if profile else "user"
+def _settings_password_ok(supplied):
+    """True when `supplied` is the hardcoded settings password
+    (settings.SETTINGS_EDIT_PASSWORD). Constant-time compare, and an empty
+    configured password never matches anything - it would otherwise leave
+    Settings open to everyone."""
+    expected = getattr(django_settings, "SETTINGS_EDIT_PASSWORD", "") or ""
+    if not expected:
+        return False
+    return hmac.compare_digest(str(supplied or "").encode("utf-8"), expected.encode("utf-8"))
 
 
-def _require_admin(request):
-    """Returns a 403 Response if the logged-in user isn't an Admin, else
-    None - the exact split the login system exists for: Admin can change
-    Settings/Connectors, User can only view them."""
-    if _user_role(request) != "admin":
-        return Response({"error": "Admin access required for this action."}, status=403)
+def _require_settings_password(request):
+    """Returns a 403 Response unless the request carries the settings
+    password (body field `settings_password`, or the X-Settings-Password
+    header), else None. Replaces the old Admin/User role split now that the app
+    has one shared login (Ayush, 8 Oct 2026): being signed in is not enough to
+    change the API key or any other setting. Checked on the server on every
+    save, so the Settings page's lock cannot be skipped from the browser."""
+    supplied = request.data.get("settings_password") if hasattr(request.data, "get") else None
+    if not supplied:
+        supplied = request.headers.get("X-Settings-Password", "")
+    if not _settings_password_ok(supplied):
+        return Response(
+            {"error": "The settings password is missing or wrong.", "code": "settings_password"}, status=403
+        )
     return None
 
 # The fixed question behind the topic page's "AI Context Brief" panel /
@@ -166,31 +189,53 @@ def _extract_and_store(ingested_file):
     of free-flowing meeting speech, so that's the one remaining LLM call -
     only for files already confirmed to look like a real meeting, and never
     fatal to storing everything else above if it fails."""
+    # Document type / tags / signal / version / date (pure code, never
+    # overwrites a human's value) - runs for every file, including unreadable
+    # ones (those become state "error").
+    doc_meta.safe_apply_auto_metadata(ingested_file)
+
+    # Venki, 8 Oct: a file may be renamed to anything, so where the rules
+    # cannot trust the NAME, an LLM reads the file's CONTENT and decides what
+    # it is (only with a key configured; never overrides a person's choice).
+    settings = _current_llm_settings()
+    doc_meta.safe_refine_doc_type_with_llm(ingested_file, settings)
+
     text = ingested_file.extracted_text or ""
     if ingested_file.extraction_error or not text.strip():
         return
 
-    if not extraction.looks_like_meeting_transcript(text):
+    # A file the content check identified as a meeting record is read as a
+    # meeting even when it lacks the speaker-line shape the plain-code gate
+    # looks for - that is how a renamed transcript or MoM reaches Meetings
+    # and Action Items.
+    read_as_meeting = extraction.looks_like_meeting_transcript(text) or (
+        ingested_file.doc_type_source == "llm" and ingested_file.doc_type in doc_meta.MEETING_DOC_TYPES
+    )
+    if not read_as_meeting:
         ExtractedMeta.objects.filter(ingested_file=ingested_file).delete()
         Task.objects.filter(source_file=ingested_file).delete()
         return
 
     meta = extraction.extract_meeting_metadata(text)
     hours = extraction.extract_employee_hours(text)
-    ExtractedMeta.objects.update_or_create(
-        ingested_file=ingested_file,
-        defaults={
-            "meeting_title": meta["meeting_title"],
-            "meeting_date": meta["meeting_date"],
-            "meeting_time": meta["meeting_time"],
-            "attendees": meta["attendees"],
-            "agenda": meta["agenda"],
-            "achieved": meta["achieved"],
-            "employee_hours": hours,
-        },
+    existing_meta = ExtractedMeta.objects.filter(ingested_file=ingested_file).first()
+    defaults = {
+        "meeting_title": meta["meeting_title"],
+        "meeting_date": meta["meeting_date"],
+        "meeting_time": meta["meeting_time"],
+        "attendees": meta["attendees"],
+        "agenda": meta["agenda"],
+        "achieved": meta["achieved"],
+        "employee_hours": hours,
+    }
+    # Meeting type/sequence (a manual choice is kept) + "who said what" turns.
+    defaults.update(
+        doc_meta.auto_meeting_fields(
+            meta["meeting_title"], doc_meta.primary_filename(ingested_file), text, existing_meta
+        )
     )
+    ExtractedMeta.objects.update_or_create(ingested_file=ingested_file, defaults=defaults)
 
-    settings = _current_llm_settings()
     if not settings.get("llm_api_key"):
         return
     try:
@@ -208,18 +253,15 @@ def _extract_and_store(ingested_file):
         title = (item.get("title") or "").strip()
         if not title or title in existing_titles:
             continue
-        due_date = None
-        if item.get("due_date"):
-            try:
-                due_date = datetime.strptime(item["due_date"], "%Y-%m-%d").date()
-            except ValueError:
-                due_date = None
+        # No due date is stored (Ayush, 8 Oct: an action item is just the
+        # action plus the date it was added - created_at - and where it came
+        # from). A date the model inferred from the meeting wording was only
+        # ever a guess.
         Task.objects.create(
             topic=ingested_file.topic,
             source_file=ingested_file,
             title=title,
             assignee=item.get("assignee") or "",
-            due_date=due_date,
         )
 
 
@@ -259,30 +301,6 @@ def _ask_topic(topic, question):
     the chat just reports what changed - no brief is generated for that
     turn at all."""
     ChatMessage.objects.create(topic=topic, role="user", content=question, is_llm=False)
-
-    if topic.topic_type == "general":
-        # Inbox holds files that didn't confidently match a project -
-        # they're not necessarily related to EACH OTHER at all, so a single
-        # combined "brief" across all of them would synthesize a false
-        # narrative out of content that was never one story to begin with.
-        # Ayush, 30 Sep, looking at exactly that happening: "this should
-        # not have this context and all... it will be something general".
-        # No LLM call, no CaseSummary - per-file questions belong on the
-        # dedicated Inbox page instead (see IngestedFileViewSet.ask).
-        msg = ChatMessage.objects.create(
-            topic=topic,
-            role="assistant",
-            content=(
-                "Inbox holds files that didn't confidently match a project, so they aren't "
-                "necessarily related to each other — a combined summary here wouldn't mean "
-                "anything real. Open a specific file for its own summary, or move files into a "
-                "real project first."
-            ),
-            source_files=[],
-            is_llm=False,
-            generation_note="No brief is generated for Inbox — it's a general holding area, not one project.",
-        )
-        return _message_payload(msg)
 
     correction = corrections.detect_correction(question)
     if correction:
@@ -805,8 +823,10 @@ class TopicViewSet(viewsets.ModelViewSet):
                         "agenda": (ev["description"] or "")[:500],
                         "achieved": "",
                         "employee_hours": [],
+                        **doc_meta.auto_meeting_fields(summary, "", "", None),
                     },
                 )
+                doc_meta.safe_apply_auto_metadata(obj)
                 created += 1
                 on_progress(i, len(events))
             return {"updated": created}
@@ -1136,28 +1156,133 @@ class TopicViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["get"])
     def meeting_metadata(self, request, pk=None):
+        """Meetings of this topic (deduplicated), newest first. Every key it
+        always returned is still here; added (5 Oct 2026): file_id,
+        meeting_type(+label/source), meeting_sequence, speaker_turn_count,
+        speaker_summary ("who said what" per speaker) and notes. Pass
+        ?include_turns=1 to also get the full speaker_turns list."""
         topic = self.get_object()
+        include_turns = request.query_params.get("include_turns") in ("1", "true", "yes")
         metas = (
             ExtractedMeta.objects.filter(ingested_file__topic=topic)
             .select_related("ingested_file")
+            .prefetch_related("notes")
             .order_by(F("meeting_date").desc(nulls_last=True), "-ingested_file__first_added_at")
         )
-        data = [
-            {
-                "id": m.id,
-                "file_display_name": m.ingested_file.display_name,
-                "file_path": m.ingested_file.path,
-                "meeting_title": m.meeting_title,
-                "timeline_title": _meeting_timeline_title(m.meeting_title),
-                "meeting_date": m.meeting_date.isoformat() if m.meeting_date else None,
-                "meeting_time": m.meeting_time,
-                "attendees": m.attendees,
-                "agenda": m.agenda,
-                "achieved": m.achieved,
-            }
-            for m in _dedupe_meetings(metas)
-        ]
-        return Response(data)
+        return Response([_meeting_payload(m, include_turns=include_turns) for m in _dedupe_meetings(metas)])
+
+    @action(detail=True, methods=["get"], url_path="timeline_events")
+    def timeline_events(self, request, pk=None):
+        """Business timeline, oldest first: meetings (with type + sequence),
+        emails, key documents (proposal / quotation-SOW / PRD-BRD / charter /
+        plan, with version) and human notes."""
+        return Response(_business_timeline_events(self.get_object()))
+
+    @action(detail=True, methods=["get"], url_path="metadata_csv")
+    def metadata_csv(self, request, pk=None):
+        """Metadata CSV for this topic's files: the 7 contract columns
+        (file, document_type, topic_tags, signal, state, seconds,
+        review_notes) first, then phase, version, doc_date, participants."""
+        topic = self.get_object()
+        files = topic.files.select_related("topic", "meta").prefetch_related("topic__folders")
+        return _metadata_csv_response(files, f"{topic.name}-metadata.csv")
+
+    # ---- human notes (MeetingNote) ----------------------------------------
+    @action(detail=True, methods=["get", "post"], url_path="notes")
+    def notes(self, request, pk=None):
+        topic = self.get_object()
+        if request.method == "GET":
+            qs = topic.meeting_notes.select_related("meta")
+            meta_id = request.query_params.get("meta")
+            if meta_id:
+                qs = qs.filter(meta_id=meta_id)
+            return Response(MeetingNoteSerializer(qs, many=True).data)
+
+        text = str(request.data.get("text") or "").strip()
+        if not text:
+            return Response({"error": "text is required"}, status=400)
+        if len(text) > MAX_NOTE_LENGTH:
+            return Response({"error": f"A note can be at most {MAX_NOTE_LENGTH} characters."}, status=400)
+        meta = None
+        raw_meta = request.data.get("meta")
+        if raw_meta not in (None, ""):
+            meta = ExtractedMeta.objects.filter(pk=raw_meta, ingested_file__topic=topic).first()
+            if meta is None:
+                return Response({"error": "That meeting does not belong to this topic."}, status=400)
+        note = MeetingNote.objects.create(topic=topic, meta=meta, text=text, author=request.user.username)
+        return Response(MeetingNoteSerializer(note).data, status=201)
+
+    @action(detail=True, methods=["patch", "delete"], url_path=r"notes/(?P<note_id>\d+)")
+    def note_detail(self, request, pk=None, note_id=None):
+        topic = self.get_object()
+        note = get_object_or_404(MeetingNote, pk=note_id, topic=topic)
+        if request.method == "DELETE":
+            note.delete()
+            return Response(status=204)
+        text = str(request.data.get("text") or "").strip()
+        if not text:
+            return Response({"error": "text is required"}, status=400)
+        if len(text) > MAX_NOTE_LENGTH:
+            return Response({"error": f"A note can be at most {MAX_NOTE_LENGTH} characters."}, status=400)
+        note.text = text
+        note.save(update_fields=["text"])
+        return Response(MeetingNoteSerializer(note).data)
+
+    # ---- contacts (optional role / side per stakeholder) ------------------
+    def _attendee_suggestions(self, topic):
+        metas = list(ExtractedMeta.objects.filter(ingested_file__topic=topic))
+        saved = {c.name.lower() for c in topic.contacts.all()}
+        return [
+            n for n in _collect_stakeholders(topic, metas)
+            if len(n.strip()) >= 2 and n.lower() not in saved and not extraction.is_placeholder_attendee(n)
+        ][:50]
+
+    @action(detail=True, methods=["get", "post"], url_path="contacts")
+    def contacts(self, request, pk=None):
+        topic = self.get_object()
+        if request.method == "GET":
+            return Response(
+                {
+                    "contacts": ContactSerializer(topic.contacts.all(), many=True).data,
+                    # Names seen as attendees that are not saved yet. Nothing is
+                    # created from them until someone saves one or calls seed.
+                    "suggestions": self._attendee_suggestions(topic),
+                }
+            )
+        serializer = ContactSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        name = serializer.validated_data["name"].strip()
+        if not name:
+            return Response({"error": "name is required"}, status=400)
+        if topic.contacts.filter(name__iexact=name).exists():
+            return Response({"error": "A contact with that name already exists."}, status=400)
+        contact = serializer.save(topic=topic, name=name)
+        return Response(ContactSerializer(contact).data, status=201)
+
+    @action(detail=True, methods=["post"], url_path="contacts/seed")
+    def contacts_seed(self, request, pk=None):
+        """Explicit "add the attendees as contacts" - only when a person asks."""
+        topic = self.get_object()
+        created = [Contact.objects.create(topic=topic, name=n[:150]) for n in self._attendee_suggestions(topic)]
+        return Response(
+            {"created": len(created), "contacts": ContactSerializer(topic.contacts.all(), many=True).data},
+            status=201,
+        )
+
+    @action(detail=True, methods=["patch", "delete"], url_path=r"contacts/(?P<contact_id>\d+)")
+    def contact_detail(self, request, pk=None, contact_id=None):
+        topic = self.get_object()
+        contact = get_object_or_404(Contact, pk=contact_id, topic=topic)
+        if request.method == "DELETE":
+            contact.delete()
+            return Response(status=204)
+        serializer = ContactSerializer(contact, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        new_name = (serializer.validated_data.get("name") or contact.name).strip()
+        if topic.contacts.filter(name__iexact=new_name).exclude(pk=contact.pk).exists():
+            return Response({"error": "A contact with that name already exists."}, status=400)
+        serializer.save(name=new_name)
+        return Response(ContactSerializer(contact).data)
 
     @action(detail=True, methods=["post"])
     def compute_payroll(self, request, pk=None):
@@ -1220,17 +1345,51 @@ class TaskViewSet(viewsets.ModelViewSet):
     items (source_file set); a person can also add one manually from the
     Context Node's Commitments card (source_file left null) - that's the
     only signal distinguishing "AI-extracted" from "manually added", so no
-    extra field was needed for it. title/assignee/due_date/status/topic are
-    all writable; only source_file/created_at/updated_at stay read-only."""
+    extra field was needed for it. title/assignee/status/topic are writable;
+    source_file/created_at/updated_at stay read-only, and due_date is not
+    exposed at all (8 Oct 2026 - see TaskSerializer)."""
 
     serializer_class = TaskSerializer
 
     def get_queryset(self):
-        qs = Task.objects.select_related("topic", "source_file")
+        qs = Task.objects.select_related("topic", "source_file", "source_file__meta")
         topic_id = self.request.query_params.get("topic")
         if topic_id:
             qs = qs.filter(topic_id=topic_id)
         return qs
+
+    @action(detail=True, methods=["get"], url_path="source")
+    def source(self, request, pk=None):
+        """Where this action item came from - the file (shown by its template
+        name, with its real file name second) and the passage of it that best
+        matches the task. Computed on demand, when someone clicks the item, so
+        the task list itself stays light. A task a person added by hand has no
+        source file and says so. The passage is the closest match found in the
+        file's own text, not a stored quote (the LLM rewrote the wording into
+        a short task), so it is labelled as such and left out when nothing
+        matches well enough."""
+        task = self.get_object()
+        f = task.source_file
+        if f is None:
+            return Response({"added_by_hand": True, "file": None, "passage": None})
+        meta = getattr(f, "meta", None)
+        meeting_date = meta.meeting_date if meta else None
+        return Response(
+            {
+                "added_by_hand": False,
+                "file": {
+                    "id": f.id,
+                    "name": doc_meta.primary_filename(f) or f.display_name or "",
+                    "label": doc_meta.display_title(f),
+                    "doc_type": f.doc_type,
+                    "read_by_ai": f.doc_type_source == "llm",
+                    "meeting_title": (meta.meeting_title if meta else "") or "",
+                    "date": (meeting_date or f.document_date or f.first_added_at.date()).isoformat(),
+                    "openable": not f.path.startswith(("pasted:", "mbox:", "ics:")),
+                },
+                "passage": evidence.find_supporting_passage(f.extracted_text, task.title),
+            }
+        )
 
     @action(detail=True, methods=["post"], url_path="ai_execute")
     def ai_execute(self, request, pk=None):
@@ -1292,10 +1451,10 @@ class RiskViewSet(viewsets.ModelViewSet):
 
 
 class CalendarView(APIView):
-    """Across ALL topics, every ExtractedMeta row with a real meeting_date
-    PLUS every Task with a due_date - optionally filtered to one topic via
-    ?topic_id=<id>. One merged, date-sorted list so a calendar widget can
-    highlight a day for either a meeting or a commitment, tagged by "kind".
+    """Across ALL topics, every ExtractedMeta row with a real meeting_date -
+    optionally filtered to one topic via ?topic_id=<id>. A date-sorted list so
+    a calendar widget can highlight a day with a meeting, tagged by "kind"
+    (action items no longer have a due date, so they are not on the calendar).
     Deliberately not nested under the topics router since it spans topics."""
 
     def get(self, request):
@@ -1323,30 +1482,16 @@ class CalendarView(APIView):
                     "meeting_title": m.meeting_title,
                     "meeting_date": m.meeting_date.isoformat(),
                     "meeting_time": m.meeting_time,
-                    "attendees": m.attendees,
+                    "attendees": extraction.clean_attendees(m.attendees),
                     "agenda": m.agenda,
                     "achieved": m.achieved,
+                    "meeting_type": m.meeting_type,
+                    "meeting_sequence": m.meeting_sequence,
                 }
             )
 
-        task_qs = Task.objects.filter(due_date__isnull=False).select_related("topic")
-        if topic_id:
-            task_qs = task_qs.filter(topic_id=topic_id)
-        for t in task_qs:
-            data.append(
-                {
-                    "kind": "task",
-                    "date": t.due_date.isoformat(),
-                    "topic_id": t.topic.id,
-                    "topic_name": t.topic.name,
-                    "topic_type": t.topic.topic_type,
-                    "id": t.id,
-                    "title": t.title,
-                    "assignee": t.assignee,
-                    "status": t.status,
-                    "due_date": t.due_date.isoformat(),
-                }
-            )
+        # Action items no longer carry a due date (Ayush, 8 Oct 2026), so they
+        # no longer put dates on the calendar - it shows meetings only.
 
         data.sort(key=lambda e: e["date"], reverse=True)
         return Response(data)
@@ -1377,12 +1522,9 @@ class GlobalSourcesView(APIView):
                 "path": f.path,
                 "display_name": f.display_name,
                 "source_method": f.source_method,
-                "artifact_type": (
-                    "email" if f.source_method == "email_import"
-                    else "meeting" if f.source_method == "calendar_import" or getattr(f, "meta", None)
-                    else "file"
-                ),
+                "artifact_type": artifact_type_for(f),
                 "first_added_at": f.first_added_at.isoformat(),
+                **file_metadata_payload(f),
             }
             for f in qs
         ]
@@ -1418,7 +1560,45 @@ class GlobalTimelineView(APIView):
                     "date": m.meeting_date.isoformat(),
                     "topic_id": topic.id,
                     "topic_name": topic.name,
-                    "title": m.meeting_title or m.ingested_file.display_name,
+                    "title": (
+                        _meeting_display_title(m) if m.meeting_type else (m.meeting_title or m.ingested_file.display_name)
+                    ),
+                }
+            )
+
+        # Business events (5 Oct 2026): emails, key documents and human notes.
+        file_qs = IngestedFile.objects.filter(
+            doc_type__in=("email",) + _TIMELINE_DOC_TYPES
+        ).exclude(meta_state="error").select_related("topic")
+        note_qs = MeetingNote.objects.select_related("topic")
+        if topic_id:
+            file_qs = file_qs.filter(topic_id=topic_id)
+            note_qs = note_qs.filter(topic_id=topic_id)
+        for f in file_qs:
+            when = f.document_date or f.first_added_at.date()
+            if f.doc_type == "email":
+                kind = "email"
+                title = doc_meta.email_subject(f.extracted_text) or f.display_name or "Email"
+            else:
+                kind = "document"
+                title = f"{doc_meta.DOC_TYPE_LABELS.get(f.doc_type, 'Document')} {f.version_label}".strip()
+            events.append(
+                {
+                    "kind": kind,
+                    "date": when.isoformat(),
+                    "topic_id": f.topic_id,
+                    "topic_name": f.topic.name,
+                    "title": title,
+                }
+            )
+        for n in note_qs:
+            events.append(
+                {
+                    "kind": "note",
+                    "date": n.created_at.date().isoformat(),
+                    "topic_id": n.topic_id,
+                    "topic_name": n.topic.name,
+                    "title": "Note: " + _truncate(" ".join(n.text.split()), 100),
                 }
             )
 
@@ -1579,7 +1759,7 @@ class GlobalSearchView(APIView):
             "ingested_file__topic"
         )[:300]
         for m in metas:
-            for name in m.attendees or []:
+            for name in extraction.clean_attendees(m.attendees):
                 lname = name.lower()
                 if not all(tok in lname for tok in tokens):
                     continue
@@ -1713,7 +1893,7 @@ class SettingsView(APIView):
         return Response(data)
 
     def post(self, request):
-        denied = _require_admin(request)
+        denied = _require_settings_password(request)
         if denied:
             return denied
         for k in self.KEYS:
@@ -1730,6 +1910,19 @@ class SettingsView(APIView):
                 continue
             Settings.set(k, value)
         return Response({"saved": True})
+
+
+class SettingsUnlockView(APIView):
+    """Checks the settings password without saving anything, so the Settings
+    page can unlock its fields only after the right password is typed. The
+    unlock itself lives only in the page (nothing is remembered on the server):
+    every save re-sends the password and SettingsView.post checks it again."""
+
+    def post(self, request):
+        denied = _require_settings_password(request)
+        if denied:
+            return denied
+        return Response({"ok": True})
 
 
 class LoopViewSet(viewsets.ModelViewSet):
@@ -1751,100 +1944,6 @@ class LoopViewSet(viewsets.ModelViewSet):
         return Response(result)
 
 
-class IngestedFileViewSet(viewsets.ReadOnlyModelViewSet):
-    """Per-FILE operations - the Inbox page's own file manager (Ayush,
-    30 Sep: Inbox mixes files from unrelated projects, so the only
-    operations that make sense are single-file ones - "summary of these
-    files or single file meaning", never a combined brief across all of
-    them - see _ask_topic's own Inbox guard for why that's blocked)."""
-
-    queryset = IngestedFile.objects.select_related("topic").all()
-
-    @action(detail=True, methods=["post"])
-    def ask(self, request, pk=None):
-        """Summarize/ask about just this one file - the same generate_brief
-        primitive _ask_topic uses, just scoped to a single-file list so
-        nothing from any other file leaks in. Not persisted to any chat
-        history - a lightweight, ad hoc lookup, not a conversation."""
-        f = self.get_object()
-        question = (request.data.get("question") or "Summarize this file in a few sentences.").strip()
-        answer, _source_paths, is_llm, note, _fields = llm_brief.generate_brief(
-            f.topic, question, [f], settings=_current_llm_settings()
-        )
-        return Response({"answer": answer, "is_llm": is_llm, "generation_note": note or ""})
-
-    @action(detail=True, methods=["post"], url_path="move")
-    def move(self, request, pk=None):
-        """Move this one file to a different topic - Inbox's "Move to
-        project" action. Repoints its RecordingEvent too (if any), so the
-        Dashboard/Transcripts review flows agree with where the file
-        actually lives, and refreshes the destination topic's brief once."""
-        f = self.get_object()
-        topic = get_object_or_404(Topic, pk=request.data.get("topic_id"))
-        f.topic = topic
-        f.save(update_fields=["topic"])
-        RecordingEvent.objects.filter(ingested_file=f).update(
-            topic=topic, status="routed", detail="Moved out of Inbox."
-        )
-        _ask_topic(topic, CONTEXT_BRIEF_QUESTION)
-        return Response({"id": f.id, "topic_id": topic.id, "topic_name": topic.name})
-
-    @action(detail=True, methods=["post"], url_path="delete")
-    def delete_file(self, request, pk=None):
-        """A real, hard delete - Ayush's own ask, 30 Sep ("teleting and
-        other file operation"), for Inbox specifically: unlike a
-        RecordingEvent 'dismiss' (which only ever changes a status, never
-        removes the row), there was previously no way to actually remove an
-        ingested file from the app at all. Safe to hard-delete: every FK
-        that points at IngestedFile (Task/Commitment/Decision/Risk.
-        source_file, RecordingEvent.ingested_file) is on_delete=SET_NULL,
-        so deleting a file never cascades into deleting real task/decision/
-        risk records - they just lose their source-file link. Its own
-        RecordingEvent (if any) is explicitly dismissed rather than left
-        pointing at nothing."""
-        f = self.get_object()
-        RecordingEvent.objects.filter(ingested_file=f).update(
-            ingested_file=None, status="dismissed", detail="File deleted."
-        )
-        f.delete()
-        return Response({"deleted": True})
-
-    @action(detail=False, methods=["post"], url_path="bulk_delete")
-    def bulk_delete(self, request):
-        """Multi-select "Delete selected" on the Inbox page - one clean
-        operation instead of N single-file deletes."""
-        file_ids = request.data.get("file_ids") or []
-        if not file_ids:
-            return Response({"error": "file_ids is required"}, status=400)
-        qs = IngestedFile.objects.filter(id__in=file_ids)
-        count = qs.count()
-        RecordingEvent.objects.filter(ingested_file_id__in=file_ids).update(
-            ingested_file=None, status="dismissed", detail="File deleted."
-        )
-        qs.delete()
-        return Response({"deleted_count": count})
-
-    @action(detail=False, methods=["post"], url_path="bulk_move")
-    def bulk_move(self, request):
-        """Multi-select "Move selected to project" on the Inbox page - one
-        decision for the whole selection, one brief refresh at the end
-        (never one per file - see RecordingEventViewSet.upload's own
-        docstring for why that matters at any real batch size)."""
-        file_ids = request.data.get("file_ids") or []
-        if not file_ids:
-            return Response({"error": "file_ids is required"}, status=400)
-        topic = get_object_or_404(Topic, pk=request.data.get("topic_id"))
-        qs = IngestedFile.objects.filter(id__in=file_ids)
-        moved_count = qs.count()
-        qs.update(topic=topic)
-        RecordingEvent.objects.filter(ingested_file_id__in=file_ids).update(
-            topic=topic, status="routed", detail="Moved out of Inbox."
-        )
-        if moved_count:
-            _ask_topic(topic, CONTEXT_BRIEF_QUESTION)
-        return Response({"topic_id": topic.id, "topic_name": topic.name, "moved_count": moved_count})
-
-
 class RecordingEventViewSet(viewsets.ReadOnlyModelViewSet):
     """The Transcripts page's activity feed - every file the central
     Recordings-folder watcher (core/recordings.py) has ever found, whatever
@@ -1855,6 +1954,39 @@ class RecordingEventViewSet(viewsets.ReadOnlyModelViewSet):
 
     queryset = RecordingEvent.objects.select_related("topic", "ingested_file").all()
     serializer_class = RecordingEventSerializer
+
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        if self.action == "list":
+            context["omit_speaker_turns"] = True
+        return context
+
+    def retrieve(self, request, *args, **kwargs):
+        """Detail page: if the transcript has text but no speaker turns yet, prepare
+        them once - inline for Teams-format text (no LLM), in the background
+        through the API model for Whisper text when a key is configured. The
+        response says speaker_turns_generating=true while that runs."""
+        event = self.get_object()
+        recordings.ensure_speaker_turns(event, background=True)
+        event.refresh_from_db()
+        return Response(self.get_serializer(event).data)
+
+    @action(detail=True, methods=["post"], url_path="rename_speaker")
+    def rename_speaker(self, request, pk=None):
+        """Renames one speaker label across all turns of this event, e.g.
+        {"old": "Speaker 1", "new": "Gokul"}; renamed turns are marked edited."""
+        event = self.get_object()
+        old = str(request.data.get("old") or "").strip()
+        new = " ".join(str(request.data.get("new") or "").split())
+        if not old or not new:
+            return Response({"error": "old and new are required"}, status=400)
+        if len(new) > 60:
+            return Response({"error": "A speaker name can be at most 60 characters."}, status=400)
+        changed = recordings.rename_speaker(event, old, new)
+        if not changed:
+            return Response({"error": f"No turns are labelled '{old}'."}, status=404)
+        event.refresh_from_db()
+        return Response({**RecordingEventSerializer(event).data, "renamed_turns": changed})
 
     @action(detail=False, methods=["post"], parser_classes=[MultiPartParser])
     def upload(self, request):
@@ -1873,6 +2005,25 @@ class RecordingEventViewSet(viewsets.ReadOnlyModelViewSet):
         files = request.FILES.getlist("files")
         if not files:
             return Response({"error": "files is required"}, status=400)
+
+        # A project is REQUIRED at upload time - there is no holding area.
+        raw_topic_id = (request.data.get("topic_id") or "").strip() if isinstance(
+            request.data.get("topic_id"), str
+        ) else request.data.get("topic_id")
+        if not raw_topic_id:
+            return Response(
+                {"error": "Choose a project for these files first - every upload must go into a project."},
+                status=400,
+            )
+        try:
+            target_topic = Topic.objects.filter(pk=int(raw_topic_id)).first()
+        except (TypeError, ValueError):
+            target_topic = None
+        if target_topic is None:
+            return Response(
+                {"error": "That project doesn't exist - choose an existing project for these files."},
+                status=400,
+            )
 
         # A real, hard cap - not arbitrary caution: dropping a whole folder
         # was tried for real (Ayush, 30 Sep) and produced "Failed to fetch"
@@ -1940,13 +2091,38 @@ class RecordingEventViewSet(viewsets.ReadOnlyModelViewSet):
                 with open(dest_path, "wb") as f:
                     for chunk in upload.chunks():
                         f.write(chunk)
+                # A plain document (proposal, quotation, email, spreadsheet...) is
+                # filed under its own name - not turned into a "<name> -
+                # Transcript.txt" copy and a Transcripts-page recording. Only
+                # audio/video and transcript-shaped text take the recording path.
+                if not recordings.is_recording_or_transcript(dest_path):
+                    doc, doc_error = recordings.ingest_document(
+                        target_topic, dest_path, display_name=safe_name
+                    )
+                    touched_topic_ids.add(target_topic.id)
+                    results.append(
+                        {
+                            "id": None,
+                            "document": True,
+                            "file_path": dest_path,
+                            "file_name": safe_name,
+                            "topic": target_topic.id,
+                            "topic_name": target_topic.name,
+                            "ingested_file": doc.id,
+                            "status": "routed",
+                            "detail": f"Added to '{target_topic.name}' as a document (not a recording).",
+                            "error": doc_error,
+                        }
+                    )
+                    continue
                 # refresh_brief=False here on purpose - see _ingest_into_topic's
                 # own docstring. One LLM brief call per file in a big batch is
                 # exactly what caused the real "Failed to fetch" bug; every
                 # topic that actually received a file gets exactly one
                 # refresh below, after the whole batch is done.
                 recordings.process_new_recording(
-                    dest_path, source="manual_drop", allow_llm_routing=False, refresh_brief=False
+                    dest_path, source="manual_drop", allow_llm_routing=False, refresh_brief=False,
+                    target_topic=target_topic,
                 )
                 event = RecordingEvent.objects.filter(file_path=dest_path).first()
                 if event and event.topic_id:
@@ -2005,14 +2181,10 @@ class RecordingEventViewSet(viewsets.ReadOnlyModelViewSet):
         event = self.get_object()
         topic = get_object_or_404(Topic, pk=request.data.get("topic_id"))
         if event.ingested_file:
-            # Already real, ingested content (e.g. sitting in the Inbox
-            # topic) - just repoint the existing row to the new topic.
-            # Re-running _ingest_into_topic here would write a SECOND
-            # transcript file + a second IngestedFile row under the new
-            # topic's folder, leaving the original Inbox copy behind as an
-            # orphaned duplicate (same content, two rows, double search
-            # hits) - a real bug this avoids rather than one worth fixing
-            # later.
+            # Already real, ingested content - just repoint the existing
+            # row to the new topic. Re-running _ingest_into_topic here would
+            # write a SECOND transcript file + a second IngestedFile row,
+            # leaving the original behind as an orphaned duplicate.
             obj = event.ingested_file
             if obj.topic_id != topic.id:
                 obj.topic = topic
@@ -2035,63 +2207,6 @@ class RecordingEventViewSet(viewsets.ReadOnlyModelViewSet):
         event.pending_extracted_text = ""
         event.save()
         return Response(RecordingEventSerializer(event).data)
-
-    @action(detail=False, methods=["post"], url_path="bulk_assign")
-    def bulk_assign(self, request):
-        """One decision for a whole folder-drop's worth of Inbox-filed
-        events at once - "create a project for all of these" / "move all
-        of these to an existing project" - rather than repeating assign_
-        topic's single-file flow N times, which for a real N-file folder
-        drop meant N separate brief-regeneration LLM calls back to back
-        (the same "Failed to fetch" root cause this app already fixed once
-        for the upload endpoint itself - see RecordingEventViewSet.upload).
-        Body: {"event_ids": [...], "topic_id": <id>} to move to an existing
-        project, or {"event_ids": [...], "new_topic": {"name", "one_liner",
-        "topic_type"}} to create one first and move everything into it."""
-        event_ids = request.data.get("event_ids") or []
-        if not event_ids:
-            return Response({"error": "event_ids is required"}, status=400)
-
-        new_topic_data = request.data.get("new_topic")
-        if new_topic_data:
-            name = (new_topic_data.get("name") or "").strip()
-            if not name:
-                return Response({"error": "new_topic.name is required"}, status=400)
-            topic = Topic.objects.create(
-                name=name,
-                one_liner=(new_topic_data.get("one_liner") or "").strip(),
-                topic_type=(new_topic_data.get("topic_type") or "project").strip(),
-            )
-        else:
-            topic = get_object_or_404(Topic, pk=request.data.get("topic_id"))
-
-        events = RecordingEvent.objects.filter(id__in=event_ids).select_related("ingested_file")
-        moved = []
-        for event in events:
-            if event.ingested_file:
-                obj = event.ingested_file
-                if obj.topic_id != topic.id:
-                    obj.topic = topic
-                    obj.save(update_fields=["topic"])
-            else:
-                text = event.pending_extracted_text
-                if not text:
-                    continue  # nothing real to move - leave it for individual review
-                obj = recordings._ingest_into_topic(topic, event.file_path, text, refresh_brief=False)
-            event.topic = topic
-            event.ingested_file = obj
-            event.status = "routed"
-            event.detail = "Moved out of Inbox as part of a batch."
-            event.pending_extracted_text = ""
-            event.save()
-            moved.append(event.id)
-
-        if moved:
-            _ask_topic(topic, CONTEXT_BRIEF_QUESTION)
-
-        return Response(
-            {"topic": TopicSerializer(topic).data, "moved_count": len(moved), "moved_ids": moved}
-        )
 
     @action(detail=True, methods=["post"], url_path="confirm_new_project")
     def confirm_new_project(self, request, pk=None):
@@ -2475,7 +2590,13 @@ def _dedupe_meetings(metas):
     best = {}
     order = []
     for m in metas:
-        key = (m.meeting_date, _meeting_timeline_title(m.meeting_title).lower())
+        if m.meeting_type:
+            # A typed meeting ("Discovery 2") is only the same meeting as one
+            # with the same full title, type and sequence - the 4-word title
+            # alone would merge two different calls held on the same day.
+            key = (m.meeting_date, (m.meeting_title or "").strip().lower(), m.meeting_type, m.meeting_sequence)
+        else:
+            key = (m.meeting_date, _meeting_timeline_title(m.meeting_title).lower())
         score = len(m.attendees or []) + len(m.agenda or "") + len(m.achieved or "")
         if key not in best or score > best[key][0]:
             if key not in best:
@@ -2529,9 +2650,8 @@ def _dedupe_names(names):
 def _collect_stakeholders(topic, metas):
     names = set()
     for m in metas:
-        for a in m.attendees or []:
-            if a:
-                names.add(a)
+        for a in extraction.clean_attendees(m.attendees):
+            names.add(a)
     for n in (topic.related_people or "").split(","):
         n = n.strip()
         if n:
@@ -3089,7 +3209,7 @@ class ConnectorRequestView(APIView):
     actually been asked for before any live integration is built."""
 
     def post(self, request, slug):
-        denied = _require_admin(request)
+        denied = _require_settings_password(request)
         if denied:
             return denied
         obj, _ = ConnectorStatus.objects.update_or_create(
@@ -3102,7 +3222,7 @@ class ConnectorResetView(APIView):
     """Withdraws a pending request, back to 'Not Connected'."""
 
     def post(self, request, slug):
-        denied = _require_admin(request)
+        denied = _require_settings_password(request)
         if denied:
             return denied
         ConnectorStatus.objects.filter(slug=slug).update(status="not_connected", requested_at=None)
@@ -3122,13 +3242,25 @@ class CsrfTokenView(APIView):
         return Response({"ok": True})
 
 
+ONE_LOGIN_MESSAGE = "This app has one shared login, so sign-up and email password reset are turned off."
+
+
 class LoginView(APIView):
+    """Signs in the one shared login only (settings.SINGLE_LOGIN_USERNAME).
+    Any other username - including accounts that still exist in the database -
+    gets the same generic error as a wrong password, so this can't be used to
+    find out which accounts exist."""
+
     permission_classes = [AllowAny]
 
     def post(self, request):
         username = (request.data.get("username") or "").strip()
         password = request.data.get("password") or ""
-        user = authenticate(request, username=username, password=password)
+        if username.lower() != django_settings.SINGLE_LOGIN_USERNAME.lower():
+            return Response({"error": "Incorrect username or password."}, status=400)
+        # The configured spelling, not what was typed: Django's own username
+        # match is case-sensitive, and "User" / "USER" should open the same login.
+        user = authenticate(request, username=django_settings.SINGLE_LOGIN_USERNAME, password=password)
         if user is None:
             return Response({"error": "Incorrect username or password."}, status=400)
         django_login(request, user)
@@ -3136,98 +3268,34 @@ class LoginView(APIView):
 
 
 class RegisterView(APIView):
-    """Self-service account creation - every new account gets role="user"
-    (Profile's own default); Admin access is granted the same way it
-    already is today (directly, not through this form). Logs the new
-    account straight in on success, same as LoginView, so signup is one
-    step, not signup-then-login."""
+    """Switched off: the app has one shared login (Ayush, 8 Oct 2026), so no
+    account can be created from outside."""
 
     permission_classes = [AllowAny]
 
     def post(self, request):
-        username = (request.data.get("username") or "").strip()
-        email = (request.data.get("email") or "").strip().lower()
-        display_name = (request.data.get("display_name") or "").strip()
-        password = request.data.get("password") or ""
-
-        if not username or not email or not password:
-            return Response({"error": "Username, email, and password are all required."}, status=400)
-        if len(password) < 6:
-            return Response({"error": "Password must be at least 6 characters."}, status=400)
-        if User.objects.filter(username__iexact=username).exists():
-            return Response({"error": "That username is already taken."}, status=400)
-        if User.objects.filter(email__iexact=email).exists():
-            return Response({"error": "An account with that email already exists."}, status=400)
-
-        user = User.objects.create_user(username=username, email=email, password=password)
-        if display_name:
-            parts = display_name.split(" ", 1)
-            user.first_name = parts[0]
-            user.last_name = parts[1] if len(parts) > 1 else ""
-            user.save()
-        Profile.objects.create(user=user, role="user")
-
-        django_login(request, user)
-        return Response(_profile_payload(user), status=201)
+        return Response({"error": ONE_LOGIN_MESSAGE}, status=403)
 
 
 class PasswordResetRequestView(APIView):
-    """Step 1 of self-service reset: given an email, generate a one-time
-    token (Django's own default_token_generator - stateless, no extra table
-    needed) and email a reset link. This environment has no real SMTP
-    account configured (settings.EMAIL_BACKEND is the console backend), so
-    the "email" actually lands in the backend server's own console/log, not
-    a real inbox, until real credentials are added later - built for real,
-    mocked until configured, same as this workspace's other not-yet-wired
-    integrations. Always returns the same generic response regardless of
-    whether the email matched an account, so this endpoint can't be used to
-    find out who has an account."""
+    """Switched off with sign-up: with one shared login there is no email
+    address to send a reset link to. The login's password is changed from the
+    Profile page while signed in, or from the command line
+    (`python manage.py changepassword <username>`)."""
 
     permission_classes = [AllowAny]
 
     def post(self, request):
-        email = (request.data.get("email") or "").strip().lower()
-        user = User.objects.filter(email__iexact=email).first() if email else None
-        if user:
-            uid = urlsafe_base64_encode(force_bytes(user.pk))
-            token = default_token_generator.make_token(user)
-            reset_link = f"{django_settings.FRONTEND_URL}/reset-password?uid={uid}&token={token}"
-            send_mail(
-                subject="Reset your OrientMe password",
-                message=(
-                    f"Hi {user.get_full_name() or user.username},\n\n"
-                    f"Use this link to reset your OrientMe password:\n{reset_link}\n\n"
-                    "If you didn't request this, you can ignore this email."
-                ),
-                from_email=None,
-                recipient_list=[email],
-                fail_silently=True,
-            )
-        return Response({"ok": True})
+        return Response({"error": ONE_LOGIN_MESSAGE}, status=403)
 
 
 class PasswordResetConfirmView(APIView):
-    """Step 2: the uid+token from the emailed/logged link, plus a new
-    password."""
+    """Switched off - see PasswordResetRequestView."""
 
     permission_classes = [AllowAny]
 
     def post(self, request):
-        uidb64 = request.data.get("uid") or ""
-        token = request.data.get("token") or ""
-        new_password = request.data.get("new_password") or ""
-        if len(new_password) < 6:
-            return Response({"error": "New password must be at least 6 characters."}, status=400)
-        try:
-            uid = force_str(urlsafe_base64_decode(uidb64))
-            user = User.objects.get(pk=uid)
-        except (TypeError, ValueError, OverflowError, User.DoesNotExist):
-            user = None
-        if user is None or not default_token_generator.check_token(user, token):
-            return Response({"error": "This reset link is invalid or has expired."}, status=400)
-        user.set_password(new_password)
-        user.save()
-        return Response({"ok": True})
+        return Response({"error": ONE_LOGIN_MESSAGE}, status=403)
 
 
 class LogoutView(APIView):
@@ -3250,9 +3318,9 @@ class MeView(APIView):
 
 
 class ChangePasswordView(APIView):
-    """Self-service password change - any logged-in person (Admin or User)
-    can change their own password; this has nothing to do with the
-    Admin/User role split, which only governs Settings/Connectors."""
+    """Self-service password change for the signed-in login. This is the
+    login's own password; it has nothing to do with the settings password
+    (settings.SETTINGS_EDIT_PASSWORD), which guards the Settings page."""
 
     def post(self, request):
         old_password = request.data.get("old_password") or ""
@@ -3282,3 +3350,345 @@ class UpdateProfileView(APIView):
             request.user.save()
         return Response(_profile_payload(request.user))
 
+
+# ===========================================================================
+# 5 Oct 2026 - additive sales-oriented features (file metadata, meeting
+# types, human notes, business timeline, contacts, metadata CSV).
+# Nothing above this line was removed or re-purposed.
+# ===========================================================================
+
+_TIMELINE_DOC_TYPES = ("proposal", "quotation_sow", "prd_brd", "project_charter", "project_plan", "opportunity_scorecard")
+_TIMELINE_KIND_ORDER = {"meeting": 0, "email": 1, "document": 2, "note": 3}
+MAX_NOTE_LENGTH = 2000
+
+
+def _meeting_display_title(m):
+    return doc_meta.meeting_display_title(
+        _meeting_timeline_title(m.meeting_title), m.meeting_title, m.meeting_type, m.meeting_sequence
+    )
+
+
+def _meeting_payload(m, include_turns=False):
+    """The meeting_metadata item shape: every key it always had, plus the
+    meeting type/sequence, the "who said what" summary and the meeting's notes."""
+    payload = {
+        "id": m.id,
+        "file_id": m.ingested_file_id,
+        "file_display_name": m.ingested_file.display_name,
+        "file_path": m.ingested_file.path,
+        "meeting_title": m.meeting_title,
+        "timeline_title": _meeting_display_title(m),
+        "meeting_date": m.meeting_date.isoformat() if m.meeting_date else None,
+        "meeting_time": m.meeting_time,
+        "attendees": extraction.clean_attendees(m.attendees),
+        "agenda": m.agenda,
+        "achieved": m.achieved,
+        "meeting_type": m.meeting_type,
+        "meeting_type_label": doc_meta.MEETING_TYPE_LABELS.get(m.meeting_type, ""),
+        "meeting_sequence": m.meeting_sequence,
+        "meeting_type_source": m.meeting_type_source,
+        "speaker_turn_count": len(m.speaker_turns or []),
+        "speaker_summary": extraction.summarize_speakers(m.speaker_turns),
+        "notes": [
+            {"id": n.id, "text": n.text, "author": n.author, "created_at": n.created_at.isoformat()}
+            for n in m.notes.all()
+        ],
+    }
+    if include_turns:
+        payload["speaker_turns"] = m.speaker_turns or []
+    return payload
+
+
+def _business_timeline_events(topic):
+    """Business events for a topic, oldest first: meetings (type + sequence in
+    the title), emails (by document_date), key documents with their version,
+    and human notes. Additive to the app's own timeline - see API_CONTRACT.md."""
+    events = []
+
+    def event(kind, date_iso, title, body="", **extra):
+        row = {
+            "kind": kind, "date": date_iso, "title": title, "body": body, "approx_date": False,
+            "file_id": None, "meta_id": None, "note_id": None, "doc_type": "", "version_label": "",
+            "meeting_type": "", "meeting_sequence": None, "author": "", "meeting_title": "",
+        }
+        row.update(extra)
+        events.append(row)
+
+    metas = (
+        ExtractedMeta.objects.filter(ingested_file__topic=topic, meeting_date__isnull=False)
+        .select_related("ingested_file")
+        .order_by("meeting_date", "ingested_file__first_added_at")
+    )
+    for m in _dedupe_meetings(metas):
+        event(
+            "meeting", m.meeting_date.isoformat(), _meeting_display_title(m),
+            _truncate(m.achieved or m.agenda or "", 160),
+            file_id=m.ingested_file_id, meta_id=m.id, meeting_type=m.meeting_type,
+            meeting_sequence=m.meeting_sequence,
+        )
+
+    files = topic.files.filter(doc_type__in=("email",) + _TIMELINE_DOC_TYPES).exclude(meta_state="error")
+    for f in files:
+        when = f.document_date
+        approx = when is None
+        if approx:
+            when = f.first_added_at.date()
+        if f.doc_type == "email":
+            subject = doc_meta.email_subject(f.extracted_text)
+            event(
+                "email", when.isoformat(), subject or f.display_name or "Email", f.signal,
+                approx_date=approx, file_id=f.id, doc_type=f.doc_type, version_label=f.version_label,
+            )
+        else:
+            label = doc_meta.DOC_TYPE_LABELS.get(f.doc_type, "Document")
+            title = f"{label} {f.version_label}".strip()
+            event(
+                "document", when.isoformat(), title, f.signal,
+                approx_date=approx, file_id=f.id, doc_type=f.doc_type, version_label=f.version_label,
+            )
+
+    for n in topic.meeting_notes.select_related("meta"):
+        first_line = " ".join((n.text or "").split())
+        event(
+            "note", n.created_at.date().isoformat(), "Note: " + _truncate(first_line, 70), n.text,
+            note_id=n.id, meta_id=n.meta_id, author=n.author,
+            meeting_title=n.meta.meeting_title if n.meta_id else "",
+        )
+
+    events.sort(key=lambda e: (e["date"], _TIMELINE_KIND_ORDER[e["kind"]], e["file_id"] or e["note_id"] or e["meta_id"] or 0))
+    return events
+
+
+# ---- metadata CSV --------------------------------------------------------
+METADATA_CSV_COLUMNS = [
+    "file", "document_type", "topic_tags", "signal", "state", "seconds", "review_notes",  # Siddharth's contract
+    "phase", "version", "doc_date", "participants",  # optional, to the right
+]
+_DELIVERY_DOC_TYPES = ("prd_brd", "project_charter", "project_plan", "stakeholder_map")
+_DELIVERY_MEETING_TYPES = ("kickoff", "standup", "review")
+
+
+def _csv_safe(value):
+    """Neutralise spreadsheet formula injection (a cell starting = + @ or a
+    '-' that is not a plain negative number would be run as a formula by
+    Excel); email-derived text is not trusted."""
+    value = "" if value is None else str(value)
+    if value and (value[0] in "=+@\t\r" or (value[0] == "-" and not re.match(r"^-\d+(\.\d+)?$", value))):
+        return "'" + value
+    return value
+
+
+def _csv_file_label(f):
+    path = f.path or ""
+    norm = path.replace("\\", "/")
+    for folder in f.topic.folders.all():
+        base = (folder.path or "").replace("\\", "/").rstrip("/")
+        if base and norm.lower().startswith(base.lower() + "/"):
+            return norm[len(base) + 1:]
+    if path.startswith(("pasted:", "mbox:", "ics:")):
+        return f.display_name or path
+    return f.display_name or os.path.basename(norm) or path
+
+
+def _csv_phase(f):
+    topic = f.topic
+    meta = getattr(f, "meta", None)
+    if f.doc_type in _DELIVERY_DOC_TYPES or (meta is not None and meta.meeting_type in _DELIVERY_MEETING_TYPES):
+        return "Delivery"
+    if topic.topic_type in ("opportunity", "customer") or topic.stage:
+        return "Pre-sales"
+    return ""
+
+
+def _csv_participants(f):
+    if f.doc_type == "email":
+        names = doc_meta.email_participants(f.extracted_text)
+    else:
+        meta = getattr(f, "meta", None)
+        names = extraction.clean_attendees(meta.attendees) if meta is not None else []
+    return "; ".join(names)
+
+
+def _metadata_csv_row(f, with_topic):
+    meta = getattr(f, "meta", None)
+    state = f.meta_state or ("error" if f.extraction_error else "")
+    when = f.document_date or (meta.meeting_date if meta is not None else None)
+    notes = f.review_notes or (f.extraction_error if state == "error" else "")
+    row = [
+        _csv_file_label(f),
+        doc_meta.DOC_TYPE_LABELS.get(f.doc_type, ""),
+        f.topic_tags,
+        f.signal,
+        state,
+        f"{f.meta_seconds:.1f}" if f.meta_seconds is not None else "",
+        notes,
+        _csv_phase(f),
+        f.version_label,
+        when.isoformat() if when else "",
+        _csv_participants(f),
+    ]
+    if with_topic:
+        row.append(f.topic.name)
+    return [_csv_safe(c) for c in row], (when.isoformat() if when else "9999-12-31")
+
+
+def _metadata_csv_response(files, filename, with_topic=False):
+    rows = [_metadata_csv_row(f, with_topic) for f in files]
+    rows.sort(key=lambda r: (r[1], r[0][0].lower()))
+    buf = io.StringIO()
+    writer = csv.writer(buf, lineterminator="\r\n")
+    writer.writerow(METADATA_CSV_COLUMNS + (["topic"] if with_topic else []))
+    for row, _sort in rows:
+        writer.writerow(row)
+    response = HttpResponse(buf.getvalue(), content_type="text/csv; charset=utf-8")
+    safe_name = re.sub(r'[^A-Za-z0-9._ -]+', "_", filename).strip() or "metadata.csv"
+    response["Content-Disposition"] = f'attachment; filename="{safe_name}"'
+    return response
+
+
+class GlobalMetadataCsvView(APIView):
+    """GET /api/metadata_csv/ - every ingested file across every project (or
+    one project with ?topic_id=): the same CSV as TopicViewSet.metadata_csv
+    with one extra trailing "topic" column."""
+
+    def get(self, request):
+        qs = IngestedFile.objects.select_related("topic", "meta").prefetch_related("topic__folders")
+        topic_id = request.query_params.get("topic_id")
+        if topic_id:
+            qs = qs.filter(topic_id=topic_id)
+        return _metadata_csv_response(qs, "orientme-metadata.csv", with_topic=True)
+
+
+# ---- file metadata edit / confirm ----------------------------------------
+class FileMetadataView(APIView):
+    """GET/PATCH /api/files/<id>/metadata/ - read or correct one file's
+    metadata. A PATCH that changes doc_type / topic_tags / signal /
+    version_label / document_date marks the row "corrected" (and doc_type as
+    manually set); review_notes can be edited without changing the state."""
+
+    EDITABLE = ("doc_type", "topic_tags", "signal", "version_label", "document_date", "review_notes")
+
+    def _payload(self, f):
+        return {"id": f.id, "topic_id": f.topic_id, **file_metadata_payload(f)}
+
+    def get(self, request, pk=None):
+        return Response(self._payload(get_object_or_404(IngestedFile, pk=pk)))
+
+    def patch(self, request, pk=None):
+        f = get_object_or_404(IngestedFile, pk=pk)
+        data = request.data
+        present = [k for k in self.EDITABLE if k in data]
+        if not present:
+            return Response({"error": "Send at least one of: " + ", ".join(self.EDITABLE)}, status=400)
+
+        errors, changes = {}, {}
+        if "doc_type" in data:
+            value = str(data["doc_type"] or "").strip()
+            if value and value not in dict(DOC_TYPES):
+                errors["doc_type"] = "Unknown document type. Allowed: " + ", ".join(dict(DOC_TYPES))
+            else:
+                changes["doc_type"] = value
+        if "topic_tags" in data:
+            changes["topic_tags"] = ", ".join(doc_meta.normalize_tags(data["topic_tags"]))
+        if "signal" in data:
+            value = " ".join(str(data["signal"] or "").split())
+            if len(value) > 400:
+                errors["signal"] = "At most 400 characters."
+            else:
+                changes["signal"] = value
+        if "version_label" in data:
+            value = " ".join(str(data["version_label"] or "").split())
+            if len(value) > 30:
+                errors["version_label"] = "At most 30 characters."
+            else:
+                changes["version_label"] = value
+        if "document_date" in data:
+            raw = data["document_date"]
+            if raw in (None, ""):
+                changes["document_date"] = None
+            else:
+                try:
+                    changes["document_date"] = datetime.strptime(str(raw)[:10], "%Y-%m-%d").date()
+                except ValueError:
+                    errors["document_date"] = "Use YYYY-MM-DD."
+        if "review_notes" in data:
+            changes["review_notes"] = str(data["review_notes"] or "").strip()
+        if errors:
+            return Response({"errors": errors}, status=400)
+
+        fields = []
+        material_change = False
+        for key, value in changes.items():
+            if getattr(f, key) != value:
+                setattr(f, key, value)
+                fields.append(key)
+                if key != "review_notes":
+                    material_change = True
+        if "doc_type" in fields:
+            f.doc_type_source = "manual"
+            fields.append("doc_type_source")
+        if material_change and f.meta_state != "corrected":
+            f.meta_state = "corrected"
+            fields.append("meta_state")
+        if fields:
+            f.save(update_fields=fields)  # update_fields: last_ingested_at is left alone
+        return Response(self._payload(f))
+
+
+class FileMetadataConfirmView(APIView):
+    """POST /api/files/<id>/confirm/ - a person vouches for the current
+    metadata: generated_unconfirmed (or never-filled) -> confirmed. Already
+    corrected rows stay "corrected"; an unreadable (error) file cannot be
+    confirmed."""
+
+    def post(self, request, pk=None):
+        f = get_object_or_404(IngestedFile, pk=pk)
+        if f.meta_state == "error":
+            return Response({"error": "This file could not be read, so there is nothing to confirm."}, status=400)
+        if f.meta_state != "corrected" and f.meta_state != "confirmed":
+            f.meta_state = "confirmed"
+            f.save(update_fields=["meta_state"])
+        return Response({"id": f.id, "topic_id": f.topic_id, **file_metadata_payload(f)})
+
+
+# ---- meeting type / sequence ---------------------------------------------
+class MeetingDetailView(APIView):
+    """GET/PATCH /api/meetings/<meta_id>/ - one meeting (ExtractedMeta). PATCH
+    meeting_type and/or meeting_sequence by hand; a manual choice is never
+    overwritten by auto-detection on re-ingest."""
+
+    def _get(self, pk):
+        return get_object_or_404(ExtractedMeta.objects.select_related("ingested_file"), pk=pk)
+
+    def get(self, request, pk=None):
+        return Response(_meeting_payload(self._get(pk), include_turns=True))
+
+    def patch(self, request, pk=None):
+        m = self._get(pk)
+        data = request.data
+        if "meeting_type" not in data and "meeting_sequence" not in data:
+            return Response({"error": "Send meeting_type and/or meeting_sequence."}, status=400)
+        errors = {}
+        if "meeting_type" in data:
+            value = str(data["meeting_type"] or "").strip()
+            if value and value not in dict(MEETING_TYPES):
+                errors["meeting_type"] = "Allowed: " + ", ".join(dict(MEETING_TYPES))
+            else:
+                m.meeting_type = value
+        if "meeting_sequence" in data:
+            raw = data["meeting_sequence"]
+            if raw in (None, ""):
+                m.meeting_sequence = None
+            else:
+                try:
+                    seq = int(raw)
+                    if not 1 <= seq <= 99:
+                        raise ValueError
+                    m.meeting_sequence = seq
+                except (TypeError, ValueError):
+                    errors["meeting_sequence"] = "A whole number from 1 to 99, or null."
+        if errors:
+            return Response({"errors": errors}, status=400)
+        m.meeting_type_source = "manual"
+        m.save(update_fields=["meeting_type", "meeting_sequence", "meeting_type_source"])
+        return Response(_meeting_payload(m, include_turns=True))

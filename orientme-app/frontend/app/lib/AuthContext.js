@@ -6,10 +6,16 @@ import { api } from "./api";
 
 const AuthContext = createContext(null);
 
-// Real Django sessions now gate the whole app - this provider checks once
-// on load whether anyone's logged in, and redirects to /login if not. Two
-// roles (admin/user) ride along on the same "who am I" call so pages can
-// gate individual actions (Settings, Connectors) without a second request.
+// Public routes reachable without a session - the search page and the login
+// page. (Sign-up and email password reset are switched off: the app has one
+// shared login.) Exported so AppShell's own render guard (no sidebar/chrome on
+// these pages) stays in sync with this redirect list.
+export const PUBLIC_PATHS = new Set(["/", "/login"]);
+
+// Real Django sessions gate the whole app - this provider checks once on load
+// whether anyone's logged in, and redirects to /login if not. There is one
+// shared login; changing Settings needs a separate password (see the
+// Settings page), not a role.
 export function AuthProvider({ children }) {
   const router = useRouter();
   const pathname = usePathname();
@@ -34,9 +40,8 @@ export function AuthProvider({ children }) {
   }, []);
 
   useEffect(() => {
-    // "/" is the public, no-login search page - everyone can land there.
-    // Every other route still requires a real session.
-    if (!loading && !user && pathname !== "/login" && pathname !== "/") {
+    // Every route not in PUBLIC_PATHS still requires a real session.
+    if (!loading && !user && !PUBLIC_PATHS.has(pathname)) {
       router.replace("/login");
     }
   }, [loading, user, pathname, router]);
@@ -55,7 +60,6 @@ export function AuthProvider({ children }) {
       value={{
         user,
         loading,
-        isAdmin: user?.role === "admin",
         refresh,
         logout,
       }}

@@ -30,14 +30,17 @@ TOPIC_TYPES = [
     ("person", "Person"),
     ("customer", "Customer"),
     ("opportunity", "Opportunity"),
-    (
-        "general",
-        "General / Inbox",
-    ),  # the one singleton "doesn't fit a real project yet" bucket - see
-    # recordings.get_or_create_inbox_topic. Not something a person picks
-    # when creating a topic by hand (TopicAutocomplete/create-project forms
-    # filter it out) - it only ever exists as the one auto-created landing
-    # spot for a folder/file drop that didn't confidently match anything.
+]
+
+
+TOPIC_STAGES = [
+    ("intro", "Intro"),
+    ("discovery", "Discovery"),
+    ("solution", "Solution"),
+    ("commercial", "Commercial"),
+    ("won", "Won"),
+    ("lost", "Lost"),
+    ("delivery", "Delivery"),
 ]
 
 
@@ -59,6 +62,10 @@ class Topic(models.Model):
         "auto-create pipeline rather than a person clicking 'create topic' - shown as a badge so "
         "an LLM-guessed project is never mistaken for one a person deliberately set up.",
     )
+    # Sales-flavoured, optional (5 Oct 2026). Blank for every existing topic and
+    # ignored by everything that uses topic_type.
+    stage = models.CharField(max_length=20, choices=TOPIC_STAGES, blank=True, default="")
+    customer_name = models.CharField(max_length=200, blank=True, default="")
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -93,6 +100,36 @@ SOURCE_METHODS = [
 ]
 
 
+# Document type vocabulary (5 Oct 2026, additive). Labels match
+# document_type_vocabulary.csv / Siddharth's metadata CSV contract.
+DOC_TYPES = [
+    ("email", "Email"),
+    ("meeting_transcript", "Meeting Transcript"),
+    ("mom_action_items", "MoM / Action Items"),
+    ("proposal", "Proposal"),
+    ("quotation_sow", "Quotation / SOW"),
+    ("prd_brd", "PRD / BRD"),
+    ("project_charter", "Project Charter"),
+    ("project_plan", "Project Plan"),
+    ("stakeholder_map", "Stakeholder Map"),
+    ("opportunity_scorecard", "Opportunity Scorecard"),
+    ("report", "Report"),
+    ("notes", "Notes"),
+    ("other", "Other"),
+]
+
+# "llm" = decided by reading the file's CONTENT (8 Oct 2026, Venki: a file
+# may be renamed to anything, so the name cannot be what decides what it is).
+DOC_TYPE_SOURCES = [("auto", "Auto"), ("manual", "Manual"), ("llm", "AI (read from content)")]
+
+META_STATES = [
+    ("generated_unconfirmed", "Generated (unconfirmed)"),
+    ("confirmed", "Confirmed"),
+    ("corrected", "Corrected"),
+    ("error", "Error"),
+]
+
+
 class IngestedFile(models.Model):
     """One piece of ingested content - out of a lookup folder, a direct
     upload, or pasted text. Keeps its extracted text and a content hash so
@@ -116,6 +153,26 @@ class IngestedFile(models.Model):
     extraction_error = models.CharField(max_length=300, blank=True)
     first_added_at = models.DateTimeField(auto_now_add=True)
     last_ingested_at = models.DateTimeField(auto_now=True)
+
+    # --- File metadata following Siddharth's CSV contract (5 Oct 2026). All
+    # optional; filled by core/doc_meta.py on ingest (pure code first; a
+    # content-reading LLM check decides the document type when the file's name
+    # cannot be trusted) and never overwritten once a human has
+    # corrected/confirmed them.
+    doc_type = models.CharField(max_length=30, choices=DOC_TYPES, blank=True, default="")
+    doc_type_source = models.CharField(max_length=10, choices=DOC_TYPE_SOURCES, blank=True, default="")
+    # The content hash the LLM content check last ran on - an unchanged file is
+    # never sent to the model twice (see doc_meta.refine_doc_type_with_llm).
+    llm_checked_hash = models.CharField(max_length=64, blank=True, default="")
+    topic_tags = models.CharField(
+        max_length=200, blank=True, default="", help_text="Comma-separated, at most 3."
+    )
+    signal = models.CharField(max_length=400, blank=True, default="")
+    meta_state = models.CharField(max_length=30, choices=META_STATES, blank=True, default="")
+    review_notes = models.TextField(blank=True, default="")
+    version_label = models.CharField(max_length=30, blank=True, default="")
+    document_date = models.DateField(null=True, blank=True)
+    meta_seconds = models.FloatField(null=True, blank=True)
 
     class Meta:
         unique_together = [("topic", "path")]
@@ -207,6 +264,20 @@ class Settings(models.Model):
         return obj
 
 
+MEETING_TYPES = [
+    ("intro", "Intro"),
+    ("discovery", "Discovery"),
+    ("solution", "Solution"),
+    ("commercial", "Commercial"),
+    ("kickoff", "Kickoff"),
+    ("review", "Review"),
+    ("standup", "Stand-up / Sync"),
+    ("other", "Other"),
+]
+
+MEETING_TYPE_SOURCES = [("auto", "Auto"), ("manual", "Manual")]
+
+
 class ExtractedMeta(models.Model):
     """Structured facts pulled out of one IngestedFile's text via pure-Python
     heuristics (see extraction.py) - no LLM involved. One-to-one with
@@ -224,6 +295,15 @@ class ExtractedMeta(models.Model):
     achieved = models.TextField(blank=True)
     # list of {"name": str, "hours": float, "date": "YYYY-MM-DD" or None}
     employee_hours = models.JSONField(default=list, blank=True)
+    # Meeting type / sequence (5 Oct 2026): blank for every existing meeting
+    # until auto-detected from a title keyword ("Discovery 2") or set by hand.
+    meeting_type = models.CharField(max_length=20, choices=MEETING_TYPES, blank=True, default="")
+    meeting_sequence = models.PositiveIntegerField(null=True, blank=True)
+    meeting_type_source = models.CharField(max_length=10, choices=MEETING_TYPE_SOURCES, blank=True, default="")
+    # "Who said what" (5 Oct 2026): list of {"speaker", "ts", "text"} parsed in
+    # plain code from Teams-format transcripts. Empty for text with no speaker
+    # names (e.g. Whisper "[MM:SS]" output) - never guessed.
+    speaker_turns = models.JSONField(default=list, blank=True)
     extracted_at = models.DateTimeField(auto_now=True)
 
     def __str__(self):
@@ -544,7 +624,6 @@ RECORDING_EVENT_STATUSES = [
     ("pending_new_project", "New project suggested - awaiting your decision"),
     ("auto_created", "New project created"),
     ("needs_review", "Needs manual assignment"),
-    ("inbox", "Filed to Inbox - no confident project match"),
     ("pre_existing", "Existed before auto-watch (not processed)"),
     ("error", "Error"),
     ("dismissed", "Dismissed - not tracked"),
@@ -626,6 +705,21 @@ class RecordingEvent(models.Model):
         "+ speech per line - generated only when a person clicks 'Generate Transcript'.",
     )
     speaker_transcript_generated_at = models.DateTimeField(null=True, blank=True)
+    # Conversation-style "who spoke what" (5 Oct 2026): list of {"speaker",
+    # "ts", "text", "edited"} - names read straight from a Teams-format
+    # transcript in plain code, or lines grouped by speaker via the app's API
+    # LLM (it only groups real line numbers, never rewrites text). The
+    # speaker_transcript text above is kept in its original format.
+    speaker_turns = models.JSONField(default=list, blank=True)
+    speaker_turns_source = models.CharField(
+        max_length=10, blank=True, default="",
+        help_text="teams = names read from the transcript itself; llm = grouped by the API model; "
+        "code = placeholder 'Speaker 1' (no key / call failed).",
+    )
+    speaker_turns_attempted_at = models.DateTimeField(
+        null=True, blank=True,
+        help_text="Set when an automatic (background) generation was tried - so it runs at most once.",
+    )
 
     class Meta:
         ordering = ["-detected_at"]
@@ -700,3 +794,49 @@ class SearchLog(models.Model):
     def __str__(self):
         return f"{self.query!r} -> {self.chosen_kind}"
 
+
+
+class MeetingNote(models.Model):
+    """A short human note (typically one or two lines written right after a
+    meeting) - HIGH-SIGNAL evidence: shown on the topic timeline and given to
+    the brief prompt as a dated "Human notes (trusted)" block, next to the
+    ProjectState block (see llm_brief.py). Optionally tied to one meeting
+    (ExtractedMeta); SET_NULL so a note survives if that meeting row is
+    rebuilt/removed when its file is re-ingested."""
+
+    topic = models.ForeignKey(Topic, on_delete=models.CASCADE, related_name="meeting_notes")
+    meta = models.ForeignKey(
+        ExtractedMeta, on_delete=models.SET_NULL, null=True, blank=True, related_name="notes"
+    )
+    text = models.TextField()
+    author = models.CharField(max_length=150, blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["created_at", "id"]
+
+    def __str__(self):
+        return f"Note on topic {self.topic_id}: {self.text[:40]}"
+
+
+CONTACT_SIDES = [("customer", "Customer"), ("us", "Us")]
+
+
+class Contact(models.Model):
+    """Optional per-topic stakeholder details (name, organisation, role, side).
+    Rows are only created by a person (or by the explicit "seed from
+    attendees" action) - never automatically."""
+
+    topic = models.ForeignKey(Topic, on_delete=models.CASCADE, related_name="contacts")
+    name = models.CharField(max_length=150)
+    organisation = models.CharField(max_length=150, blank=True, default="")
+    role = models.CharField(max_length=150, blank=True, default="")
+    side = models.CharField(max_length=10, choices=CONTACT_SIDES, blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["name"]
+        unique_together = [("topic", "name")]
+
+    def __str__(self):
+        return f"{self.name} ({self.topic_id})"

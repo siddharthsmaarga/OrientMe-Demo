@@ -9,16 +9,19 @@ from .views import (
     ConnectorStatusView,
     CsrfTokenView,
     DecisionViewSet,
+    FileMetadataConfirmView,
+    FileMetadataView,
     GlobalChatView,
     MessageFeedbackView,
     GlobalSearchView,
+    GlobalMetadataCsvView,
     GlobalSourcesView,
     GlobalTimelineView,
-    IngestedFileViewSet,
     LoginView,
     LogoutView,
     LoopViewSet,
     MeView,
+    MeetingDetailView,
     OpenSourceFileView,
     OpenSourceFolderView,
     OrientHtmlView,
@@ -30,6 +33,7 @@ from .views import (
     ResolveOnlyView,
     RiskViewSet,
     SearchLogView,
+    SettingsUnlockView,
     SettingsView,
     AutoCreateTopicView,
     StatsView,
@@ -49,7 +53,6 @@ router.register("decisions", DecisionViewSet, basename="decision")
 router.register("risks", RiskViewSet, basename="risk")
 router.register("loops", LoopViewSet, basename="loop")
 router.register("recording_events", RecordingEventViewSet, basename="recording-event")
-router.register("files", IngestedFileViewSet, basename="ingested-file")
 
 urlpatterns = [
     # Must come before router.urls - "topics/auto_create/" would otherwise
@@ -60,6 +63,7 @@ urlpatterns = [
     path("topics/auto_create/", AutoCreateTopicView.as_view(), name="topic-auto-create"),
 ] + router.urls + [
     path("settings/", SettingsView.as_view(), name="settings"),
+    path("settings/unlock/", SettingsUnlockView.as_view(), name="settings-unlock"),
     path("calendar/", CalendarView.as_view(), name="calendar"),
     path("orient/", OrientView.as_view(), name="orient"),
     path("resolve_only/", ResolveOnlyView.as_view(), name="resolve-only"),
@@ -67,6 +71,10 @@ urlpatterns = [
     path("topics/<int:pk>/brief_html/", TopicBriefHtmlView.as_view(), name="topic-brief-html"),
     path("topic_names/", TopicNamesView.as_view(), name="topic-names"),
     path("files/<int:pk>/open/", OpenSourceFileView.as_view(), name="open-source-file"),
+    path("files/<int:pk>/metadata/", FileMetadataView.as_view(), name="file-metadata"),
+    path("files/<int:pk>/confirm/", FileMetadataConfirmView.as_view(), name="file-metadata-confirm"),
+    path("meetings/<int:pk>/", MeetingDetailView.as_view(), name="meeting-detail"),
+    path("metadata_csv/", GlobalMetadataCsvView.as_view(), name="global-metadata-csv"),
     path("folders/<int:pk>/open/", OpenSourceFolderView.as_view(), name="open-source-folder"),
     path("stats/", StatsView.as_view(), name="stats"),
     path("chat/global/", GlobalChatView.as_view(), name="global-chat"),

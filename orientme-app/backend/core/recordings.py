@@ -18,11 +18,12 @@ import json
 import logging
 import os
 import re
+import threading
 from datetime import datetime
 
 from django.utils import timezone
 
-from . import extraction, ingestion, local_llm
+from . import doc_meta, extraction, ingestion, llm_brief, local_llm
 from .models import IngestedFile, RecordingEvent, Settings, SourceFolder, Topic
 
 logger = logging.getLogger(__name__)
@@ -33,28 +34,6 @@ _UNSAFE_FOLDER_CHARS = re.compile(r'[\\/:*?"<>|]')
 def _safe_folder_name(name):
     cleaned = _UNSAFE_FOLDER_CHARS.sub("", name).strip()
     return cleaned or "Untitled Project"
-
-
-INBOX_TOPIC_NAME = "Inbox"
-
-
-def get_or_create_inbox_topic():
-    """The one singleton landing spot for a dropped file/folder that didn't
-    confidently match an existing project - Ayush's own product call, 30
-    Sep: a random folder of docs shouldn't be forced to become (or block
-    on) a "Project", but it also shouldn't sit in an unusable, unsearchable
-    limbo waiting for someone to tag it one file at a time. It's a REAL
-    Topic (topic_type='general') so everything that already works for any
-    other topic - Ask/Chat, brief generation, and GlobalSearchView - works
-    on Inbox content for free, no special-casing anywhere else. get_or_
-    create keyed on (name, topic_type) so this is idempotent even if called
-    concurrently by two uploads landing at the same moment."""
-    topic, _ = Topic.objects.get_or_create(
-        name=INBOX_TOPIC_NAME,
-        topic_type="general",
-        defaults={"one_liner": "Files dropped without a confident project match - move them out any time."},
-    )
-    return topic
 
 
 def _resolve_recording_date(file_path):
@@ -270,6 +249,14 @@ def _ingest_into_topic(topic, original_path, text, refresh_brief=True):
     file - see RecordingEventViewSet.upload."""
     from .views import CONTEXT_BRIEF_QUESTION, _ask_topic, _extract_and_store
 
+    if not is_recording_or_transcript(original_path, text):
+        # A proposal / quotation / email / spreadsheet is not a recording: keep
+        # its own name and location instead of writing "<name> - Transcript.txt".
+        obj, _error = ingest_document(topic, original_path, text=text)
+        if refresh_brief:
+            _ask_topic(topic, CONTEXT_BRIEF_QUESTION)
+        return obj
+
     dest_path = _write_transcript_file(topic, original_path, text)
     content_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
     obj, _ = IngestedFile.objects.update_or_create(
@@ -289,7 +276,27 @@ def _ingest_into_topic(topic, original_path, text, refresh_brief=True):
     return obj
 
 
-def process_new_recording(file_path, source="watched_folder", allow_llm_routing=True, refresh_brief=True):
+def process_new_recording(
+    file_path, source="watched_folder", allow_llm_routing=True, refresh_brief=True, target_topic=None
+):
+    """See _process_new_recording. After it finishes, best-effort 'who spoke
+    what' turns are prepared for the resulting event (never breaks ingestion)."""
+    result = _process_new_recording(
+        file_path, source=source, allow_llm_routing=allow_llm_routing, refresh_brief=refresh_brief,
+        target_topic=target_topic,
+    )
+    try:
+        event = RecordingEvent.objects.filter(file_path=file_path).first()
+        if event is not None and event.status not in ("error", "dismissed"):
+            ensure_speaker_turns(event, background=True)
+    except Exception:  # noqa: BLE001
+        logger.exception("Speaker turns after ingest failed for %s", file_path)
+    return result
+
+
+def _process_new_recording(
+    file_path, source="watched_folder", allow_llm_routing=True, refresh_brief=True, target_topic=None
+):
     """One recording file, all the way through: transcribe -> route to an
     existing topic / flag a possible new one for a person to confirm /
     flag for manual review -> ingest -> log a RecordingEvent. Never raises -
@@ -309,7 +316,9 @@ def process_new_recording(file_path, source="watched_folder", allow_llm_routing=
     duplicating this whole pipeline: same self-claim, same extraction, same
     code-only _confident_name_match, just skipping the LLM-routing step
     entirely (allow_llm_routing=False) so a person always makes that call
-    themselves via the quick-tag picker - never automatic for that source."""
+    themselves via the quick-tag picker - never automatic for that source.
+    `target_topic`, when given (in-browser uploads), skips all matching and
+    files the content straight into that project."""
     _placeholder, claimed = RecordingEvent.objects.get_or_create(
         file_path=file_path,
         defaults={
@@ -358,6 +367,20 @@ def process_new_recording(file_path, source="watched_folder", allow_llm_routing=
 
     settings = _current_settings_dict()
     engine_used = Settings.get("transcription_engine", "local_whisper")
+
+    if target_topic is not None:
+        # In-browser upload: the person named the project up front, so no
+        # matching/suggesting is needed - ingest straight into it.
+        obj = _ingest_into_topic(target_topic, file_path, text, refresh_brief=refresh_brief)
+        RecordingEvent.objects.update_or_create(
+            file_path=file_path,
+            defaults={
+                "topic": target_topic, "ingested_file": obj, "status": "routed", "engine_used": engine_used,
+                "detail": f"Dropped into '{target_topic.name}'.",
+            },
+        )
+        return
+
     suggest_new = Settings.get("recordings_suggest_new_topics", "true") == "true"
 
     existing_topics = list(Topic.objects.all())
@@ -375,27 +398,18 @@ def process_new_recording(file_path, source="watched_folder", allow_llm_routing=
         return
 
     if not allow_llm_routing:
-        # No confident project-name match, and this source (manual drop -
-        # a person dropping a folder/files straight into the browser) never
-        # gets LLM-assisted routing. Used to leave this sitting as
-        # 'needs_review' with no IngestedFile at all - unsearchable, un-
-        # askable, real content stuck in limbo until someone tagged it one
-        # file at a time. Real complaint hit dropping a whole project
-        # folder (Ayush, 30 Sep): dozens of files piled up requiring manual
-        # per-file attention, AND showed up on the Transcripts page (a
-        # different, meeting-focused concept) with no way to remove them.
-        # Filing straight into the Inbox topic instead means the content is
-        # immediately real - searchable, chattable, brief-able - the same
-        # moment it lands, and moving it into a real project later is an
-        # explicit choice a person makes when they're ready, not a
-        # precondition for the file being usable at all.
-        inbox = get_or_create_inbox_topic()
-        obj = _ingest_into_topic(inbox, file_path, text, refresh_brief=refresh_brief)
+        # No confident project-name match, and this source (the disk-watched
+        # manual-drop folder) never gets LLM-assisted routing: leave it as
+        # 'needs_review' with the extracted text held on the event, so a
+        # person tags it to a project via the quick-tag picker. (In-browser
+        # uploads never get here - they always name a project up front via
+        # target_topic.)
         RecordingEvent.objects.update_or_create(
             file_path=file_path,
             defaults={
-                "topic": inbox, "ingested_file": obj, "status": "inbox", "engine_used": engine_used,
-                "detail": "No confident project match - filed to Inbox. Move it to a project any time.",
+                "status": "needs_review", "engine_used": engine_used,
+                "pending_extracted_text": text,
+                "detail": "No confident project match - pick a project to tag this to.",
             },
         )
         return
@@ -715,14 +729,30 @@ def _parse_timestamped_lines(text):
 
 
 SPEAKER_GROUPING_PROMPT = """Below is a numbered list of lines from a real meeting transcript, one \
-speech fragment per line. Your ONLY job is to say which lines were spoken by the same person - group \
-consecutive line numbers that are clearly the same speaker. Do NOT rewrite, summarize, or quote the \
-text back; only the line numbers and a speaker label per group. Use a real name only if someone is \
-actually addressed by name or introduces themselves in the text; otherwise use "Speaker 1", "Speaker \
-2", etc, consistently - the same unnamed speaker must keep the same label every time they speak. This \
-is a meeting between real people, never label anyone "User" or "Assistant".
+speech fragment per line. Your ONLY job is to say which lines were spoken by the same person: return \
+groups of consecutive line numbers that are clearly the same speaker, each with a speaker label. Do NOT \
+rewrite, summarize, or quote the text back; only the line numbers and a speaker label per group.
 
+Rules:
+- Use a real name ONLY if someone is addressed by name or introduces themselves in the text; otherwise \
+use "Speaker 1", "Speaker 2", and so on. The same unnamed person must keep the same label every time \
+they speak.
+- It is perfectly possible that only ONE person speaks (a monologue, a voice note, a dictated update). \
+Then use a single label for every line - never invent a second speaker.
+- Prefer FEWER speakers: add a new label only when the text clearly shows a different person (a reply \
+to a question, being addressed by name, a change of topic hand-over). Short fragments such as "Yes." or \
+"Okay." usually belong to the neighbouring speaker unless it is clearly someone answering.
+- This is a meeting between real people. Never label anyone "User", "Assistant", "System" or "AI".
+- Cover every line you are asked to label, with no gaps.
+{context_block}
 {numbered_lines}"""
+
+SPEAKER_CONTEXT_TEMPLATE = """
+Speakers identified in earlier parts of this meeting: {known}. Reuse these exact labels for the same \
+people; add a new label only for someone clearly new.
+Lines {ctx_from}-{ctx_to} are context from the previous excerpt and are ALREADY labelled (shown in square \
+brackets) - do not output groups for them. Label lines {new_from}-{new_to}.
+"""
 
 SPEAKER_GROUPING_SCHEMA = {
     "type": "object",
@@ -743,64 +773,380 @@ SPEAKER_GROUPING_SCHEMA = {
     "required": ["groups"],
 }
 
+SPEAKER_TOOL_NAME = "submit_speaker_groups"
+SPEAKER_TOOL_DESCRIPTION = (
+    "Report which numbered transcript lines were spoken by which speaker (groups of consecutive "
+    "line numbers with a speaker label). Never rewrite or quote the text."
+)
 
-def generate_speaker_transcript(event):
+SPEAKER_CHUNK_CHARS = 8000  # numbered-line characters per model call
+SPEAKER_CHUNK_OVERLAP_LINES = 10  # already-labelled lines repeated as context in the next chunk
+SPEAKER_MAX_TURN_CHARS = 800  # a long run by one speaker is split into several turns
+UNATTRIBUTED = "Unattributed"
+_GENERIC_SPEAKER_RE = re.compile(r"^speaker\s*(\d+)$", re.IGNORECASE)
+_BAD_SPEAKER_LABELS = {"", "user", "assistant", "system", "ai", "bot", "unknown", "none"}
+_RENDERED_LINE_RE = re.compile(r"^\[(\d{1,2}:\d{2}(?::\d{2})?)\]\s+(.+?):\s(.*)$")
+
+
+def _llm_key_configured():
+    return bool((Settings.get("llm_api_key", "") or "").strip())
+
+
+def _canon_speaker_label(raw, known):
+    """Normalises a model-supplied label; None when it is unusable."""
+    label = " ".join(str(raw or "").split()).strip(" :")[:60]
+    if label.lower() in _BAD_SPEAKER_LABELS:
+        return None
+    m = _GENERIC_SPEAKER_RE.match(label)
+    if m:
+        label = f"Speaker {int(m.group(1))}"
+    for k in known:
+        if k.lower() == label.lower():
+            return k
+    return label
+
+
+def _speaker_chunk_ranges(lines, max_chars=None, overlap=None):
+    """[(start, end, label_from)] - 0-based, end exclusive. Lines before
+    label_from are already-labelled context; lines label_from..end are to be
+    labelled. Chunks never stall (at least one new line each)."""
+    max_chars = SPEAKER_CHUNK_CHARS if max_chars is None else max_chars
+    overlap = SPEAKER_CHUNK_OVERLAP_LINES if overlap is None else overlap
+    n = len(lines)
+    sizes = [len(f"{i + 1}. {text}") + 1 for i, (_ts, text) in enumerate(lines)]
+    ranges = []
+    start = label_from = 0
+    while label_from < n:
+        end, total = start, 0
+        while end < n:
+            if end >= label_from and end > label_from and total + sizes[end] > max_chars:
+                break
+            total += sizes[end]
+            end += 1
+        ranges.append((start, end, label_from))
+        if end >= n:
+            break
+        label_from = end
+        start = max(end - overlap, ranges[-1][0] + 1)
+    return ranges
+
+
+def _parse_speaker_groups(args, lo, hi, known):
+    """{line_number: label} for 1-based lines lo..hi from a model result."""
+    out = {}
+    for g in (args or {}).get("groups") or []:
+        start, end = g.get("start_line"), g.get("end_line")
+        label = _canon_speaker_label(g.get("speaker"), known)
+        if not (isinstance(start, int) and isinstance(end, int) and label):
+            continue
+        for i in range(max(start, lo), min(end, hi) + 1):
+            out[i] = label
+    return out
+
+
+def _build_speaker_prompt(lines, rng, labels, known):
+    start, end, label_from = rng
+    numbered = []
+    for i in range(start, end):
+        if i < label_from:
+            numbered.append(f"{i + 1}. [{labels.get(i + 1, UNATTRIBUTED)}] {lines[i][1]}")
+        else:
+            numbered.append(f"{i + 1}. {lines[i][1]}")
+    context_block = ""
+    if label_from > start:
+        context_block = SPEAKER_CONTEXT_TEMPLATE.format(
+            known=", ".join(known) or "(none yet)",
+            ctx_from=start + 1, ctx_to=label_from, new_from=label_from + 1, new_to=end,
+        )
+    return SPEAKER_GROUPING_PROMPT.format(context_block=context_block, numbered_lines="\n".join(numbered))
+
+
+def _lines_to_turns(lines, labels):
+    """Merges consecutive lines with the same label into turns (a long run is
+    split at SPEAKER_MAX_TURN_CHARS). `labels` is {1-based line number: label}."""
+    turns = []
+    for i, (ts, text) in enumerate(lines, start=1):
+        label = labels.get(i, UNATTRIBUTED)
+        last = turns[-1] if turns else None
+        if last and last["speaker"] == label and len(last["text"]) + len(text) < SPEAKER_MAX_TURN_CHARS:
+            last["text"] = f"{last['text']} {text}"
+        else:
+            turns.append({"speaker": label, "ts": ts, "text": text, "edited": False})
+    return turns
+
+
+def _render_speaker_lines(lines, labels):
+    """The long-standing speaker_transcript text format: one "[ts] Name: text" line per fragment."""
+    return "\n".join(f"[{ts}] {labels.get(i, UNATTRIBUTED)}: {text}" for i, (ts, text) in enumerate(lines, start=1))
+
+
+def _failure_reason(exc):
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    return f"HTTP {status}" if status else type(exc).__name__
+
+
+def _label_lines_with_llm(lines, settings, call=None):
+    """Chunked grouping through the API model. Returns (labels, unattributed,
+    error_reason) - labels is {line number: label}; error_reason is set only
+    when a call failed. The model never sees or returns anything but line
+    numbers and labels; every real word/timestamp stays in code."""
+    call = call or llm_brief.call_structured
+    labels, known, error = {}, [], None
+    for rng in _speaker_chunk_ranges(lines):
+        start, end, label_from = rng
+        lo, hi = label_from + 1, end
+        prompt = _build_speaker_prompt(lines, rng, labels, known)
+        for _attempt in range(2):  # one retry for gaps / a transient failure
+            missing = [i for i in range(lo, hi + 1) if i not in labels]
+            if not missing:
+                break
+            try:
+                args = call(
+                    prompt, SPEAKER_TOOL_NAME, SPEAKER_TOOL_DESCRIPTION, SPEAKER_GROUPING_SCHEMA,
+                    settings, timeout=120,
+                )
+            except llm_brief.MissingApiKeyError:
+                return labels, len(lines) - len(labels), "no API key"
+            except Exception as exc:  # noqa: BLE001 - a failed call must never break ingestion
+                error = _failure_reason(exc)
+                logger.warning("Speaker grouping: LLM call failed (%s)", error)
+                continue
+            for i, label in _parse_speaker_groups(args, lo, hi, known).items():
+                labels.setdefault(i, label)
+        for i in range(lo, hi + 1):
+            if i in labels and labels[i] not in known and labels[i] != UNATTRIBUTED:
+                known.append(labels[i])
+    return labels, sum(1 for i in range(1, len(lines) + 1) if i not in labels), error
+
+
+def _save_speaker_result(event, turns, rendered, source):
+    event.speaker_turns = turns
+    event.speaker_turns_source = source
+    event.speaker_transcript = rendered
+    event.speaker_transcript_generated_at = timezone.now()
+    event.save(
+        update_fields=["speaker_turns", "speaker_turns_source", "speaker_transcript", "speaker_transcript_generated_at"]
+    )
+
+
+def generate_speaker_transcript(event, settings=None, call=None):
     """The detail page's 'Generate Transcript' button - Speaker Name +
-    Timestamp + Speech per turn (Ayush, 30 Sep).
+    Timestamp + Speech per turn (Ayush, 30 Sep). Returns (event, succeeded,
+    message); never raises.
 
-    Deliberately NOT "ask the model to rewrite the transcript" - a real
-    test on 30 Sep showed that approach fabricates entire lines of
-    dialogue that were never said, on a long/messy real transcript (it
-    invented a "System:" line that doesn't exist anywhere in the source).
-    Every real timestamp and every real word here comes straight from
-    _parse_timestamped_lines, in code, never touched by the model. The
-    model's ONLY job is grouping already-real line numbers by speaker
-    (SPEAKER_GROUPING_SCHEMA) - a much lower-stakes task, since the worst
-    a wrong answer can do is mislabel who said something, never invent
-    what was said. Any line number the model doesn't cover falls back to
-    the same label as the line before it (or "Speaker 1" for the first),
-    so a partial/short answer degrades gracefully instead of losing lines."""
+    Safety design kept from the 30 Sep version: the model is NOT asked to
+    rewrite the transcript (that fabricated dialogue). Every real timestamp
+    and word comes from code (_parse_timestamped_lines); the model only
+    groups real line numbers by speaker. A wrong answer can mislabel who said
+    something, never invent what was said.
+
+    5 Oct 2026 changes: (1) uses the app's configured API model (the one the
+    brief uses), not the local Ollama model; (2) Teams-format text (speaker
+    name + timestamp lines) is parsed in plain code - real names, no LLM;
+    (3) long transcripts go in overlapping chunks that carry the labels found
+    so far, and a line the model leaves unlabelled is shown as 'Unattributed'
+    instead of inheriting the previous speaker; (4) a single speaker is a
+    valid result; (5) no key / failed call -> one placeholder 'Speaker 1'
+    group and a message that names the API key. Also stores structured
+    speaker_turns next to the unchanged speaker_transcript text."""
     text = _current_transcript_text(event)
     if not (text or "").strip():
         return event, False, "No transcript text is available yet for this recording."
+
+    teams_turns = extraction.parse_speaker_turns(text)
+    if teams_turns:
+        turns = [dict(t, edited=False) for t in teams_turns]
+        rendered = "\n".join(f"[{t['ts']}] {t['speaker']}: {t['text']}" for t in turns)
+        _save_speaker_result(event, turns, rendered, "teams")
+        return event, True, "Speaker names were read straight from the transcript - no LLM was used."
 
     lines = _parse_timestamped_lines(text)
     if not lines:
         return event, False, "No timestamped transcript lines were found to split into speaker turns."
 
-    numbered = "\n".join(f"{i}. {t}" for i, (_ts, t) in enumerate(lines, start=1))
-    prompt = SPEAKER_GROUPING_PROMPT.format(numbered_lines=numbered[:12000])
-    raw = local_llm.call_local_llm(prompt, timeout=240, schema=SPEAKER_GROUPING_SCHEMA)
+    settings = settings if settings is not None else _current_settings_dict()
+    placeholder = {i: "Speaker 1" for i in range(1, len(lines) + 1)}
 
-    speaker_by_line = {}
-    if raw:
-        try:
-            for g in json.loads(raw).get("groups") or []:
-                start, end = g.get("start_line"), g.get("end_line")
-                speaker = (g.get("speaker") or "").strip()
-                if isinstance(start, int) and isinstance(end, int) and speaker:
-                    for i in range(start, min(end, len(lines)) + 1):
-                        speaker_by_line[i] = speaker
-        except json.JSONDecodeError:
-            logger.warning("Generate Transcript: local LLM reply wasn't parseable JSON: %r", raw[:300])
-
-    rendered_lines = []
-    last_speaker = "Speaker 1"
-    for i, (ts, body) in enumerate(lines, start=1):
-        speaker = speaker_by_line.get(i, last_speaker)
-        last_speaker = speaker
-        rendered_lines.append(f"[{ts}] {speaker}: {body}")
-
-    event.speaker_transcript = "\n".join(rendered_lines)
-    event.speaker_transcript_generated_at = timezone.now()
-    event.save()
-    if not raw:
+    if not (settings.get("llm_api_key") or "").strip():
+        _save_speaker_result(event, _lines_to_turns(lines, placeholder), _render_speaker_lines(lines, placeholder), "code")
         return event, True, (
-            f"Local model ({local_llm.OLLAMA_MODEL}) wasn't reachable, so every line is grouped under "
-            "one placeholder speaker - the timestamps and text are still real, just not split by "
-            "speaker. Try again once Ollama is running for real speaker grouping."
+            "No LLM API key is configured (see Settings), so every line is grouped under one placeholder "
+            "speaker - the timestamps and text are still real, just not split by speaker. Add the API key "
+            "in Settings and regenerate for real speaker grouping."
+        )
+
+    labels, unattributed, error = _label_lines_with_llm(lines, settings, call=call)
+    if not labels:
+        _save_speaker_result(event, _lines_to_turns(lines, placeholder), _render_speaker_lines(lines, placeholder), "code")
+        reason = f" ({error})" if error else ""
+        return event, True, (
+            f"The LLM call did not return a usable result{reason}, so every line is grouped under one "
+            "placeholder speaker - the timestamps and text are still real. Check the API key and model in "
+            "Settings, then regenerate."
+        )
+
+    _save_speaker_result(event, _lines_to_turns(lines, labels), _render_speaker_lines(lines, labels), "llm")
+    if unattributed:
+        return event, True, (
+            f"Transcript generated, but {unattributed} line(s) could not be attributed to a speaker and are "
+            "shown as 'Unattributed'. Regenerate to try again."
         )
     return event, True, "Transcript generated."
+
+
+def _turns_from_rendered_text(rendered):
+    """Structured turns from an already-rendered speaker_transcript (generated
+    before speaker_turns existed) - no LLM, nothing re-labelled."""
+    lines, labels = [], {}
+    for raw in (rendered or "").splitlines():
+        m = _RENDERED_LINE_RE.match(raw.strip())
+        if not m:
+            continue
+        lines.append((m.group(1), m.group(3)))
+        labels[len(lines)] = m.group(2).strip()
+    return _lines_to_turns(lines, labels) if lines else []
+
+
+_auto_lock = threading.Lock()
+_auto_inflight = set()
+
+
+def speaker_turns_generating(event_id):
+    return event_id in _auto_inflight
+
+
+def _run_auto_speaker_turns(event_id):
+    from django.db import connection
+
+    try:
+        event = RecordingEvent.objects.filter(pk=event_id).first()
+        if event is not None and not event.speaker_turns:
+            generate_speaker_transcript(event)
+    except Exception:  # noqa: BLE001 - best effort; never breaks anything
+        logger.exception("Auto speaker turns failed for recording event %s", event_id)
+    finally:
+        with _auto_lock:
+            _auto_inflight.discard(event_id)
+        connection.close()
+
+
+def ensure_speaker_turns(event, background=True):
+    """Best-effort, cached 'who spoke what' for one event. Returns "ready"
+    (turns exist), "started" (generation running in the background) or
+    "skipped". Teams-format text and already-generated speaker_transcript text
+    are converted inline in plain code; only Whisper-style text needs the API
+    model, and that is tried at most once per event (speaker_turns_attempted_at)
+    and only when a key is configured. The manual Generate button always works."""
+    try:
+        if event.speaker_turns:
+            return "ready"
+        text = _current_transcript_text(event)
+        if not (text or "").strip():
+            return "skipped"
+        if extraction.parse_speaker_turns(text):
+            generate_speaker_transcript(event)
+            return "ready"
+        if (event.speaker_transcript or "").strip():
+            turns = _turns_from_rendered_text(event.speaker_transcript)
+            if turns:
+                event.speaker_turns = turns
+                event.speaker_turns_source = "legacy"
+                event.save(update_fields=["speaker_turns", "speaker_turns_source"])
+                return "ready"
+        if event.speaker_turns_attempted_at is not None or not _llm_key_configured():
+            return "skipped"
+        if not _parse_timestamped_lines(text):
+            return "skipped"
+        with _auto_lock:
+            if event.id in _auto_inflight:
+                return "started"
+            _auto_inflight.add(event.id)
+        RecordingEvent.objects.filter(pk=event.pk).update(speaker_turns_attempted_at=timezone.now())
+        if not background:
+            _run_auto_speaker_turns(event.id)
+            return "ready"
+        threading.Thread(
+            target=_run_auto_speaker_turns, args=(event.id,), daemon=True, name=f"speaker-turns-{event.id}"
+        ).start()
+        return "started"
+    except Exception:  # noqa: BLE001
+        logger.exception("ensure_speaker_turns failed for recording event %s", getattr(event, "id", None))
+        return "skipped"
+
+
+def rename_speaker(event, old, new):
+    """Renames a speaker label on every turn of one event ("Speaker 1" ->
+    "Gokul"), marks those turns as edited by a human and keeps the
+    speaker_transcript text in step. Returns the number of turns changed."""
+    turns = event.speaker_turns or []
+    changed = 0
+    for t in turns:
+        if t.get("speaker") == old:
+            t["speaker"] = new
+            t["edited"] = True
+            changed += 1
+    if not changed:
+        return 0
+    prefix = re.compile(r"^(\[[^\]]*\]\s+)" + re.escape(old) + r":\s")
+    rendered = [prefix.sub(lambda m: f"{m.group(1)}{new}: ", ln) for ln in (event.speaker_transcript or "").splitlines()]
+    event.speaker_turns = turns
+    event.speaker_transcript = "\n".join(rendered) if event.speaker_transcript else ""
+    event.save(update_fields=["speaker_turns", "speaker_transcript"])
+    return changed
+
+
+# ---------------------------------------------------------------------------
+# Plain documents vs recordings (5 Oct 2026, G5)
+# ---------------------------------------------------------------------------
+def is_recording_or_transcript(path, text=None):
+    """True for audio/video and for transcript-shaped text (speaker lines,
+    [MM:SS] lines, an Attendees header, a Teams recording/transcript name) -
+    the content that belongs on the Transcripts pipeline. Everything else
+    (proposals, quotations, emails, spreadsheets, notes) is a plain document."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext in ingestion.AUDIO_VIDEO_EXTENSIONS:
+        return True
+    if ext in (".eml", ".msg"):
+        return False
+    if text is None:
+        try:
+            text = ingestion.extract_text(path)
+        except Exception:  # noqa: BLE001 - unreadable: treat as a plain document (it reports its own error)
+            return False
+    names = [os.path.basename(path)]
+    return bool(extraction.looks_like_meeting_transcript(text) or doc_meta._strong_transcript_signal(text, names))
+
+
+def ingest_document(topic, path, text=None, display_name=None, source_method="upload"):
+    """Files a plain document into a topic under its OWN name and path - no
+    "<name> - Transcript.txt" copy and no Transcripts-page event. Returns
+    (IngestedFile, error_message)."""
+    from .views import _extract_and_store
+
+    error = ""
+    if text is None:
+        try:
+            text = ingestion.extract_text(path)
+        except Exception as exc:  # noqa: BLE001 - report it on the file
+            text, error = "", str(exc)
+    try:
+        with open(path, "rb") as fh:
+            content_hash = hashlib.sha256(fh.read()).hexdigest()
+    except OSError:
+        content_hash = hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+    obj, _ = IngestedFile.objects.update_or_create(
+        topic=topic,
+        path=path,
+        defaults={
+            "display_name": display_name or os.path.basename(path),
+            "source_method": source_method,
+            "extracted_text": text or "",
+            "content_hash": content_hash,
+            "extraction_error": error,
+        },
+    )
+    _extract_and_store(obj)
+    return obj, error
 
 
 def save_summary_to_project(event):

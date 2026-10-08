@@ -2,10 +2,11 @@ from django.contrib import admin
 
 from .models import (
     ChatMessage,
+    Contact,
     ExtractedMeta,
     IngestedFile,
+    MeetingNote,
     SearchLog,
-    Settings,
     SourceFolder,
     Topic,
     Workflow,
@@ -15,9 +16,13 @@ admin.site.register(Topic)
 admin.site.register(SourceFolder)
 admin.site.register(IngestedFile)
 admin.site.register(ChatMessage)
-admin.site.register(Settings)
+# Settings is deliberately NOT registered here: it holds the API key in plain
+# text, and the Django admin would let anyone with a staff account read or
+# change it without the settings password the Settings page asks for.
 admin.site.register(ExtractedMeta)
 admin.site.register(Workflow)
+admin.site.register(MeetingNote)
+admin.site.register(Contact)
 
 
 @admin.register(SearchLog)
