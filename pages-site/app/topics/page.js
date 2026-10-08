@@ -18,6 +18,8 @@ import {
 import CalendarWidget from "../components/CalendarWidget";
 import ProjectTabs from "../components/ProjectTabs";
 import TaskBoard from "../components/TaskBoard";
+import FileMetadata from "../components/FileMetadata";
+import { MeetingNotes, MeetingTypeEditor, WhoSaidWhat } from "../components/MeetingExtras";
 import {
   briefHtmlPage,
   briefMarkdown,
@@ -27,6 +29,18 @@ import {
   summaryCsv,
   tasksCsv,
 } from "../lib/demoFiles";
+
+// Optional sales-flavoured stage on a topic (additive - no topic type or
+// existing field changes meaning because of it).
+const STAGE_OPTIONS = [
+  { key: "intro", label: "Intro" },
+  { key: "discovery", label: "Discovery" },
+  { key: "solution", label: "Solution" },
+  { key: "commercial", label: "Commercial" },
+  { key: "won", label: "Won" },
+  { key: "lost", label: "Lost" },
+  { key: "delivery", label: "Delivery" },
+];
 
 const PROJECT_TABS = [
   { key: "overview", label: "Overview" },
@@ -255,6 +269,9 @@ function TopicDetailContent() {
   const [pasting, setPasting] = useState(false);
 
   const [meetingMetadata, setMeetingMetadata] = useState([]);
+  // Business events (emails, key documents, human notes) - merged into the
+  // timeline next to the existing client-side events.
+  const [businessEvents, setBusinessEvents] = useState([]);
 
   const [payrollRuns, setPayrollRuns] = useState([]);
   const [computingPayroll, setComputingPayroll] = useState(false);
@@ -316,6 +333,29 @@ function TopicDetailContent() {
     }
   }
 
+  async function loadBusinessEvents() {
+    try {
+      const evs = await api.getTimelineEvents(id);
+      setBusinessEvents((evs || []).filter((e) => e.kind !== "meeting"));
+    } catch (e) {
+      console.error("Could not load timeline events:", e.message);
+    }
+  }
+
+  // A meeting type/sequence edit or a new note changes the meeting list and
+  // what the timeline shows - refresh both.
+  function handleMeetingChanged() {
+    loadMeetingMetadata();
+    loadBusinessEvents();
+  }
+
+  // A file's metadata edit/confirm: patch the loaded file in place (no full
+  // reload, so the open Manage sources list keeps its scroll position).
+  function handleFileMetaChanged(fileId, meta) {
+    setTopic((t) => (t ? { ...t, files: t.files.map((f) => (f.id === fileId ? { ...f, ...meta } : f)) } : t));
+    loadBusinessEvents();
+  }
+
   async function loadCalendar() {
     try {
       setCalendarEvents(await api.getCalendar(id));
@@ -364,9 +404,14 @@ function TopicDetailContent() {
     }
   }
 
-  async function handleSaveProjectState(currentPosition) {
+  async function handleSaveProjectState(currentPosition, topicFields) {
     const state = await api.updateProjectState(id, currentPosition);
     setProjectState(state);
+    // Optional Stage / Customer name - only sent when one actually changed.
+    if (topicFields && Object.keys(topicFields).length > 0) {
+      await api.updateTopic(id, topicFields);
+      load();
+    }
   }
 
   async function handleImportTasksCsv(e) {
@@ -429,6 +474,7 @@ function TopicDetailContent() {
 
   async function refreshExtras() {
     loadMeetingMetadata();
+    loadBusinessEvents();
     loadCalendar();
     loadTasks();
     loadCommitments();
@@ -542,6 +588,17 @@ function TopicDetailContent() {
 
   function handleExportTasksCsv() {
     downloadText(`${exportBaseName()}-tasks.csv`, "text/csv", tasksCsv(tasks));
+  }
+
+  // One row per file: document type, topic tags, signal, state, review notes
+  // (+ phase, version, date, participants) - built in the browser.
+  async function handleExportMetadataCsv() {
+    try {
+      const { filename, csv } = await api.getMetadataCsv(id);
+      downloadText(filename, "text/csv", csv);
+    } catch (e) {
+      setError(e.message);
+    }
   }
 
   async function handleAddFolder(e) {
@@ -752,6 +809,19 @@ function TopicDetailContent() {
               {urgencyStyle.label}
             </span>
           )}
+          {topic.stage && (
+            <span
+              data-testid="topic-stage"
+              className="text-xs px-2 py-0.5 rounded-full font-medium shrink-0 bg-violet-50 text-violet-700 border border-violet-100"
+            >
+              Stage: {STAGE_OPTIONS.find((st) => st.key === topic.stage)?.label || topic.stage}
+            </span>
+          )}
+          {topic.customer_name && (
+            <span data-testid="topic-customer" className="text-xs text-ink-muted shrink-0 truncate max-w-[200px]">
+              {topic.customer_name}
+            </span>
+          )}
         </div>
         <div className="flex items-center gap-1.5 shrink-0">
           <button
@@ -837,6 +907,17 @@ function TopicDetailContent() {
                 >
                   {importingTasksCsv ? "Importing…" : "↑ Import edited tasks (.csv)"}
                 </button>
+                <div className="mt-1 px-3 py-1.5 text-[11px] font-semibold uppercase tracking-wider text-ink-muted border-t border-border-warm">
+                  Files
+                </div>
+                <button
+                  type="button"
+                  onClick={() => { handleExportMetadataCsv(); setDataMenuOpen(false); }}
+                  className="w-full text-left px-3 py-1.5 text-slate-700 hover:bg-slate-50"
+                  title="One row per file: document type, topic tags, signal, state, review notes"
+                >
+                  ↓ Export metadata CSV
+                </button>
               </div>
             )}
           </div>
@@ -917,6 +998,7 @@ function TopicDetailContent() {
                 workflowHistory={workflowHistory}
                 onOpenSources={() => setSourcesModalOpen(true)}
                 projectState={projectState}
+                businessEvents={businessEvents}
               />
             </div>
             <div className="lg:sticky lg:top-4 min-w-0">
@@ -926,6 +1008,7 @@ function TopicDetailContent() {
                 tasks={tasks}
                 summaryHistory={summaryHistory}
                 workflowHistory={workflowHistory}
+                businessEvents={businessEvents}
               />
             </div>
           </div>
@@ -961,7 +1044,7 @@ function TopicDetailContent() {
                 <div className="flex flex-wrap gap-3">
                   {meetingMetadata.map((m) => (
                     <div key={m.id} className="flex-1 min-w-[220px]">
-                      <MeetingInfoCard entry={m} />
+                      <MeetingInfoCard entry={m} topicId={id} onChanged={handleMeetingChanged} />
                     </div>
                   ))}
                 </div>
@@ -985,6 +1068,7 @@ function TopicDetailContent() {
       {editProjectOpen && (
         <EditProjectModal
           projectState={projectState}
+          topic={topic}
           onClose={() => setEditProjectOpen(false)}
           onSave={handleSaveProjectState}
         />
@@ -1286,9 +1370,12 @@ function TopicDetailContent() {
               {topic.files.map((f) => (
                 <li key={f.id} className="text-xs border-b border-slate-50 pb-2 last:border-0">
                   {f.extraction_error ? (
-                    <span className="text-red-600">
-                      ⚠ {(f.display_name || f.path).split(/[\\/]/).pop()} — {f.extraction_error}
-                    </span>
+                    <>
+                      <span className="text-red-600">
+                        ⚠ {(f.display_name || f.path).split(/[\\/]/).pop()} — {f.extraction_error}
+                      </span>
+                      <FileMetadata file={f} onChanged={handleFileMetaChanged} />
+                    </>
                   ) : (
                     <>
                       <div className="flex items-center justify-between gap-2">
@@ -1300,6 +1387,7 @@ function TopicDetailContent() {
                         </span>
                       </div>
                       <span className="text-slate-400">Added {formatAdded(f.first_added_at)}</span>
+                      <FileMetadata file={f} onChanged={handleFileMetaChanged} />
                     </>
                   )}
                 </li>
@@ -1366,6 +1454,7 @@ function ContextBriefPanel({
   workflowHistory,
   onOpenSources,
   projectState,
+  businessEvents,
 }) {
   const byPath = Object.fromEntries((files || []).map((f) => [f.path, f]));
   const fieldSources = summary?.field_sources || {};
@@ -1431,7 +1520,7 @@ function ContextBriefPanel({
   // Compact Recent Activity - top 4, newest first. The full history lives
   // in Project Timeline further down this same page (#project-timeline).
   const recentEvents = summary
-    ? [...buildTimelineEvents(topic, meetingMetadata, tasks, summaryHistory, workflowHistory)]
+    ? [...buildTimelineEvents(topic, meetingMetadata, tasks, summaryHistory, workflowHistory, businessEvents)]
         .reverse()
         .slice(0, 4)
     : [];
@@ -2415,14 +2504,19 @@ function WorkTabPanel({ topicId, tasks, onChanged, topicType, payrollRuns, compu
 // Explicit "Project Intelligence" editing - same overlay/close-button shell
 // as CalendarModal/ManageSourcesModal further down this file, not a new
 // pattern.
-function EditProjectModal({ projectState, onClose, onSave }) {
+function EditProjectModal({ projectState, topic, onClose, onSave }) {
   const [value, setValue] = useState(projectState?.current_position || "");
+  const [stage, setStage] = useState(topic?.stage || "");
+  const [customerName, setCustomerName] = useState(topic?.customer_name || "");
   const [saving, setSaving] = useState(false);
 
   async function handleSave() {
     setSaving(true);
     try {
-      await onSave(value);
+      const topicFields = {};
+      if (stage !== (topic?.stage || "")) topicFields.stage = stage;
+      if (customerName.trim() !== (topic?.customer_name || "")) topicFields.customer_name = customerName.trim();
+      await onSave(value, topicFields);
       onClose();
     } catch (e) {
       alert(e.message);
@@ -2457,6 +2551,34 @@ function EditProjectModal({ projectState, onClose, onSave }) {
             className="w-full text-sm border border-slate-200 rounded-md px-3 py-2"
             autoFocus
           />
+          {/* Optional - for tracking a customer opportunity through its
+              stages; leaving both blank changes nothing. */}
+          <div className="grid grid-cols-2 gap-3 mt-3">
+            <label className="block text-xs text-slate-500">
+              Stage (optional)
+              <select
+                value={stage}
+                onChange={(e) => setStage(e.target.value)}
+                className="mt-1 w-full text-sm border border-slate-200 rounded-md px-2 py-1.5 bg-white text-slate-800"
+              >
+                <option value="">Not set</option>
+                {STAGE_OPTIONS.map((st) => (
+                  <option key={st.key} value={st.key}>
+                    {st.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="block text-xs text-slate-500">
+              Customer name (optional)
+              <input
+                value={customerName}
+                onChange={(e) => setCustomerName(e.target.value)}
+                maxLength={200}
+                className="mt-1 w-full text-sm border border-slate-200 rounded-md px-2 py-1.5 text-slate-800"
+              />
+            </label>
+          </div>
         </div>
         <div className="flex items-center justify-end gap-2 px-4 pb-4">
           <button
@@ -2571,7 +2693,7 @@ function ManageSourcesModal({ onClose, children }) {
   );
 }
 
-function MeetingInfoCard({ entry }) {
+function MeetingInfoCard({ entry, topicId, onChanged }) {
   const name = fileDisplayName(entry);
   const dateLabel = formatMeetingDate(entry.meeting_date);
   const chip = [dateLabel, entry.meeting_time].filter(Boolean).join(" · ");
@@ -2612,6 +2734,13 @@ function MeetingInfoCard({ entry }) {
       {entry.meeting_title && (
         <p className="text-[11px] text-slate-400 mt-2 font-mono truncate">{name}</p>
       )}
+      {topicId && (
+        <>
+          <MeetingTypeEditor entry={entry} onChanged={onChanged} />
+          <WhoSaidWhat entry={entry} />
+          <MeetingNotes topicId={topicId} entry={entry} onChanged={onChanged} />
+        </>
+      )}
     </div>
   );
 }
@@ -2631,7 +2760,14 @@ const TIMELINE_DOT_STYLES = {
   "status-update": "bg-violet-500",
   "payroll-computed": "bg-amber-400",
   "payroll-approved": "bg-amber-600",
+  email: "bg-sky-500",
+  document: "bg-indigo-500",
+  note: "bg-amber-500",
 };
+
+// Small marker in front of the label for the business event kinds, so they
+// read apart from meetings/tasks at a glance (existing kinds get none).
+const TIMELINE_KIND_ICONS = { email: "✉", document: "📄", note: "📝" };
 
 function truncateText(text, max) {
   if (!text) return "";
@@ -2643,8 +2779,28 @@ function truncateText(text, max) {
 // entry, oldest first) share one computation - two independent copies of
 // this merge/label logic already drifted apart once this session (see the
 // meeting-title dedup fix), not repeating that.
-function buildTimelineEvents(topic, meetingMetadata, tasks, summaryHistory, workflowHistory) {
+function buildTimelineEvents(topic, meetingMetadata, tasks, summaryHistory, workflowHistory, businessEvents) {
   const events = [];
+
+  // Emails, key documents (proposal/quotation/PRD/charter/plan) and human
+  // notes from getTimelineEvents() - meetings are NOT taken from there (they
+  // already come from meetingMetadata below, with type + sequence in
+  // timeline_title), so nothing shows twice.
+  (businessEvents || []).forEach((b, i) => {
+    if (!b.date || !TIMELINE_KIND_ICONS[b.kind]) return;
+    const dateOnly = String(b.date).length <= 10;
+    const ts = new Date(dateOnly ? `${b.date}T00:00:00` : b.date).getTime();
+    if (isNaN(ts)) return;
+    events.push({
+      key: `${b.kind}-${b.file_id || b.note_id || i}`,
+      sortTs: ts,
+      dateLabel: dateOnly ? `${formatMeetingDate(b.date)}${b.approx_date ? " (approx.)" : ""}` : formatAdded(b.date),
+      label: b.title,
+      kind: b.kind,
+      path: "",
+      detail: b,
+    });
+  });
 
   meetingMetadata.forEach((m) => {
     if (!m.meeting_date) return;
@@ -2753,9 +2909,9 @@ function buildTimelineEvents(topic, meetingMetadata, tasks, summaryHistory, work
 // The compact, height-bounded sidebar column used on the Overview tab, next
 // to Context Node (the separate Timeline tab this once also powered was
 // redundant with this column and was removed - see PROJECT_TABS above).
-function ProjectTimeline({ topic, meetingMetadata, tasks, summaryHistory, workflowHistory }) {
+function ProjectTimeline({ topic, meetingMetadata, tasks, summaryHistory, workflowHistory, businessEvents }) {
   const [expandedKey, setExpandedKey] = useState(null);
-  const events = buildTimelineEvents(topic, meetingMetadata, tasks, summaryHistory, workflowHistory);
+  const events = buildTimelineEvents(topic, meetingMetadata, tasks, summaryHistory, workflowHistory, businessEvents);
 
   if (events.length === 0) return null;
 
@@ -2791,6 +2947,7 @@ function ProjectTimeline({ topic, meetingMetadata, tasks, summaryHistory, workfl
                     {e.dateLabel}
                   </span>
                   <span className="block text-[12.5px] font-medium text-slate-700 leading-snug group-hover:text-brand">
+                    {TIMELINE_KIND_ICONS[e.kind] && <span className="mr-1">{TIMELINE_KIND_ICONS[e.kind]}</span>}
                     {e.label}
                   </span>
                 </button>
@@ -2861,6 +3018,18 @@ function ProjectTimeline({ topic, meetingMetadata, tasks, summaryHistory, workfl
                           <p>
                             <span className="font-medium text-slate-500">Next step: </span>
                             {e.detail.next_step}
+                          </p>
+                        )}
+                      </>
+                    )}
+                    {(e.kind === "email" || e.kind === "document") && e.detail.body && <p>{e.detail.body}</p>}
+                    {e.kind === "note" && (
+                      <>
+                        <p className="whitespace-pre-wrap">{e.detail.body}</p>
+                        {(e.detail.author || e.detail.meeting_title) && (
+                          <p className="text-slate-400">
+                            {e.detail.author}
+                            {e.detail.meeting_title ? ` · after ${e.detail.meeting_title}` : ""}
                           </p>
                         )}
                       </>

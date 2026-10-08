@@ -5,6 +5,9 @@
 // (nothing here persists across a real page reload - intentional for a
 // public demo, see api.js's own header comment).
 
+import { buildSalesTopic, SALES_TOPIC_ID } from "./salesFixture";
+import { ensureFileMeta } from "./docMeta";
+
 let nextId = 1000;
 export function newId() {
   return nextId++;
@@ -43,6 +46,17 @@ function teamsFilenameDate(filePath) {
   return `${ymd.slice(0, 4)}-${ymd.slice(4, 6)}-${ymd.slice(6, 8)}T${hms.slice(0, 2)}:${hms.slice(2, 4)}:${hms.slice(4, 6)}.000Z`;
 }
 
+// Turns a pre-baked "[mm:ss] Name: text" speaker transcript into the
+// speaker_turns shape the Transcripts detail page's Conversation view reads
+// (the real app builds the same list from Teams-style text in plain code).
+function turnsFromSpeakerTranscript(text) {
+  return (text || "")
+    .split("\n")
+    .map((line) => /^\[(\d{1,2}:\d{2})\]\s+([^:]+):\s+(.*)$/.exec(line))
+    .filter(Boolean)
+    .map((m) => ({ speaker: m[2].trim(), ts: m[1], text: m[3].trim(), edited: false }));
+}
+
 export const DEMO_USER = {
   authenticated: true,
   username: "demo",
@@ -51,6 +65,7 @@ export const DEMO_USER = {
 };
 
 function buildInitialState() {
+  const sales = buildSalesTopic({ daysFromNow, isoDaysAgo });
   const topics = [
     {
       id: 1,
@@ -617,6 +632,69 @@ function buildInitialState() {
     },
   ];
 
+  // A single-speaker voice memo (added with the Conversation view): the text
+  // has timestamps but no speaker names, so everything is grouped under one
+  // placeholder speaker - never guessed. Routed to the Larkspur opportunity.
+  const memoFile = "Larkspur Post-Meeting Voice Memo-20260929_071500UTC-Voice Recording.m4a";
+  recordingEvents.push({
+    id: 7,
+    file_path: memoFile,
+    file_name: memoFile,
+    detected_at: isoDaysAgo(6),
+    recording_date: teamsFilenameDate(memoFile),
+    source: "watched_folder",
+    topic: SALES_TOPIC_ID,
+    topic_name: sales.topic.name,
+    ingested_file: null,
+    status: "routed",
+    engine_used: "local_whisper",
+    detail: "Matched - 'Larkspur' is named directly in the transcript.",
+    suggested_topic_name: "",
+    suggested_topic_one_liner: "",
+    suggested_topic_type: "",
+    transcript_text:
+      "[00:04] Quick note after the Larkspur call. Meera is happy with the proposal and said Finance should sign off this week.\n[00:19] The only open point is the exit clause, Hannah wants it at thirty days, and I think we can say yes to that.\n[00:38] Next step is to confirm the pilot start date once the signature is in. I will also ask Kiran to send the sample payback report so Hannah has the audit trail she asked for.",
+    meeting_summary: "",
+    summary_generated_at: null,
+    diarization_result: "",
+    diarization_generated_at: null,
+    speaker_transcript: "",
+    speaker_transcript_generated_at: null,
+    speaker_turns: [
+      { speaker: "Speaker 1", ts: "00:04", text: "Quick note after the Larkspur call. Meera is happy with the proposal and said Finance should sign off this week.", edited: false },
+      { speaker: "Speaker 1", ts: "00:19", text: "The only open point is the exit clause, Hannah wants it at thirty days, and I think we can say yes to that.", edited: false },
+      { speaker: "Speaker 1", ts: "00:38", text: "Next step is to confirm the pilot start date once the signature is in. I will also ask Kiran to send the sample payback report so Hannah has the audit trail she asked for.", edited: false },
+    ],
+    speaker_turns_source: "code",
+    speaker_turns_generating: false,
+  });
+
+  // Multi-speaker recordings: Conversation view turns read from the names
+  // already in the pre-baked speaker transcript (plain code, no model).
+  for (const ev of recordingEvents) {
+    if ((ev.id === 1 || ev.id === 3) && ev.speaker_transcript) {
+      ev.speaker_turns = turnsFromSpeakerTranscript(ev.speaker_transcript);
+      ev.speaker_turns_source = "teams";
+      ev.speaker_turns_generating = false;
+    }
+  }
+
+  // The fictional Larkspur sales opportunity (see salesFixture.js) - merged
+  // in additively; every topic/file/record above is untouched.
+  topics.push(sales.topic);
+  folders.push(...sales.folders);
+  files.push(...sales.files);
+  tasks.push(...sales.tasks);
+  commitments.push(...sales.commitments);
+  decisions.push(...sales.decisions);
+  risks.push(...sales.risks);
+  summaries.push(...sales.summaries);
+  projectStates.push(sales.projectState);
+  // Document-type / tag / signal / state chips for the older sample files too
+  // (plain code, "generated" until confirmed).
+  files.forEach(ensureFileMeta);
+  const notes = sales.notes;
+
   return {
     topics,
     folders,
@@ -629,6 +707,7 @@ function buildInitialState() {
     projectStates,
     messages,
     workflows,
+    notes,
     loops: [],
     connectors,
     recordingEvents,

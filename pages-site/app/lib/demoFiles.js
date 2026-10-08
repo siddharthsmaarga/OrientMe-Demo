@@ -37,6 +37,35 @@ function escapeHtml(s) {
   return String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
 }
 
+// Metadata CSV (the browser-side counterpart of the real app's
+// /topics/<id>/metadata_csv/): the 7 contract columns first, then
+// phase/version/doc_date/participants. UTF-8, CRLF line ends, and cells that
+// start with = + @ (or a "-" that is not a plain number) get a leading
+// apostrophe so a spreadsheet cannot run them as formulas.
+export const METADATA_CSV_COLUMNS = [
+  "file",
+  "document_type",
+  "topic_tags",
+  "signal",
+  "state",
+  "seconds",
+  "review_notes",
+  "phase",
+  "version",
+  "doc_date",
+  "participants",
+];
+
+function safeCell(value) {
+  const s = value == null ? "" : String(value);
+  const risky = /^[=+@]/.test(s) || (/^-/.test(s) && !/^-?\d+(\.\d+)?$/.test(s));
+  return risky ? `'${s}` : s;
+}
+
+export function metadataCsv(rows) {
+  return toCsv([METADATA_CSV_COLUMNS, ...rows.map((r) => METADATA_CSV_COLUMNS.map((c) => safeCell(r[c])))]);
+}
+
 // Same field/label pairs the real backend's export_brief_md and
 // export_summary_csv use (core/views.py SUMMARY_CSV_FIELDS).
 const SUMMARY_FIELDS = [

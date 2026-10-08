@@ -3,20 +3,33 @@ from rest_framework.routers import DefaultRouter
 from .views import (
     CalendarView,
     ChangePasswordView,
+    CommitmentViewSet,
     ConnectorRequestView,
     ConnectorResetView,
     ConnectorStatusView,
     CsrfTokenView,
+    DecisionViewSet,
     GlobalChatView,
+    MessageFeedbackView,
     GlobalSearchView,
+    GlobalSourcesView,
+    GlobalTimelineView,
+    IngestedFileViewSet,
     LoginView,
     LogoutView,
     LoopViewSet,
     MeView,
     OpenSourceFileView,
+    OpenSourceFolderView,
     OrientHtmlView,
     OrientView,
+    PasswordResetConfirmView,
+    PasswordResetRequestView,
+    RecordingEventViewSet,
+    RegisterView,
     ResolveOnlyView,
+    RiskViewSet,
+    SearchLogView,
     SettingsView,
     AutoCreateTopicView,
     StatsView,
@@ -31,7 +44,12 @@ from django.urls import path
 router = DefaultRouter()
 router.register("topics", TopicViewSet, basename="topic")
 router.register("tasks", TaskViewSet, basename="task")
+router.register("commitments", CommitmentViewSet, basename="commitment")
+router.register("decisions", DecisionViewSet, basename="decision")
+router.register("risks", RiskViewSet, basename="risk")
 router.register("loops", LoopViewSet, basename="loop")
+router.register("recording_events", RecordingEventViewSet, basename="recording-event")
+router.register("files", IngestedFileViewSet, basename="ingested-file")
 
 urlpatterns = [
     # Must come before router.urls - "topics/auto_create/" would otherwise
@@ -49,14 +67,22 @@ urlpatterns = [
     path("topics/<int:pk>/brief_html/", TopicBriefHtmlView.as_view(), name="topic-brief-html"),
     path("topic_names/", TopicNamesView.as_view(), name="topic-names"),
     path("files/<int:pk>/open/", OpenSourceFileView.as_view(), name="open-source-file"),
+    path("folders/<int:pk>/open/", OpenSourceFolderView.as_view(), name="open-source-folder"),
     path("stats/", StatsView.as_view(), name="stats"),
     path("chat/global/", GlobalChatView.as_view(), name="global-chat"),
+    path("messages/<str:kind>/<int:pk>/feedback/", MessageFeedbackView.as_view(), name="message-feedback"),
     path("search/", GlobalSearchView.as_view(), name="global-search"),
+    path("search/log/", SearchLogView.as_view(), name="search-log"),
+    path("sources/", GlobalSourcesView.as_view(), name="global-sources"),
+    path("timeline/", GlobalTimelineView.as_view(), name="global-timeline"),
     path("connectors/", ConnectorStatusView.as_view(), name="connector-status"),
     path("connectors/<str:slug>/request/", ConnectorRequestView.as_view(), name="connector-request"),
     path("connectors/<str:slug>/reset/", ConnectorResetView.as_view(), name="connector-reset"),
     path("auth/csrf/", CsrfTokenView.as_view(), name="auth-csrf"),
     path("auth/login/", LoginView.as_view(), name="auth-login"),
+    path("auth/register/", RegisterView.as_view(), name="auth-register"),
+    path("auth/password_reset/request/", PasswordResetRequestView.as_view(), name="auth-password-reset-request"),
+    path("auth/password_reset/confirm/", PasswordResetConfirmView.as_view(), name="auth-password-reset-confirm"),
     path("auth/logout/", LogoutView.as_view(), name="auth-logout"),
     path("auth/me/", MeView.as_view(), name="auth-me"),
     path("auth/change_password/", ChangePasswordView.as_view(), name="auth-change-password"),

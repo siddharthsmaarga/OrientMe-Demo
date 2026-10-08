@@ -30,6 +30,14 @@ TOPIC_TYPES = [
     ("person", "Person"),
     ("customer", "Customer"),
     ("opportunity", "Opportunity"),
+    (
+        "general",
+        "General / Inbox",
+    ),  # the one singleton "doesn't fit a real project yet" bucket - see
+    # recordings.get_or_create_inbox_topic. Not something a person picks
+    # when creating a topic by hand (TopicAutocomplete/create-project forms
+    # filter it out) - it only ever exists as the one auto-created landing
+    # spot for a folder/file drop that didn't confidently match anything.
 ]
 
 
@@ -44,6 +52,12 @@ class Topic(models.Model):
     one_liner = models.CharField(max_length=300, blank=True)
     related_people = models.CharField(
         max_length=500, blank=True, help_text="Comma-separated names, plain text for MVP"
+    )
+    auto_created = models.BooleanField(
+        default=False,
+        help_text="True when a recording's transcript was routed here by core/recordings.py's "
+        "auto-create pipeline rather than a person clicking 'create topic' - shown as a badge so "
+        "an LLM-guessed project is never mistaken for one a person deliberately set up.",
     )
     created_at = models.DateTimeField(auto_now_add=True)
 
@@ -111,11 +125,22 @@ class IngestedFile(models.Model):
         return self.display_name or self.path
 
 
+FEEDBACK_CHOICES = [("up", "Helpful"), ("down", "Not helpful")]
+
+
 class ChatMessage(models.Model):
     """One turn in a topic's 'ask' history - the chat box Venki described
     ('there will be a chat box... you just prompt'). Assistant messages
     store which files their answer drew on, so every claim can be traced
-    back to a source, per the PRD's own requirement."""
+    back to a source, per the PRD's own requirement.
+
+    `feedback` is the "orientation run" evaluation capture Venki asked for
+    directly in the 30 Sep AI Adoption Sprint Meeting: "I should be able to
+    say thumbs up or thumbs down... this should be done as a reusable
+    component... it should be unobtrusive" - the foundation for the
+    "hill-climbing"/evaluation harness he described (a later, bigger watcher-
+    agent piece, not built here - this is just the capture step it depends
+    on). One assistant message IS one orientation run in his own framing."""
 
     ROLE_CHOICES = [("user", "User"), ("assistant", "Assistant")]
 
@@ -125,6 +150,7 @@ class ChatMessage(models.Model):
     source_files = models.JSONField(default=list, blank=True)
     is_llm = models.BooleanField(default=True)
     generation_note = models.CharField(max_length=300, blank=True)
+    feedback = models.CharField(max_length=10, choices=FEEDBACK_CHOICES, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -135,7 +161,10 @@ class GlobalChatMessage(models.Model):
     """One turn in the 'common chatbox' history - same shape as ChatMessage,
     but not tied to a single Topic: answers are grounded in every ingested
     file across every topic at once, for "what's going on everywhere"
-    questions rather than one topic's own ask box."""
+    questions rather than one topic's own ask box.
+
+    `feedback` - see ChatMessage's own docstring; same "orientation run"
+    capture, just for this cross-topic chat instead of a per-topic one."""
 
     ROLE_CHOICES = ChatMessage.ROLE_CHOICES
 
@@ -144,6 +173,7 @@ class GlobalChatMessage(models.Model):
     source_files = models.JSONField(default=list, blank=True)
     is_llm = models.BooleanField(default=True)
     generation_note = models.CharField(max_length=300, blank=True)
+    feedback = models.CharField(max_length=10, choices=FEEDBACK_CHOICES, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -239,16 +269,21 @@ TASK_STATUSES = [
 
 
 class Task(models.Model):
-    """An action item / commitment pulled out of a meeting by the LLM
-    extractor (llm_brief.extract_meeting_metadata_llm's action_items field) -
-    the Kanban-board unit from the 18 Sep standup transcript: "we need
+    """An action item / work item pulled out of a meeting by the LLM
+    extractor (llm_brief.extract_action_items_llm) - the Kanban-board unit
+    from the 18 Sep standup transcript: "we need
     ideally a planner task board... backlog, in progress, completed."
 
     Tied to the ingested_file it came from so re-scanning that file doesn't
     duplicate a task that already exists (see core.views._extract_and_store's
     dedup-by-title-per-file logic), but a task's own status/due_date survive
     independently once created - re-extraction never resets a task someone
-    has already moved across the board."""
+    has already moved across the board.
+
+    Deliberately NOT the same concept as Commitment (see that model's own
+    docstring) - a Task is work that needs to be done; a Commitment is a
+    person's promise, which may optionally point at one of these via
+    Commitment.linked_task."""
 
     topic = models.ForeignKey(Topic, on_delete=models.CASCADE, related_name="tasks")
     source_file = models.ForeignKey(
@@ -266,6 +301,108 @@ class Task(models.Model):
 
     def __str__(self):
         return self.title
+
+
+COMMITMENT_STATUSES = [
+    ("open", "Open"),
+    ("in_progress", "In Progress"),
+    ("done", "Done"),
+]
+
+
+class Commitment(models.Model):
+    """A person's explicit promise/obligation - deliberately NOT the same
+    concept as Task. "Venkatesh will provide the architecture proposal by
+    Friday" is a commitment; "Create Azure architecture proposal" is the
+    task it may produce. A commitment can optionally point at the task it
+    produced (linked_task), but the two are independent records with
+    independent lifecycles - completing one never implies the other."""
+
+    topic = models.ForeignKey(Topic, on_delete=models.CASCADE, related_name="commitments")
+    source_file = models.ForeignKey(
+        "IngestedFile", on_delete=models.SET_NULL, null=True, blank=True, related_name="commitments"
+    )
+    linked_task = models.ForeignKey(
+        Task, on_delete=models.SET_NULL, null=True, blank=True, related_name="commitments"
+    )
+    person = models.CharField(max_length=150)
+    commitment = models.CharField(max_length=500)
+    date_made = models.DateField(null=True, blank=True)
+    due_date = models.DateField(null=True, blank=True)
+    status = models.CharField(max_length=20, choices=COMMITMENT_STATUSES, default="open")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["due_date", "created_at"]
+
+    def __str__(self):
+        return f"{self.person}: {self.commitment}"
+
+
+DECISION_STATUSES = [
+    ("decided", "Decided"),
+    ("reversed", "Reversed"),
+]
+
+
+class Decision(models.Model):
+    """A structured, persistent decision record for a topic - the piece the
+    free-text `CaseSummary.decisions_made` field can't provide: something
+    that keeps its own identity/status across regenerations instead of being
+    rewritten fresh every time the brief is regenerated. Mirrors Task's own
+    shape/conventions (topic FK, nullable source_file, created_at) rather
+    than inventing a new pattern."""
+
+    topic = models.ForeignKey(Topic, on_delete=models.CASCADE, related_name="decisions")
+    source_file = models.ForeignKey(
+        "IngestedFile", on_delete=models.SET_NULL, null=True, blank=True, related_name="decisions"
+    )
+    decision = models.CharField(max_length=500)
+    context = models.TextField(blank=True, help_text="Why this was decided / the reasoning.")
+    participants = models.CharField(
+        max_length=300, blank=True, help_text="Free text - no structured People model exists yet."
+    )
+    decided_date = models.DateField(null=True, blank=True)
+    status = models.CharField(max_length=20, choices=DECISION_STATUSES, default="decided")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-decided_date", "-created_at"]
+
+    def __str__(self):
+        return self.decision
+
+
+RISK_STATUSES = [
+    ("open", "Open"),
+    ("mitigated", "Mitigated"),
+    ("closed", "Closed"),
+]
+
+
+class Risk(models.Model):
+    """A structured, tracked risk/blocker for a topic - distinct from
+    CaseSummary.risks_and_gaps (the AI's own free-text read, regenerated
+    fresh every brief). This is the persistent record a person maintains:
+    what could prevent the project from succeeding, its impact, who owns
+    it, and whether it's still open. Mirrors Decision's own shape/
+    conventions rather than inventing a new pattern."""
+
+    topic = models.ForeignKey(Topic, on_delete=models.CASCADE, related_name="risks")
+    source_file = models.ForeignKey(
+        "IngestedFile", on_delete=models.SET_NULL, null=True, blank=True, related_name="risks"
+    )
+    description = models.CharField(max_length=500)
+    impact = models.TextField(blank=True)
+    owner = models.CharField(max_length=150, blank=True)
+    status = models.CharField(max_length=20, choices=RISK_STATUSES, default="open")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return self.description
 
 
 class CaseSummary(models.Model):
@@ -288,6 +425,11 @@ class CaseSummary(models.Model):
     current_state = models.TextField(blank=True)
     history = models.TextField(blank=True)
     customer_thoughts = models.TextField(blank=True)
+    customer_need = models.TextField(blank=True)
+    proposed_solution = models.TextField(blank=True)
+    latest_updates = models.TextField(blank=True)
+    decisions_made = models.TextField(blank=True)
+    meeting_prep = models.TextField(blank=True)
     promises_made = models.TextField(blank=True)
     next_step = models.TextField(blank=True)
     risks_and_gaps = models.TextField(blank=True)
@@ -315,6 +457,28 @@ class CaseSummary(models.Model):
 
     def __str__(self):
         return f"Summary for topic {self.topic_id} @ {self.generated_at}"
+
+
+class ProjectState(models.Model):
+    """The explicit, always-current 'Project Intelligence' layer for a
+    topic - distinct from CaseSummary, which is deliberately append-only
+    (a fresh row per AI generation, never updated in place). This is the
+    opposite: one row per topic, edited in place, so a person can state
+    the current position directly without touching the original source
+    documents. Deliberately no separate history table - one prior value
+    is enough ("previous value available if needed") without
+    over-engineering an audit trail nobody asked for."""
+
+    topic = models.OneToOneField(Topic, on_delete=models.CASCADE, related_name="state")
+    current_position = models.TextField(blank=True)
+    previous_position = models.TextField(
+        blank=True, help_text="The value of current_position just before the most recent edit."
+    )
+    updated_at = models.DateTimeField(auto_now=True)
+    updated_by = models.CharField(max_length=150, blank=True)
+
+    def __str__(self):
+        return f"State for topic {self.topic_id} @ {self.updated_at}"
 
 
 class Loop(models.Model):
@@ -375,6 +539,101 @@ class ScanJob(models.Model):
         ordering = ["-started_at"]
 
 
+RECORDING_EVENT_STATUSES = [
+    ("routed", "Routed to existing project"),
+    ("pending_new_project", "New project suggested - awaiting your decision"),
+    ("auto_created", "New project created"),
+    ("needs_review", "Needs manual assignment"),
+    ("inbox", "Filed to Inbox - no confident project match"),
+    ("pre_existing", "Existed before auto-watch (not processed)"),
+    ("error", "Error"),
+    ("dismissed", "Dismissed - not tracked"),
+]
+
+
+class RecordingEvent(models.Model):
+    """One row per recording file core/recordings.py's central-folder
+    watcher has found in the one shared Recordings folder (not a per-topic
+    SourceFolder - see watcher.py for that) - the review trail for the
+    auto-route/auto-create pipeline, and the data source for the frontend's
+    Transcripts page. Every outcome gets a row, including errors and "needs
+    review" - so that page always has an honest, complete picture of what
+    the pipeline actually did, never a silent background action nobody can
+    see.
+
+    Creating a brand new project is never done silently (Ayush's explicit
+    correction, 29 Sep: "dont automatically add... give user an option to
+    do so or reject the project creation") - when the LLM router thinks a
+    recording describes a project that doesn't exist yet, it lands here as
+    status='pending_new_project' with its suggestion recorded in the
+    suggested_* fields below, NOT as an already-created Topic. A person
+    reviews it on the Transcripts page and either confirms (optionally
+    editing the name first) or rejects it - see
+    RecordingEventViewSet.confirm_new_project/reject_new_project."""
+
+    file_path = models.CharField(max_length=1000, unique=True)
+    detected_at = models.DateTimeField(auto_now_add=True)
+    topic = models.ForeignKey(
+        Topic, on_delete=models.SET_NULL, null=True, blank=True, related_name="recording_events"
+    )
+    ingested_file = models.ForeignKey(
+        "IngestedFile", on_delete=models.SET_NULL, null=True, blank=True, related_name="recording_events"
+    )
+    status = models.CharField(max_length=20, choices=RECORDING_EVENT_STATUSES, default="needs_review")
+    engine_used = models.CharField(max_length=30, blank=True)
+    detail = models.CharField(
+        max_length=500, blank=True,
+        help_text="Short human-readable note - matched-topic reasoning, error text, etc.",
+    )
+    suggested_topic_name = models.CharField(max_length=200, blank=True)
+    suggested_topic_one_liner = models.CharField(max_length=300, blank=True)
+    suggested_topic_type = models.CharField(max_length=20, blank=True)
+    pending_extracted_text = models.TextField(
+        blank=True,
+        help_text="The already-transcribed text, held here only while status='pending_new_project' "
+        "so confirming doesn't require re-transcribing the recording - cleared once confirmed/rejected.",
+    )
+    meeting_summary = models.TextField(
+        blank=True,
+        help_text="On-demand LLM summary of just this one recording's transcript - generated "
+        "only when a person clicks 'Generate Summary' on the transcript detail page, never "
+        "automatically alongside transcription itself.",
+    )
+    summary_generated_at = models.DateTimeField(null=True, blank=True)
+    recording_date = models.DateTimeField(
+        null=True, blank=True,
+        help_text="The real meeting/recording date - parsed from the Teams filename's own "
+        "YYYYMMDD_HHMMSS stamp, or the file's mtime as a fallback. Never the same thing as "
+        "detected_at, which is only when this app's watcher happened to notice the file and "
+        "can be days (or, for anything bulk-classified as pre_existing, months) later than "
+        "when the meeting actually happened - the real bug this field fixes.",
+    )
+    SOURCE_CHOICES = [
+        ("watched_folder", "Watched Recordings Folder"),
+        ("manual_drop", "Manual Drop Folder"),
+    ]
+    source = models.CharField(max_length=20, choices=SOURCE_CHOICES, default="watched_folder")
+    diarization_result = models.TextField(
+        blank=True,
+        help_text="On-demand, LLM-produced structured breakdown (participants, decisions, "
+        "action items, parked items, per-speaker summary) generated only when a person clicks "
+        "'Diarize' - matches the shape of the reference example in 'Diarizer Example/'.",
+    )
+    diarization_generated_at = models.DateTimeField(null=True, blank=True)
+    speaker_transcript = models.TextField(
+        blank=True,
+        help_text="On-demand, LLM-produced transcript reformatted as speaker name + timestamp "
+        "+ speech per line - generated only when a person clicks 'Generate Transcript'.",
+    )
+    speaker_transcript_generated_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-detected_at"]
+
+    def __str__(self):
+        return f"{self.file_path} -> {self.topic_id or '(unassigned)'}"
+
+
 CONNECTOR_STATUSES = [
     ("not_connected", "Not Connected"),
     ("requested", "Requested — Pending Review"),
@@ -401,3 +660,43 @@ class ConnectorStatus(models.Model):
 
     def __str__(self):
         return f"{self.slug}: {self.status}"
+
+
+SEARCH_RESULT_KINDS = [
+    ("project", "Project"),
+    ("person", "Person"),
+    ("topic", "Topic"),
+    ("file", "File"),
+    ("task", "Task"),
+    ("none", "No selection"),
+]
+
+
+class SearchLog(models.Model):
+    """One row per universal-search (Ctrl/Cmd+K) session - what was typed,
+    how many results came back, and what (if anything) got picked. This is
+    Venki's "review the output so we can analyse and improve it later" ask
+    for the search feature specifically: not a live feature, a record for
+    someone to read afterward (browsable in Django admin) to see real
+    queries that found nothing, or found the wrong thing, and fix the
+    search logic accordingly. Written once per session (on a pick, or when
+    the palette closes with a real query that never led to one) - never
+    per keystroke, so this stays a record of real search attempts, not
+    debounced typing noise."""
+
+    query = models.CharField(max_length=300)
+    result_count = models.PositiveIntegerField(default=0)
+    chosen_kind = models.CharField(max_length=10, choices=SEARCH_RESULT_KINDS, default="none")
+    chosen_label = models.CharField(max_length=300, blank=True)
+    topic = models.ForeignKey(Topic, on_delete=models.SET_NULL, null=True, blank=True)
+    user = models.ForeignKey(
+        django_settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"{self.query!r} -> {self.chosen_kind}"
+

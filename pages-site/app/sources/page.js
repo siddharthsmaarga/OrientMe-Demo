@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../lib/api";
+import FileMetadata from "../components/FileMetadata";
 
 const TYPE_STYLES = {
   project: "bg-cyan-100 text-cyan-800",
@@ -127,6 +128,7 @@ export default function SourcesPage() {
                 <th className="px-4 py-2.5">Source</th>
                 <th className="px-4 py-2.5">Added</th>
                 <th className="px-4 py-2.5">Type</th>
+                <th className="px-4 py-2.5">Document details</th>
               </tr>
             </thead>
             <tbody>
@@ -163,6 +165,14 @@ export default function SourcesPage() {
                         File
                       </span>
                     )}
+                  </td>
+                  <td className="px-4 py-2.5 min-w-[220px] max-w-[300px]">
+                    <FileMetadata
+                      file={f}
+                      onChanged={(fileId, meta) =>
+                        setFiles((prev) => prev.map((x) => (x.id === fileId ? { ...x, ...meta } : x)))
+                      }
+                    />
                   </td>
                 </tr>
               ))}
