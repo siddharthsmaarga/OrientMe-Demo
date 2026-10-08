@@ -95,6 +95,24 @@ REST_FRAMEWORK = {
     ],
 }
 
+# One shared login only (Ayush, 8 Oct 2026: "there will be one log in only that
+# will be the user"). Sign-up and the email password-reset are switched off, and
+# only this username can sign in - other accounts that already exist in the
+# database are left alone, they just can't sign in.
+SINGLE_LOGIN_USERNAME = "user"
+
+# Changing anything on the Settings page (API key, model, folders...) needs a
+# password on top of being signed in (Ayush, 8 Oct 2026: "the password will be
+# hardcoded"). The backend checks it on every save, so it cannot be skipped from
+# the browser. It is a fixed value, but it lives in orientme/local_secrets.py
+# (git-ignored; see local_secrets.example.py), so it never goes to GitHub with
+# the code. To change it, edit that file and restart the backend. With no
+# password set, Settings cannot be changed at all.
+try:
+    from .local_secrets import SETTINGS_EDIT_PASSWORD
+except ImportError:
+    SETTINGS_EDIT_PASSWORD = os.environ.get("ORIENTME_SETTINGS_PASSWORD", "")
+
 ROOT_URLCONF = 'orientme.urls'
 
 TEMPLATES = [
@@ -167,12 +185,33 @@ STATIC_URL = 'static/'
 # ever reads these files itself, to extract text.
 MEDIA_ROOT = BASE_DIR / 'media'
 
+# Local, offline transcription for audio/video meeting recordings
+# (core/ingestion.py's _extract_audio_video). No GPU detected on this
+# machine, so "base" on CPU with int8 quantization - a reasonable
+# speed/accuracy default. Override via env var for a machine with a GPU
+# (device="cuda" would also need changing in ingestion.py) or for more
+# accuracy at the cost of speed (e.g. "small"/"medium").
+WHISPER_MODEL_SIZE = os.environ.get('WHISPER_MODEL_SIZE', 'base')
+
+# How often (seconds) core/watcher.py re-scans every linked SourceFolder for
+# new/changed files with no one clicking "Scan folder now" - the automatic
+# watch-a-folder behaviour Venki described for Teams recordings landing in a
+# synced OneDrive folder. 60s default; override for a faster/slower cadence.
+FOLDER_WATCH_INTERVAL_SECONDS = int(os.environ.get('FOLDER_WATCH_INTERVAL_SECONDS', '60'))
+
 
 # Email
 # https://docs.djangoproject.com/en/6.1/topics/email/#topic-email-configuration
+#
+# No real SMTP account is configured yet, so EMAIL_BACKEND stays on the
+# console backend - send_mail() prints the message (including any password-
+# reset link) to this process's own stdout/log instead of actually
+# delivering it. Swap this for the real smtp.EmailBackend + EMAIL_HOST/
+# EMAIL_HOST_USER/EMAIL_HOST_PASSWORD once real credentials exist; nothing
+# else about the reset flow needs to change.
+EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'
+DEFAULT_FROM_EMAIL = 'noreply@orientme.local'
 
-MAILERS = {
-    'default': {
-        'BACKEND': 'django.core.mail.backends.console.EmailBackend',
-    },
-}
+# Used only to build the link inside password-reset emails (the Next.js
+# frontend, not this API) - defaults to the frontend's local dev port.
+FRONTEND_URL = os.environ.get('FRONTEND_URL', 'http://localhost:3001')

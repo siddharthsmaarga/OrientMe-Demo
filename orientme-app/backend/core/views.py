@@ -1,4 +1,8 @@
+import csv
 import hashlib
+import hmac
+import io
+import logging
 import os
 import re
 import subprocess
@@ -26,17 +30,26 @@ from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from . import corrections, extraction, ics_import, ingestion, llm_brief, mbox_import
+from . import corrections, doc_meta, evidence, extraction, ics_import, ingestion, llm_brief, mbox_import, recordings
 from .models import (
     CaseSummary,
     ChatMessage,
+    Commitment,
     ConnectorStatus,
+    Contact,
+    DOC_TYPES,
+    Decision,
     ExtractedMeta,
     GlobalChatMessage,
     IngestedFile,
     Loop,
-    Profile,
+    MEETING_TYPES,
+    MeetingNote,
+    ProjectState,
+    RecordingEvent,
+    Risk,
     ScanJob,
+    SearchLog,
     Settings,
     SourceFolder,
     TASK_STATUSES,
@@ -46,14 +59,26 @@ from .models import (
 )
 from .serializers import (
     CaseSummarySerializer,
+    ChatMessageSerializer,
+    CommitmentSerializer,
+    ContactSerializer,
+    DecisionSerializer,
     GlobalChatMessageSerializer,
     LoopSerializer,
+    MeetingNoteSerializer,
+    ProjectStateSerializer,
+    RecordingEventSerializer,
+    RiskSerializer,
     ScanJobSerializer,
     TaskSerializer,
     TopicDetailSerializer,
     TopicSerializer,
     WorkflowSerializer,
+    artifact_type_for,
+    file_metadata_payload,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _profile_payload(user):
@@ -66,17 +91,31 @@ def _profile_payload(user):
     }
 
 
-def _user_role(request):
-    profile = getattr(request.user, "profile", None)
-    return profile.role if profile else "user"
+def _settings_password_ok(supplied):
+    """True when `supplied` is the hardcoded settings password
+    (settings.SETTINGS_EDIT_PASSWORD). Constant-time compare, and an empty
+    configured password never matches anything - it would otherwise leave
+    Settings open to everyone."""
+    expected = getattr(django_settings, "SETTINGS_EDIT_PASSWORD", "") or ""
+    if not expected:
+        return False
+    return hmac.compare_digest(str(supplied or "").encode("utf-8"), expected.encode("utf-8"))
 
 
-def _require_admin(request):
-    """Returns a 403 Response if the logged-in user isn't an Admin, else
-    None - the exact split the login system exists for: Admin can change
-    Settings/Connectors, User can only view them."""
-    if _user_role(request) != "admin":
-        return Response({"error": "Admin access required for this action."}, status=403)
+def _require_settings_password(request):
+    """Returns a 403 Response unless the request carries the settings
+    password (body field `settings_password`, or the X-Settings-Password
+    header), else None. Replaces the old Admin/User role split now that the app
+    has one shared login (Ayush, 8 Oct 2026): being signed in is not enough to
+    change the API key or any other setting. Checked on the server on every
+    save, so the Settings page's lock cannot be skipped from the browser."""
+    supplied = request.data.get("settings_password") if hasattr(request.data, "get") else None
+    if not supplied:
+        supplied = request.headers.get("X-Settings-Password", "")
+    if not _settings_password_ok(supplied):
+        return Response(
+            {"error": "The settings password is missing or wrong.", "code": "settings_password"}, status=403
+        )
     return None
 
 # The fixed question behind the topic page's "AI Context Brief" panel /
@@ -102,6 +141,30 @@ def _current_llm_settings():
         # "stale" on the dashboard - PRD Should-have ("flag stale... information"),
         # admin-configurable since what counts as stale differs by project pace.
         "stale_after_days": Settings.get("stale_after_days", "14"),
+        # The central Recordings-folder auto-transcribe pipeline (core/
+        # recordings.py) - configurable from the Transcripts page, not the
+        # main Settings page, but read/written through this same Settings
+        # table/endpoint for consistency with everything else here.
+        "recordings_watch_folder": Settings.get(
+            "recordings_watch_folder", r"D:\OneDrive - Maarga Systems Private Limited\Recordings"
+        ),
+        # Whether the pipeline SUGGESTS a new project for a recording that
+        # doesn't match anything existing - it never creates one silently;
+        # a person always confirms or rejects on the Transcripts page (see
+        # RecordingEvent's own docstring for why).
+        "recordings_suggest_new_topics": Settings.get("recordings_suggest_new_topics", "true"),
+        # Venki's own "common folder... shortcut to mark to projects" ask
+        # (30 Sep) - a second, separate watched folder for manually-dropped
+        # files (any type, not just recordings) that always land as
+        # needs_review for a person to quick-tag, never auto-routed by an
+        # LLM (core/recordings.py's tick_manual_drop_folder).
+        "manual_drop_folder": Settings.get("manual_drop_folder", ""),
+        # "local_whisper" (built-in, no setup) or "external" (POST the audio
+        # file to external_transcription_url and expect back {"text":...,
+        # "speakers": [...]?}) - the integration point for the engineering
+        # team's transcript diarizer tool, or anything else, once it exists.
+        "transcription_engine": Settings.get("transcription_engine", "local_whisper"),
+        "external_transcription_url": Settings.get("external_transcription_url", ""),
     }
 
 
@@ -111,105 +174,95 @@ def _extract_and_store(ingested_file):
     there's nothing usable to extract from yet - matches every call site's
     existing "don't let a bad file break the request" convention.
 
-    Prefers the LLM (configured in Settings) when a key is present: it can
-    actually judge whether a document is a meeting record at all, not just
-    pattern-match it, so a report or README doesn't get a fabricated
-    "meeting title" out of its first line. Falls back to the pure-Python
-    heuristic - gated on a real transcript signal via
-    extraction.looks_like_meeting_transcript, for the same reason - when no
-    key is configured or the LLM call fails."""
+    Deterministic-first, no LLM for classification or most fields ("less
+    LLM, more automation and code-based operation" - Ayush, 24 Sep):
+    extraction.looks_like_meeting_transcript's real-signal gate (a transcript
+    speaker line or an "Attendees:" header - never just the word "meeting"
+    appearing anywhere, which is exactly the false positive a security
+    review titled "Meeting Diarizer" hit before this) plus plain-regex
+    title/date/time/attendees/agenda/achieved/hours extraction. This alone
+    means a non-meeting file - most of what actually gets ingested - never
+    reaches the LLM at all; previously every single file got a full
+    classify+extract call regardless of what it was.
+
+    Action items are the one thing regex genuinely can't pull reliably out
+    of free-flowing meeting speech, so that's the one remaining LLM call -
+    only for files already confirmed to look like a real meeting, and never
+    fatal to storing everything else above if it fails."""
+    # Document type / tags / signal / version / date (pure code, never
+    # overwrites a human's value) - runs for every file, including unreadable
+    # ones (those become state "error").
+    doc_meta.safe_apply_auto_metadata(ingested_file)
+
+    # Venki, 8 Oct: a file may be renamed to anything, so where the rules
+    # cannot trust the NAME, an LLM reads the file's CONTENT and decides what
+    # it is (only with a key configured; never overrides a person's choice).
+    settings = _current_llm_settings()
+    doc_meta.safe_refine_doc_type_with_llm(ingested_file, settings)
+
     text = ingested_file.extracted_text or ""
     if ingested_file.extraction_error or not text.strip():
         return
 
-    settings = _current_llm_settings()
-    if settings.get("llm_api_key"):
-        try:
-            fields = llm_brief.extract_meeting_metadata_llm(text, settings)
-        except Exception:  # noqa: BLE001 - fall back to the heuristic below
-            fields = None
-        if fields is not None:
-            meeting_date = None
-            raw_date = fields.get("meeting_date")
-            if raw_date:
-                try:
-                    meeting_date = datetime.strptime(raw_date, "%Y-%m-%d").date()
-                except ValueError:
-                    meeting_date = None
-            attendees = fields.get("attendees") or []
-            # Deterministic backstop on top of the LLM's own is_meeting call -
-            # real, confirmed bug: a security review of a tool literally named
-            # "Meeting Diarizer" came back is_meeting=True purely because the
-            # word "meeting" appears in its title. A genuine meeting record
-            # almost always has a real date or named attendees; is_meeting=
-            # True with neither is far more likely a misjudged report.
-            is_meeting = bool(fields.get("is_meeting")) and (meeting_date is not None or len(attendees) > 0)
-            if not is_meeting:
-                ExtractedMeta.objects.filter(ingested_file=ingested_file).delete()
-                Task.objects.filter(source_file=ingested_file).delete()
-                return
-            hours = [
-                {"name": h.get("name", ""), "hours": h.get("hours", 0), "date": raw_date or None}
-                for h in (fields.get("employee_hours") or [])
-                if h.get("name")
-            ]
-            ExtractedMeta.objects.update_or_create(
-                ingested_file=ingested_file,
-                defaults={
-                    "meeting_title": fields.get("meeting_title") or "",
-                    "meeting_date": meeting_date,
-                    "meeting_time": fields.get("meeting_time") or "",
-                    "attendees": attendees,
-                    "agenda": fields.get("agenda") or "",
-                    "achieved": fields.get("achieved") or "",
-                    "employee_hours": hours,
-                },
-            )
-            # Add any action items not already created from this same file -
-            # never touches an existing task's status/due_date, so re-scanning
-            # doesn't reset progress someone already made on the board.
-            existing_titles = set(
-                Task.objects.filter(source_file=ingested_file).values_list("title", flat=True)
-            )
-            for item in fields.get("action_items") or []:
-                title = (item.get("title") or "").strip()
-                if not title or title in existing_titles:
-                    continue
-                due_date = None
-                if item.get("due_date"):
-                    try:
-                        due_date = datetime.strptime(item["due_date"], "%Y-%m-%d").date()
-                    except ValueError:
-                        due_date = None
-                Task.objects.create(
-                    topic=ingested_file.topic,
-                    source_file=ingested_file,
-                    title=title,
-                    assignee=item.get("assignee") or "",
-                    due_date=due_date,
-                )
-            return
-        # LLM call failed - fall through to the gated heuristic below.
-
-    if not extraction.looks_like_meeting_transcript(text):
+    # A file the content check identified as a meeting record is read as a
+    # meeting even when it lacks the speaker-line shape the plain-code gate
+    # looks for - that is how a renamed transcript or MoM reaches Meetings
+    # and Action Items.
+    read_as_meeting = extraction.looks_like_meeting_transcript(text) or (
+        ingested_file.doc_type_source == "llm" and ingested_file.doc_type in doc_meta.MEETING_DOC_TYPES
+    )
+    if not read_as_meeting:
         ExtractedMeta.objects.filter(ingested_file=ingested_file).delete()
         Task.objects.filter(source_file=ingested_file).delete()
         return
 
     meta = extraction.extract_meeting_metadata(text)
     hours = extraction.extract_employee_hours(text)
-    ExtractedMeta.objects.update_or_create(
-        ingested_file=ingested_file,
-        defaults={
-            "meeting_title": meta["meeting_title"],
-            "meeting_date": meta["meeting_date"],
-            "meeting_time": meta["meeting_time"],
-            "attendees": meta["attendees"],
-            "agenda": meta["agenda"],
-            "achieved": meta["achieved"],
-            "employee_hours": hours,
-        },
+    existing_meta = ExtractedMeta.objects.filter(ingested_file=ingested_file).first()
+    defaults = {
+        "meeting_title": meta["meeting_title"],
+        "meeting_date": meta["meeting_date"],
+        "meeting_time": meta["meeting_time"],
+        "attendees": meta["attendees"],
+        "agenda": meta["agenda"],
+        "achieved": meta["achieved"],
+        "employee_hours": hours,
+    }
+    # Meeting type/sequence (a manual choice is kept) + "who said what" turns.
+    defaults.update(
+        doc_meta.auto_meeting_fields(
+            meta["meeting_title"], doc_meta.primary_filename(ingested_file), text, existing_meta
+        )
     )
+    ExtractedMeta.objects.update_or_create(ingested_file=ingested_file, defaults=defaults)
+
+    if not settings.get("llm_api_key"):
+        return
+    try:
+        action_items = llm_brief.extract_action_items_llm(text, meta["meeting_date"], settings)
+    except Exception:  # noqa: BLE001 - action items are a bonus, never fatal
+        return
+
+    # Add any action items not already created from this same file - never
+    # touches an existing task's status/due_date, so re-scanning doesn't
+    # reset progress someone already made on the board.
+    existing_titles = set(
+        Task.objects.filter(source_file=ingested_file).values_list("title", flat=True)
+    )
+    for item in action_items:
+        title = (item.get("title") or "").strip()
+        if not title or title in existing_titles:
+            continue
+        # No due date is stored (Ayush, 8 Oct: an action item is just the
+        # action plus the date it was added - created_at - and where it came
+        # from). A date the model inferred from the meeting wording was only
+        # ever a guess.
+        Task.objects.create(
+            topic=ingested_file.topic,
+            source_file=ingested_file,
+            title=title,
+            assignee=item.get("assignee") or "",
+        )
 
 
 # The 7 structured brief fields, shared by _ask_topic (persisting
@@ -217,6 +270,7 @@ def _extract_and_store(ingested_file):
 # per-paragraph rendering - one list so all three can't drift apart.
 SUMMARY_FIELD_NAMES = [
     "why_now", "current_state", "history", "customer_thoughts",
+    "customer_need", "proposed_solution", "latest_updates", "decisions_made", "meeting_prep",
     "promises_made", "next_step", "risks_and_gaps",
 ]
 
@@ -301,13 +355,10 @@ def _ask_topic(topic, question):
         CaseSummary.objects.create(
             topic=topic,
             answer_summary=fields.get("answer_summary") or "",
-            why_now=fields.get("why_now") or "",
-            current_state=fields.get("current_state") or "",
-            history=fields.get("history") or "",
-            customer_thoughts=fields.get("customer_thoughts") or "",
-            promises_made=fields.get("promises_made") or "",
-            next_step=fields.get("next_step") or "",
-            risks_and_gaps=fields.get("risks_and_gaps") or "",
+            # One dict built straight from SUMMARY_FIELD_NAMES instead of a
+            # field-by-field list - a new section only ever needs adding in
+            # that one list (and the model/schema), never here too.
+            **{key: fields.get(key) or "" for key in SUMMARY_FIELD_NAMES},
             field_sources=field_sources,
             sources_used=source_paths,
         )
@@ -344,6 +395,29 @@ def _ask_global(question):
         generation_note=note or "",
     )
     return _message_payload(msg)
+
+
+class MessageFeedbackView(APIView):
+    """Thumbs up/down on one assistant message - the "orientation run"
+    capture Venki asked for directly (30 Sep AI Adoption Sprint Meeting):
+    "I should be able to say thumbs up or thumbs down... it should be
+    unobtrusive". `kind` is "topic" (ChatMessage) or "global"
+    (GlobalChatMessage) - one endpoint for both rather than two near-
+    identical views, since the shape and rule (assistant messages only)
+    are identical."""
+
+    def post(self, request, kind, pk):
+        model = ChatMessage if kind == "topic" else GlobalChatMessage
+        msg = get_object_or_404(model, pk=pk)
+        if msg.role != "assistant":
+            return Response({"error": "Feedback only applies to assistant messages."}, status=400)
+        value = request.data.get("feedback", "")
+        if value not in ("", "up", "down"):
+            return Response({"error": "feedback must be 'up', 'down', or '' to clear it."}, status=400)
+        msg.feedback = value
+        msg.save(update_fields=["feedback"])
+        serializer_cls = ChatMessageSerializer if kind == "topic" else GlobalChatMessageSerializer
+        return Response(serializer_cls(msg).data)
 
 
 class GlobalChatView(APIView):
@@ -464,6 +538,16 @@ class TopicViewSet(viewsets.ModelViewSet):
                 _extract_and_store(f)
                 on_progress(i, len(to_extract))
 
+            # Pre-compile the brief here, in the background, rather than
+            # live when someone opens the Context Node ("less LLM... more
+            # code-based operation" + Venki's own 10-second/deterministic
+            # framing, 24 Sep) - opening the page is then a plain DB read,
+            # never a wait on a live LLM call. Only worth it if something
+            # actually changed; skip entirely on an unchanged re-scan.
+            if summary["added"] or summary["updated"]:
+                on_progress(len(to_extract), len(to_extract), status="extracting")
+                _ask_topic(t, CONTEXT_BRIEF_QUESTION)
+
             return {
                 "scanned": summary["scanned"],
                 "added": summary["added"],
@@ -487,7 +571,14 @@ class TopicViewSet(viewsets.ModelViewSet):
         """Data-fetch option 2: upload one file directly, no folder needed -
         for a one-off document you don't want to set up a whole lookup
         folder just to add. Captures the same first_added_at reference
-        timestamp as folder ingestion."""
+        timestamp as folder ingestion.
+
+        Audio/video recordings are the one exception: transcription can
+        take minutes for a real meeting, so those go through the same
+        background-job pattern as a folder scan (returns {"job_id": ...}
+        instead of {"id": ...}) rather than blocking the HTTP request -
+        the frontend distinguishes the two response shapes and polls
+        scan_status for the async case."""
         topic = self.get_object()
         upload = request.FILES.get("file")
         if not upload:
@@ -501,6 +592,34 @@ class TopicViewSet(viewsets.ModelViewSet):
         with open(dest_path, "wb") as f:
             f.write(raw)
         content_hash = hashlib.sha256(raw).hexdigest()
+
+        ext = os.path.splitext(upload.name)[1].lower()
+        if ext in (".mp4", ".mov", ".webm", ".wav", ".mp3", ".m4a"):
+            def work(t, on_progress):
+                on_progress(0, 1, status="extracting")
+                try:
+                    text = ingestion.extract_text(dest_path)
+                    error = ""
+                except Exception as e:  # noqa: BLE001 - report it on the file, not a 500
+                    text = ""
+                    error = str(e)
+                obj, _ = IngestedFile.objects.update_or_create(
+                    topic=t,
+                    path=dest_path,
+                    defaults={
+                        "display_name": upload.name,
+                        "source_method": "upload",
+                        "extracted_text": text,
+                        "content_hash": content_hash,
+                        "extraction_error": error,
+                    },
+                )
+                _extract_and_store(obj)
+                on_progress(1, 1)
+                return {"scanned": 1, "added": 1, "updated": 0, "unchanged": 0}
+
+            job_id = _start_scan_job(topic, work)
+            return Response({"job_id": job_id})
 
         try:
             text = ingestion.extract_text(dest_path)
@@ -704,8 +823,10 @@ class TopicViewSet(viewsets.ModelViewSet):
                         "agenda": (ev["description"] or "")[:500],
                         "achieved": "",
                         "employee_hours": [],
+                        **doc_meta.auto_meeting_fields(summary, "", "", None),
                     },
                 )
+                doc_meta.safe_apply_auto_metadata(obj)
                 created += 1
                 on_progress(i, len(events))
             return {"updated": created}
@@ -996,9 +1117,16 @@ class TopicViewSet(viewsets.ModelViewSet):
     def refresh_summary(self, request, pk=None):
         """Manually regenerate the brief on demand, via the exact same ask
         pipeline as any other question (so it's transparent in the chat log,
-        not a hidden call) - see CONTEXT_BRIEF_QUESTION."""
+        not a hidden call) - see CONTEXT_BRIEF_QUESTION.
+
+        Accepts an optional `question` in the POST body so the Smart
+        Suggestions preset buttons ("Catch me up", "What's changed?",
+        "Prepare me for next meeting") can each regenerate the same on-page
+        brief with a differently-focused question, without reintroducing a
+        chat surface - falls back to the original fixed question when absent."""
         topic = self.get_object()
-        _ask_topic(topic, CONTEXT_BRIEF_QUESTION)
+        question = (request.data.get("question") or "").strip() or CONTEXT_BRIEF_QUESTION
+        _ask_topic(topic, question)
         summary = topic.summaries.first()
         if not summary:
             return Response(
@@ -1007,30 +1135,154 @@ class TopicViewSet(viewsets.ModelViewSet):
             )
         return Response(CaseSummarySerializer(summary).data)
 
+    @action(detail=True, methods=["get", "patch"], url_path="state")
+    def project_state(self, request, pk=None):
+        """The explicit 'Project Intelligence' current-position editor -
+        distinct from CaseSummary (AI-regenerated, append-only). GET
+        get-or-creates the one row for this topic; PATCH shifts the old
+        current_position into previous_position before overwriting, so one
+        prior value is always available without a full history table."""
+        topic = self.get_object()
+        state, _created = ProjectState.objects.get_or_create(topic=topic)
+        if request.method == "GET":
+            return Response(ProjectStateSerializer(state).data)
+
+        new_position = request.data.get("current_position", "")
+        state.previous_position = state.current_position
+        state.current_position = new_position
+        state.updated_by = request.user.get_full_name() or request.user.username
+        state.save()
+        return Response(ProjectStateSerializer(state).data)
+
     @action(detail=True, methods=["get"])
     def meeting_metadata(self, request, pk=None):
+        """Meetings of this topic (deduplicated), newest first. Every key it
+        always returned is still here; added (5 Oct 2026): file_id,
+        meeting_type(+label/source), meeting_sequence, speaker_turn_count,
+        speaker_summary ("who said what" per speaker) and notes. Pass
+        ?include_turns=1 to also get the full speaker_turns list."""
         topic = self.get_object()
+        include_turns = request.query_params.get("include_turns") in ("1", "true", "yes")
         metas = (
             ExtractedMeta.objects.filter(ingested_file__topic=topic)
             .select_related("ingested_file")
+            .prefetch_related("notes")
             .order_by(F("meeting_date").desc(nulls_last=True), "-ingested_file__first_added_at")
         )
-        data = [
-            {
-                "id": m.id,
-                "file_display_name": m.ingested_file.display_name,
-                "file_path": m.ingested_file.path,
-                "meeting_title": m.meeting_title,
-                "timeline_title": _meeting_timeline_title(m.meeting_title),
-                "meeting_date": m.meeting_date.isoformat() if m.meeting_date else None,
-                "meeting_time": m.meeting_time,
-                "attendees": m.attendees,
-                "agenda": m.agenda,
-                "achieved": m.achieved,
-            }
-            for m in _dedupe_meetings(metas)
-        ]
-        return Response(data)
+        return Response([_meeting_payload(m, include_turns=include_turns) for m in _dedupe_meetings(metas)])
+
+    @action(detail=True, methods=["get"], url_path="timeline_events")
+    def timeline_events(self, request, pk=None):
+        """Business timeline, oldest first: meetings (with type + sequence),
+        emails, key documents (proposal / quotation-SOW / PRD-BRD / charter /
+        plan, with version) and human notes."""
+        return Response(_business_timeline_events(self.get_object()))
+
+    @action(detail=True, methods=["get"], url_path="metadata_csv")
+    def metadata_csv(self, request, pk=None):
+        """Metadata CSV for this topic's files: the 7 contract columns
+        (file, document_type, topic_tags, signal, state, seconds,
+        review_notes) first, then phase, version, doc_date, participants."""
+        topic = self.get_object()
+        files = topic.files.select_related("topic", "meta").prefetch_related("topic__folders")
+        return _metadata_csv_response(files, f"{topic.name}-metadata.csv")
+
+    # ---- human notes (MeetingNote) ----------------------------------------
+    @action(detail=True, methods=["get", "post"], url_path="notes")
+    def notes(self, request, pk=None):
+        topic = self.get_object()
+        if request.method == "GET":
+            qs = topic.meeting_notes.select_related("meta")
+            meta_id = request.query_params.get("meta")
+            if meta_id:
+                qs = qs.filter(meta_id=meta_id)
+            return Response(MeetingNoteSerializer(qs, many=True).data)
+
+        text = str(request.data.get("text") or "").strip()
+        if not text:
+            return Response({"error": "text is required"}, status=400)
+        if len(text) > MAX_NOTE_LENGTH:
+            return Response({"error": f"A note can be at most {MAX_NOTE_LENGTH} characters."}, status=400)
+        meta = None
+        raw_meta = request.data.get("meta")
+        if raw_meta not in (None, ""):
+            meta = ExtractedMeta.objects.filter(pk=raw_meta, ingested_file__topic=topic).first()
+            if meta is None:
+                return Response({"error": "That meeting does not belong to this topic."}, status=400)
+        note = MeetingNote.objects.create(topic=topic, meta=meta, text=text, author=request.user.username)
+        return Response(MeetingNoteSerializer(note).data, status=201)
+
+    @action(detail=True, methods=["patch", "delete"], url_path=r"notes/(?P<note_id>\d+)")
+    def note_detail(self, request, pk=None, note_id=None):
+        topic = self.get_object()
+        note = get_object_or_404(MeetingNote, pk=note_id, topic=topic)
+        if request.method == "DELETE":
+            note.delete()
+            return Response(status=204)
+        text = str(request.data.get("text") or "").strip()
+        if not text:
+            return Response({"error": "text is required"}, status=400)
+        if len(text) > MAX_NOTE_LENGTH:
+            return Response({"error": f"A note can be at most {MAX_NOTE_LENGTH} characters."}, status=400)
+        note.text = text
+        note.save(update_fields=["text"])
+        return Response(MeetingNoteSerializer(note).data)
+
+    # ---- contacts (optional role / side per stakeholder) ------------------
+    def _attendee_suggestions(self, topic):
+        metas = list(ExtractedMeta.objects.filter(ingested_file__topic=topic))
+        saved = {c.name.lower() for c in topic.contacts.all()}
+        return [
+            n for n in _collect_stakeholders(topic, metas)
+            if len(n.strip()) >= 2 and n.lower() not in saved and not extraction.is_placeholder_attendee(n)
+        ][:50]
+
+    @action(detail=True, methods=["get", "post"], url_path="contacts")
+    def contacts(self, request, pk=None):
+        topic = self.get_object()
+        if request.method == "GET":
+            return Response(
+                {
+                    "contacts": ContactSerializer(topic.contacts.all(), many=True).data,
+                    # Names seen as attendees that are not saved yet. Nothing is
+                    # created from them until someone saves one or calls seed.
+                    "suggestions": self._attendee_suggestions(topic),
+                }
+            )
+        serializer = ContactSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        name = serializer.validated_data["name"].strip()
+        if not name:
+            return Response({"error": "name is required"}, status=400)
+        if topic.contacts.filter(name__iexact=name).exists():
+            return Response({"error": "A contact with that name already exists."}, status=400)
+        contact = serializer.save(topic=topic, name=name)
+        return Response(ContactSerializer(contact).data, status=201)
+
+    @action(detail=True, methods=["post"], url_path="contacts/seed")
+    def contacts_seed(self, request, pk=None):
+        """Explicit "add the attendees as contacts" - only when a person asks."""
+        topic = self.get_object()
+        created = [Contact.objects.create(topic=topic, name=n[:150]) for n in self._attendee_suggestions(topic)]
+        return Response(
+            {"created": len(created), "contacts": ContactSerializer(topic.contacts.all(), many=True).data},
+            status=201,
+        )
+
+    @action(detail=True, methods=["patch", "delete"], url_path=r"contacts/(?P<contact_id>\d+)")
+    def contact_detail(self, request, pk=None, contact_id=None):
+        topic = self.get_object()
+        contact = get_object_or_404(Contact, pk=contact_id, topic=topic)
+        if request.method == "DELETE":
+            contact.delete()
+            return Response(status=204)
+        serializer = ContactSerializer(contact, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        new_name = (serializer.validated_data.get("name") or contact.name).strip()
+        if topic.contacts.filter(name__iexact=new_name).exclude(pk=contact.pk).exists():
+            return Response({"error": "A contact with that name already exists."}, status=400)
+        serializer.save(name=new_name)
+        return Response(ContactSerializer(contact).data)
 
     @action(detail=True, methods=["post"])
     def compute_payroll(self, request, pk=None):
@@ -1088,20 +1340,56 @@ class TopicViewSet(viewsets.ModelViewSet):
 
 
 class TaskViewSet(viewsets.ModelViewSet):
-    """Kanban-board tasks - see models.Task. Created automatically by
-    _extract_and_store from a meeting's action items; a person only ever
-    moves one between columns (status) or adjusts its due_date here, never
-    creates/renames/deletes one directly, hence title/assignee/topic/
-    source_file being read-only on the serializer."""
+    """Kanban-board tasks / Commitments - see models.Task. Most rows are
+    created automatically by _extract_and_store from a meeting's action
+    items (source_file set); a person can also add one manually from the
+    Context Node's Commitments card (source_file left null) - that's the
+    only signal distinguishing "AI-extracted" from "manually added", so no
+    extra field was needed for it. title/assignee/status/topic are writable;
+    source_file/created_at/updated_at stay read-only, and due_date is not
+    exposed at all (8 Oct 2026 - see TaskSerializer)."""
 
     serializer_class = TaskSerializer
 
     def get_queryset(self):
-        qs = Task.objects.select_related("topic", "source_file")
+        qs = Task.objects.select_related("topic", "source_file", "source_file__meta")
         topic_id = self.request.query_params.get("topic")
         if topic_id:
             qs = qs.filter(topic_id=topic_id)
         return qs
+
+    @action(detail=True, methods=["get"], url_path="source")
+    def source(self, request, pk=None):
+        """Where this action item came from - the file (shown by its template
+        name, with its real file name second) and the passage of it that best
+        matches the task. Computed on demand, when someone clicks the item, so
+        the task list itself stays light. A task a person added by hand has no
+        source file and says so. The passage is the closest match found in the
+        file's own text, not a stored quote (the LLM rewrote the wording into
+        a short task), so it is labelled as such and left out when nothing
+        matches well enough."""
+        task = self.get_object()
+        f = task.source_file
+        if f is None:
+            return Response({"added_by_hand": True, "file": None, "passage": None})
+        meta = getattr(f, "meta", None)
+        meeting_date = meta.meeting_date if meta else None
+        return Response(
+            {
+                "added_by_hand": False,
+                "file": {
+                    "id": f.id,
+                    "name": doc_meta.primary_filename(f) or f.display_name or "",
+                    "label": doc_meta.display_title(f),
+                    "doc_type": f.doc_type,
+                    "read_by_ai": f.doc_type_source == "llm",
+                    "meeting_title": (meta.meeting_title if meta else "") or "",
+                    "date": (meeting_date or f.document_date or f.first_added_at.date()).isoformat(),
+                    "openable": not f.path.startswith(("pasted:", "mbox:", "ics:")),
+                },
+                "passage": evidence.find_supporting_passage(f.extracted_text, task.title),
+            }
+        )
 
     @action(detail=True, methods=["post"], url_path="ai_execute")
     def ai_execute(self, request, pk=None):
@@ -1115,11 +1403,58 @@ class TaskViewSet(viewsets.ModelViewSet):
         return Response({"draft": draft, "is_llm": is_llm, "note": note})
 
 
+class DecisionViewSet(viewsets.ModelViewSet):
+    """Structured, persistent decision records - see models.Decision. Same
+    shape/conventions as TaskViewSet: filterable by ?topic=, all fields
+    writable except source_file/created_at."""
+
+    serializer_class = DecisionSerializer
+
+    def get_queryset(self):
+        qs = Decision.objects.select_related("topic", "source_file")
+        topic_id = self.request.query_params.get("topic")
+        if topic_id:
+            qs = qs.filter(topic_id=topic_id)
+        return qs
+
+
+class CommitmentViewSet(viewsets.ModelViewSet):
+    """A person's promise/obligation - see models.Commitment. Deliberately
+    separate from Task (which lives in TaskViewSet/the Work tab's Kanban
+    board); a Commitment may optionally point at a Task via linked_task, but
+    the two are independent records. Same ?topic= filter pattern as every
+    other per-topic viewset in this file."""
+
+    serializer_class = CommitmentSerializer
+
+    def get_queryset(self):
+        qs = Commitment.objects.select_related("topic", "source_file", "linked_task")
+        topic_id = self.request.query_params.get("topic")
+        if topic_id:
+            qs = qs.filter(topic_id=topic_id)
+        return qs
+
+
+class RiskViewSet(viewsets.ModelViewSet):
+    """Structured, tracked risks/blockers - see models.Risk. Same shape/
+    conventions as DecisionViewSet: filterable by ?topic=, all fields
+    writable except source_file/created_at."""
+
+    serializer_class = RiskSerializer
+
+    def get_queryset(self):
+        qs = Risk.objects.select_related("topic", "source_file")
+        topic_id = self.request.query_params.get("topic")
+        if topic_id:
+            qs = qs.filter(topic_id=topic_id)
+        return qs
+
+
 class CalendarView(APIView):
-    """Across ALL topics, every ExtractedMeta row with a real meeting_date
-    PLUS every Task with a due_date - optionally filtered to one topic via
-    ?topic_id=<id>. One merged, date-sorted list so a calendar widget can
-    highlight a day for either a meeting or a commitment, tagged by "kind".
+    """Across ALL topics, every ExtractedMeta row with a real meeting_date -
+    optionally filtered to one topic via ?topic_id=<id>. A date-sorted list so
+    a calendar widget can highlight a day with a meeting, tagged by "kind"
+    (action items no longer have a due date, so they are not on the calendar).
     Deliberately not nested under the topics router since it spans topics."""
 
     def get(self, request):
@@ -1147,88 +1482,331 @@ class CalendarView(APIView):
                     "meeting_title": m.meeting_title,
                     "meeting_date": m.meeting_date.isoformat(),
                     "meeting_time": m.meeting_time,
-                    "attendees": m.attendees,
+                    "attendees": extraction.clean_attendees(m.attendees),
                     "agenda": m.agenda,
                     "achieved": m.achieved,
+                    "meeting_type": m.meeting_type,
+                    "meeting_sequence": m.meeting_sequence,
                 }
             )
 
-        task_qs = Task.objects.filter(due_date__isnull=False).select_related("topic")
-        if topic_id:
-            task_qs = task_qs.filter(topic_id=topic_id)
-        for t in task_qs:
-            data.append(
-                {
-                    "kind": "task",
-                    "date": t.due_date.isoformat(),
-                    "topic_id": t.topic.id,
-                    "topic_name": t.topic.name,
-                    "topic_type": t.topic.topic_type,
-                    "id": t.id,
-                    "title": t.title,
-                    "assignee": t.assignee,
-                    "status": t.status,
-                    "due_date": t.due_date.isoformat(),
-                }
-            )
+        # Action items no longer carry a due date (Ayush, 8 Oct 2026), so they
+        # no longer put dates on the calendar - it shows meetings only.
 
         data.sort(key=lambda e: e["date"], reverse=True)
         return Response(data)
 
 
-class GlobalSearchView(APIView):
-    """The universal search (Ctrl/Cmd+K) - one query fanned out across
-    project names/one-liners/related people, meeting attendees
-    (stakeholders), task titles, and file names, each capped to a handful of
-    results. Server-side so the frontend never has to ship every project's
-    full data down just to filter it client-side."""
+class GlobalSourcesView(APIView):
+    """Every ingested file across every project, one browsable library - the
+    ingestion pipeline (folder scan / upload / paste / mailbox / ICS) is the
+    thing OrientMe actually runs on, so it earns its own cross-project view
+    instead of only being reachable one project's "Manage sources" modal at
+    a time (17 Sep sprint: Venki's own emphasis on the ingestion mechanism
+    being central to how the product works). Optionally filtered to one
+    topic via ?topic_id=<id>. Deliberately not nested under the topics
+    router since it spans topics, same reasoning as CalendarView above."""
 
     def get(self, request):
-        q = (request.query_params.get("q") or "").strip()
-        if not q:
-            return Response({"projects": [], "stakeholders": [], "tasks": [], "files": []})
+        topic_id = request.query_params.get("topic_id")
+        qs = IngestedFile.objects.select_related("topic", "meta").order_by("-first_added_at")
+        if topic_id:
+            qs = qs.filter(topic_id=topic_id)
 
-        projects = Topic.objects.filter(
-            Q(name__icontains=q) | Q(one_liner__icontains=q) | Q(related_people__icontains=q)
-        )[:8]
+        data = [
+            {
+                "id": f.id,
+                "topic_id": f.topic.id,
+                "topic_name": f.topic.name,
+                "topic_type": f.topic.topic_type,
+                "path": f.path,
+                "display_name": f.display_name,
+                "source_method": f.source_method,
+                "artifact_type": artifact_type_for(f),
+                "first_added_at": f.first_added_at.isoformat(),
+                **file_metadata_payload(f),
+            }
+            for f in qs
+        ]
+        return Response(data)
+
+
+class GlobalTimelineView(APIView):
+    """A cross-project activity feed - meetings ingested, status updates
+    (fresh AI briefs), and tasks added/completed, across every project,
+    newest first. The per-project Timeline tab already answers "what's
+    happened on THIS project"; this answers "what's happened anywhere I'm
+    tracking" - a genuinely different, non-redundant question, and the one
+    Venki himself called out as needing real logic ("the project timeline
+    is being constructed from... meeting transcripts... the logic of this
+    is going to be important"). Capped at 200 most recent entries - this is
+    a pulse, not a full audit log. Optionally filtered to one topic via
+    ?topic_id=<id>."""
+
+    def get(self, request):
+        topic_id = request.query_params.get("topic_id")
+        events = []
+
+        meta_qs = ExtractedMeta.objects.filter(meeting_date__isnull=False).select_related(
+            "ingested_file", "ingested_file__topic"
+        )
+        if topic_id:
+            meta_qs = meta_qs.filter(ingested_file__topic_id=topic_id)
+        for m in meta_qs:
+            topic = m.ingested_file.topic
+            events.append(
+                {
+                    "kind": "meeting",
+                    "date": m.meeting_date.isoformat(),
+                    "topic_id": topic.id,
+                    "topic_name": topic.name,
+                    "title": (
+                        _meeting_display_title(m) if m.meeting_type else (m.meeting_title or m.ingested_file.display_name)
+                    ),
+                }
+            )
+
+        # Business events (5 Oct 2026): emails, key documents and human notes.
+        file_qs = IngestedFile.objects.filter(
+            doc_type__in=("email",) + _TIMELINE_DOC_TYPES
+        ).exclude(meta_state="error").select_related("topic")
+        note_qs = MeetingNote.objects.select_related("topic")
+        if topic_id:
+            file_qs = file_qs.filter(topic_id=topic_id)
+            note_qs = note_qs.filter(topic_id=topic_id)
+        for f in file_qs:
+            when = f.document_date or f.first_added_at.date()
+            if f.doc_type == "email":
+                kind = "email"
+                title = doc_meta.email_subject(f.extracted_text) or f.display_name or "Email"
+            else:
+                kind = "document"
+                title = f"{doc_meta.DOC_TYPE_LABELS.get(f.doc_type, 'Document')} {f.version_label}".strip()
+            events.append(
+                {
+                    "kind": kind,
+                    "date": when.isoformat(),
+                    "topic_id": f.topic_id,
+                    "topic_name": f.topic.name,
+                    "title": title,
+                }
+            )
+        for n in note_qs:
+            events.append(
+                {
+                    "kind": "note",
+                    "date": n.created_at.date().isoformat(),
+                    "topic_id": n.topic_id,
+                    "topic_name": n.topic.name,
+                    "title": "Note: " + _truncate(" ".join(n.text.split()), 100),
+                }
+            )
+
+        task_qs = Task.objects.select_related("topic")
+        if topic_id:
+            task_qs = task_qs.filter(topic_id=topic_id)
+        for t in task_qs:
+            events.append(
+                {
+                    "kind": "task",
+                    "date": t.created_at.date().isoformat(),
+                    "topic_id": t.topic.id,
+                    "topic_name": t.topic.name,
+                    "title": f"Task added: {t.title}",
+                }
+            )
+            if t.status == "done":
+                events.append(
+                    {
+                        "kind": "task-done",
+                        "date": t.updated_at.date().isoformat(),
+                        "topic_id": t.topic.id,
+                        "topic_name": t.topic.name,
+                        "title": f"Task completed: {t.title}",
+                    }
+                )
+
+        summary_qs = CaseSummary.objects.select_related("topic")
+        if topic_id:
+            summary_qs = summary_qs.filter(topic_id=topic_id)
+        for s in summary_qs:
+            events.append(
+                {
+                    "kind": "status",
+                    "date": s.generated_at.date().isoformat(),
+                    "topic_id": s.topic.id,
+                    "topic_name": s.topic.name,
+                    "title": (s.answer_summary or s.current_state or "Brief regenerated").strip()[:140],
+                }
+            )
+
+        events.sort(key=lambda e: e["date"], reverse=True)
+        return Response(events[:200])
+
+
+def _search_snippet(text, tokens, context=70):
+    """The excerpt shown for a content-matched ("Topic") search result - the
+    plain text around wherever the first token actually appears, so someone
+    can see WHY it matched without opening the file. No LLM summarizing or
+    guessing a page/paragraph number here - just the real surrounding
+    characters, collapsed to one line. Returns "" if none of the tokens are
+    actually found (shouldn't happen given the caller already filtered on
+    this, but keeps this function safe to call standalone)."""
+    lower = text.lower()
+    pos = -1
+    for tok in tokens:
+        pos = lower.find(tok)
+        if pos != -1:
+            break
+    if pos == -1:
+        return ""
+    start = max(0, pos - context)
+    end = min(len(text), pos + context)
+    snippet = " ".join(text[start:end].split())  # collapse newlines/whitespace to one line
+    if start > 0:
+        snippet = "…" + snippet
+    if end < len(text):
+        snippet = snippet + "…"
+    return snippet
+
+
+class GlobalSearchView(APIView):
+    """The universal search (Ctrl/Cmd+K) - one query fanned out across
+    Projects, People, Topics (content matches), Files (name matches), and
+    Tasks, each capped to a handful of results. Server-side so the frontend
+    never has to ship every project's full data down just to filter it
+    client-side.
+
+    Shape follows the "Website Search Journey" design Ayush shared (30
+    Sep): type a few words -> grouped suggestions -> pick a Project/Person/
+    Topic/File result -> land on a destination that shows provenance
+    ("N source items", "Last indexed: <date>") and freshness. Concretely:
+      - "projects": name/one_liner/related_people matches; each carries
+        file_count + last_indexed so the palette can show "12 files ·
+        updated 2 days ago" per the wireframe's "Evidence links" line.
+      - "stakeholders" ("Person" in the design): grouped by person, one
+        entry per name with the list of projects they appear in - "Projects
+        worked with <name>", not a standalone profile page, matching the
+        design's own behavior contract ("Person opens related projects,
+        not a profile").
+      - "topics" ("Topic" in the design): CONTENT matches inside a file's
+        extracted text, each with a real excerpt of the matched passage
+        (see _search_snippet) plus last_indexed - the "cited matches" the
+        wireframe shows (e.g. "Kickoff notes.pdf | ...matched text...").
+        Deliberately shows a text excerpt, not a fabricated page/timestamp
+        number this app has no reliable way to compute for arbitrary files.
+      - "files" ("File" in the design): FILENAME matches - a file can
+        appear in both "files" (name matched) and "topics" (content
+        matched); that's two true, independent statements about the same
+        file, not a duplicate bug.
+      - "tasks": kept as a 5th, additional category beyond the design's
+        four - dropping working task search wasn't asked for, and the
+        wireframe's own suggestion list is captioned "vary by query", not a
+        closed set.
+    "Permissions filter results before they appear" (the design's own
+    behavior contract): this app has no per-project ACL - every logged-in
+    user already sees every project (a single shared internal tool, not
+    multi-tenant) - so the one real permission gate is DRF's own
+    IsAuthenticated default on this view; there is no finer-grained
+    filtering to add without a real per-project ownership model that
+    doesn't exist yet.
+
+    Rewritten 30 Sep (Ayush, real bug report + explicit spec): tokenizing
+    the query and requiring every token to appear somewhere (any order, any
+    field) so multi-word queries match regardless of word order or which
+    field carries which word. Deliberately still no LLM anywhere in here -
+    every match is a plain, fast substring check per token, same "less LLM,
+    more code" rule as the rest of this app.
+
+    Deliberately does NOT reach into not-yet-routed RecordingEvents
+    (needs_review/pending_new_project) - Ayush's own correction, same day:
+    "remove the overall search thing in the transcript screen because both
+    are different". Triaging a brand-new, untagged recording is a
+    different activity from finding something you already know exists;
+    those stay exclusively on the Transcripts page's own list + quick-tag
+    flow, not blended into this general-purpose search."""
+
+    def get(self, request):
+        empty = {"projects": [], "stakeholders": [], "topics": [], "files": [], "tasks": []}
+        q = (request.query_params.get("q") or "").strip()
+        tokens = [t for t in q.lower().split() if t]
+        if not tokens:
+            return Response(empty)
+
+        def all_tokens_q(*field_names):
+            """AND across tokens, OR across the given fields per token - so
+            a multi-word query matches regardless of which field carries
+            which word, and regardless of the words' order."""
+            combined = Q()
+            for i, tok in enumerate(tokens):
+                tok_q = Q()
+                for field in field_names:
+                    tok_q |= Q(**{f"{field}__icontains": tok})
+                combined = tok_q if i == 0 else combined & tok_q
+            return combined
+
+        project_qs = Topic.objects.filter(
+            all_tokens_q("name", "one_liner", "related_people")
+        ).prefetch_related("files")[:8]
 
         # Attendee names live inside ExtractedMeta.attendees, a JSON list -
         # SQLite has no clean "does this list contain a substring" query via
         # the ORM, so this filters in Python. Bounded to a few hundred rows
         # (one per ingested file that looked like a meeting, not per byte of
         # file content), which is fine at this app's real scale.
-        stakeholder_hits = []
-        seen = set()
+        people = {}  # lower(name) -> {"name": real-cased name, "projects": [...]}
         metas = ExtractedMeta.objects.exclude(attendees=[]).select_related(
             "ingested_file__topic"
         )[:300]
         for m in metas:
-            for name in m.attendees or []:
-                if q.lower() in name.lower():
-                    key = (name.lower(), m.ingested_file.topic_id)
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    stakeholder_hits.append(
-                        {
-                            "name": name,
-                            "topic_id": m.ingested_file.topic_id,
-                            "topic_name": m.ingested_file.topic.name,
-                        }
-                    )
-            if len(stakeholder_hits) >= 8:
+            for name in extraction.clean_attendees(m.attendees):
+                lname = name.lower()
+                if not all(tok in lname for tok in tokens):
+                    continue
+                entry = people.setdefault(lname, {"name": name, "projects": [], "_seen_topics": set()})
+                topic_id = m.ingested_file.topic_id
+                if topic_id in entry["_seen_topics"]:
+                    continue
+                entry["_seen_topics"].add(topic_id)
+                entry["projects"].append(
+                    {"topic_id": topic_id, "topic_name": m.ingested_file.topic.name}
+                )
+            if len(people) >= 8:
                 break
+        for entry in people.values():
+            del entry["_seen_topics"]
 
-        tasks = Task.objects.filter(title__icontains=q).select_related("topic")[:8]
-        files = IngestedFile.objects.filter(display_name__icontains=q).select_related("topic")[:8]
+        tasks = Task.objects.filter(all_tokens_q("title")).select_related("topic")[:8]
+
+        # Files - filename match only ("File" in the design). Content
+        # matches are a separate query below ("Topic" in the design), even
+        # though both read from the same IngestedFile table.
+        name_files = IngestedFile.objects.filter(
+            all_tokens_q("display_name")
+        ).select_related("topic")[:8]
+
+        content_files = IngestedFile.objects.filter(
+            all_tokens_q("extracted_text")
+        ).select_related("topic")[:8]
 
         return Response(
             {
                 "projects": [
-                    {"id": t.id, "name": t.name, "one_liner": t.one_liner, "topic_type": t.topic_type}
-                    for t in projects
+                    {
+                        "id": t.id,
+                        "name": t.name,
+                        "one_liner": t.one_liner,
+                        "topic_type": t.topic_type,
+                        "file_count": len(t.files.all()),
+                        "last_indexed": (
+                            max((f.last_ingested_at for f in t.files.all()), default=None).isoformat()
+                            if t.files.all()
+                            else None
+                        ),
+                    }
+                    for t in project_qs
                 ],
-                "stakeholders": stakeholder_hits[:8],
+                "stakeholders": list(people.values())[:8],
                 "tasks": [
                     {"id": t.id, "title": t.title, "topic_id": t.topic_id, "topic_name": t.topic.name}
                     for t in tasks
@@ -1239,11 +1817,44 @@ class GlobalSearchView(APIView):
                         "display_name": f.display_name or f.path,
                         "topic_id": f.topic_id,
                         "topic_name": f.topic.name,
+                        "last_indexed": f.last_ingested_at.isoformat(),
                     }
-                    for f in files
+                    for f in name_files
+                ],
+                "topics": [
+                    {
+                        "id": f.id,
+                        "display_name": f.display_name or f.path,
+                        "topic_id": f.topic_id,
+                        "topic_name": f.topic.name,
+                        "snippet": _search_snippet(f.extracted_text, tokens),
+                        "last_indexed": f.last_ingested_at.isoformat(),
+                    }
+                    for f in content_files
                 ],
             }
         )
+
+
+class SearchLogView(APIView):
+    """POST-only: records one search outcome (see models.SearchLog) so
+    Venki/Ayush can browse real search queries and their outcomes later in
+    Django admin and improve the matching logic from real usage instead of
+    guessing. A logging failure must never break search itself - this
+    view's only job is to persist a row, so any bad/missing field is
+    coerced to a safe default rather than raising."""
+
+    def post(self, request):
+        topic_id = request.data.get("topic_id") or None
+        SearchLog.objects.create(
+            query=(request.data.get("query") or "")[:300],
+            result_count=int(request.data.get("result_count") or 0),
+            chosen_kind=request.data.get("chosen_kind") or "none",
+            chosen_label=(request.data.get("chosen_label") or "")[:300],
+            topic_id=topic_id,
+            user=request.user if request.user.is_authenticated else None,
+        )
+        return Response({"ok": True})
 
 
 class StatsView(APIView):
@@ -1264,7 +1875,11 @@ class StatsView(APIView):
 
 
 class SettingsView(APIView):
-    KEYS = ["llm_provider", "llm_api_key", "llm_model", "llm_base_url", "default_directory", "stale_after_days"]
+    KEYS = [
+        "llm_provider", "llm_api_key", "llm_model", "llm_base_url", "default_directory", "stale_after_days",
+        "recordings_watch_folder", "recordings_suggest_new_topics", "transcription_engine",
+        "external_transcription_url", "manual_drop_folder",
+    ]
 
     def get(self, request):
         data = _current_llm_settings()
@@ -1278,7 +1893,7 @@ class SettingsView(APIView):
         return Response(data)
 
     def post(self, request):
-        denied = _require_admin(request)
+        denied = _require_settings_password(request)
         if denied:
             return denied
         for k in self.KEYS:
@@ -1295,6 +1910,19 @@ class SettingsView(APIView):
                 continue
             Settings.set(k, value)
         return Response({"saved": True})
+
+
+class SettingsUnlockView(APIView):
+    """Checks the settings password without saving anything, so the Settings
+    page can unlock its fields only after the right password is typed. The
+    unlock itself lives only in the page (nothing is remembered on the server):
+    every save re-sends the password and SettingsView.post checks it again."""
+
+    def post(self, request):
+        denied = _require_settings_password(request)
+        if denied:
+            return denied
+        return Response({"ok": True})
 
 
 class LoopViewSet(viewsets.ModelViewSet):
@@ -1314,6 +1942,376 @@ class LoopViewSet(viewsets.ModelViewSet):
         result = _ask_global(loop.question)
         Loop.objects.filter(id=loop.id).update(last_run_at=timezone.now(), run_count=F("run_count") + 1)
         return Response(result)
+
+
+class RecordingEventViewSet(viewsets.ReadOnlyModelViewSet):
+    """The Transcripts page's activity feed - every file the central
+    Recordings-folder watcher (core/recordings.py) has ever found, whatever
+    it did with it. Read-only except for assign_topic, the one write action
+    a person actually needs: manually routing a 'needs_review' recording
+    once the automatic match/auto-create pipeline couldn't confidently
+    decide on its own."""
+
+    queryset = RecordingEvent.objects.select_related("topic", "ingested_file").all()
+    serializer_class = RecordingEventSerializer
+
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        if self.action == "list":
+            context["omit_speaker_turns"] = True
+        return context
+
+    def retrieve(self, request, *args, **kwargs):
+        """Detail page: if the transcript has text but no speaker turns yet, prepare
+        them once - inline for Teams-format text (no LLM), in the background
+        through the API model for Whisper text when a key is configured. The
+        response says speaker_turns_generating=true while that runs."""
+        event = self.get_object()
+        recordings.ensure_speaker_turns(event, background=True)
+        event.refresh_from_db()
+        return Response(self.get_serializer(event).data)
+
+    @action(detail=True, methods=["post"], url_path="rename_speaker")
+    def rename_speaker(self, request, pk=None):
+        """Renames one speaker label across all turns of this event, e.g.
+        {"old": "Speaker 1", "new": "Gokul"}; renamed turns are marked edited."""
+        event = self.get_object()
+        old = str(request.data.get("old") or "").strip()
+        new = " ".join(str(request.data.get("new") or "").split())
+        if not old or not new:
+            return Response({"error": "old and new are required"}, status=400)
+        if len(new) > 60:
+            return Response({"error": "A speaker name can be at most 60 characters."}, status=400)
+        changed = recordings.rename_speaker(event, old, new)
+        if not changed:
+            return Response({"error": f"No turns are labelled '{old}'."}, status=404)
+        event.refresh_from_db()
+        return Response({**RecordingEventSerializer(event).data, "renamed_turns": changed})
+
+    @action(detail=False, methods=["post"], parser_classes=[MultiPartParser])
+    def upload(self, request):
+        """The dashboard/Transcripts page's real drag-and-drop upload widget
+        - Venki's original ask, 30 Sep meeting: "I drag and drop a bunch of
+        files into the web interface... give me a multi-file interface."
+        The manual_drop_folder Setting only ever covered files dropped by
+        hand into a watched folder; this is the actual in-browser version of
+        the same idea. Saves each upload into that same configured folder
+        (so it behaves identically to one dropped there by hand) or, if
+        that Setting is still empty, into MEDIA_ROOT/manual_uploads/ so the
+        feature works before anyone's configured a folder at all. Runs
+        process_new_recording() synchronously per file - same cost the
+        folder-watcher already pays for transcription - so the response
+        carries each file's resulting RecordingEvent immediately."""
+        files = request.FILES.getlist("files")
+        if not files:
+            return Response({"error": "files is required"}, status=400)
+
+        # A project is REQUIRED at upload time - there is no holding area.
+        raw_topic_id = (request.data.get("topic_id") or "").strip() if isinstance(
+            request.data.get("topic_id"), str
+        ) else request.data.get("topic_id")
+        if not raw_topic_id:
+            return Response(
+                {"error": "Choose a project for these files first - every upload must go into a project."},
+                status=400,
+            )
+        try:
+            target_topic = Topic.objects.filter(pk=int(raw_topic_id)).first()
+        except (TypeError, ValueError):
+            target_topic = None
+        if target_topic is None:
+            return Response(
+                {"error": "That project doesn't exist - choose an existing project for these files."},
+                status=400,
+            )
+
+        # A real, hard cap - not arbitrary caution: dropping a whole folder
+        # was tried for real (Ayush, 30 Sep) and produced "Failed to fetch"
+        # - one giant multipart request holding many files open, each
+        # transcribed/extracted synchronously one at a time, comfortably
+        # outran the browser's own request timeout with no response ever
+        # sent back, which is indistinguishable from a network failure on
+        # the client. A clear 400 for "too many at once" beats a silent,
+        # unexplained connection drop.
+        MAX_FILES_PER_UPLOAD = 25
+        if len(files) > MAX_FILES_PER_UPLOAD:
+            return Response(
+                {
+                    "error": f"That's {len(files)} files at once - please drop {MAX_FILES_PER_UPLOAD} or "
+                    "fewer at a time (each one is transcribed/read synchronously, so a very large batch "
+                    "can time out before any of them finish)."
+                },
+                status=400,
+            )
+
+        target_dir = Settings.get("manual_drop_folder", "").strip()
+        if not target_dir:
+            target_dir = os.path.join(django_settings.MEDIA_ROOT, "manual_uploads")
+        os.makedirs(target_dir, exist_ok=True)
+
+        results = []
+        touched_topic_ids = set()
+        for upload in files:
+            # Folder drops can include directory-entry placeholders and
+            # zero-byte junk (.DS_Store, desktop.ini, a bare folder name
+            # with no extension) depending on the browser's own drag-and-drop
+            # implementation - skip anything that isn't a real file with
+            # content rather than let it corrupt the batch.
+            if not upload.name or upload.size == 0:
+                continue
+            # A file type nothing here can even attempt to read (code,
+            # images, configs, .zip, etc. swept up in a real folder drop -
+            # Ayush's own correction, 30 Sep, after a whole project folder
+            # produced ~300 permanent "Couldn't read this file" rows: "dont
+            # add unreadable file make the system like that"). Never saved,
+            # never given a RecordingEvent row at all - just reported back
+            # in this response so the person doing THIS upload still knows
+            # it was skipped, without it becoming a standing Dashboard item
+            # anyone has to go dismiss.
+            upload_ext = os.path.splitext(upload.name)[1].lower()
+            if upload_ext not in ingestion.SUPPORTED_EXTENSIONS:
+                results.append(
+                    {
+                        "file_path": upload.name,
+                        "file_name": os.path.basename(upload.name),
+                        "skipped": True,
+                        "reason": f"Unsupported file type ({upload_ext or 'no extension'}) - not added.",
+                    }
+                )
+                continue
+            try:
+                safe_name = os.path.basename(upload.name.replace("\\", "_").replace("/", "_"))
+                dest_path = os.path.join(target_dir, safe_name)
+                # Never clobber an existing file with the same name.
+                stem, ext = os.path.splitext(dest_path)
+                n = 1
+                while os.path.exists(dest_path):
+                    dest_path = f"{stem} ({n}){ext}"
+                    n += 1
+                with open(dest_path, "wb") as f:
+                    for chunk in upload.chunks():
+                        f.write(chunk)
+                # A plain document (proposal, quotation, email, spreadsheet...) is
+                # filed under its own name - not turned into a "<name> -
+                # Transcript.txt" copy and a Transcripts-page recording. Only
+                # audio/video and transcript-shaped text take the recording path.
+                if not recordings.is_recording_or_transcript(dest_path):
+                    doc, doc_error = recordings.ingest_document(
+                        target_topic, dest_path, display_name=safe_name
+                    )
+                    touched_topic_ids.add(target_topic.id)
+                    results.append(
+                        {
+                            "id": None,
+                            "document": True,
+                            "file_path": dest_path,
+                            "file_name": safe_name,
+                            "topic": target_topic.id,
+                            "topic_name": target_topic.name,
+                            "ingested_file": doc.id,
+                            "status": "routed",
+                            "detail": f"Added to '{target_topic.name}' as a document (not a recording).",
+                            "error": doc_error,
+                        }
+                    )
+                    continue
+                # refresh_brief=False here on purpose - see _ingest_into_topic's
+                # own docstring. One LLM brief call per file in a big batch is
+                # exactly what caused the real "Failed to fetch" bug; every
+                # topic that actually received a file gets exactly one
+                # refresh below, after the whole batch is done.
+                recordings.process_new_recording(
+                    dest_path, source="manual_drop", allow_llm_routing=False, refresh_brief=False,
+                    target_topic=target_topic,
+                )
+                event = RecordingEvent.objects.filter(file_path=dest_path).first()
+                if event and event.topic_id:
+                    touched_topic_ids.add(event.topic_id)
+                results.append(
+                    RecordingEventSerializer(event).data
+                    if event
+                    else {"file_path": dest_path, "error": "Processing failed."}
+                )
+            except Exception as exc:  # noqa: BLE001 - one bad file must never sink the whole batch
+                logger.exception("Upload: failed to save/process %s", upload.name)
+                results.append({"file_path": upload.name, "error": str(exc)[:300]})
+
+        if touched_topic_ids:
+            for topic in Topic.objects.filter(id__in=touched_topic_ids):
+                try:
+                    _ask_topic(topic, CONTEXT_BRIEF_QUESTION)
+                except Exception:  # noqa: BLE001 - the upload itself already succeeded either way
+                    logger.exception("Upload: brief refresh failed for topic %s", topic.id)
+
+        return Response({"results": results})
+
+    @action(detail=True, methods=["post"])
+    def dismiss(self, request, pk=None):
+        """The corner "x" on a pending transcript card - Ayush's own ask,
+        30 Sep: "add a cross option in the corner to not assign and remove
+        this card". Never a hard delete - keeps the row (status='dismissed')
+        so the Transcripts/Dashboard "needs review" lists stop showing it
+        permanently, without silently losing the record of what happened to
+        this file, matching this pipeline's own "every file gets exactly one
+        RecordingEvent row, honest about the outcome" rule."""
+        event = self.get_object()
+        event.status = "dismissed"
+        event.detail = "Dismissed - not tracked."
+        event.pending_extracted_text = ""
+        event.save()
+        return Response(RecordingEventSerializer(event).data)
+
+    @action(detail=False, methods=["post"], url_path="bulk_dismiss")
+    def bulk_dismiss(self, request):
+        """Same dismiss as above, applied to many rows in one request -
+        Ayush's own real complaint, 30 Sep, after a whole project folder of
+        source files landed as ~50 individual 'Couldn't read this file'
+        cards: "everytime i have to click cross cross... make it simple
+        like multi select". One clean UPDATE rather than N round-trips."""
+        event_ids = request.data.get("event_ids") or []
+        if not event_ids:
+            return Response({"error": "event_ids is required"}, status=400)
+        updated = RecordingEvent.objects.filter(id__in=event_ids).update(
+            status="dismissed", detail="Dismissed - not tracked.", pending_extracted_text=""
+        )
+        return Response({"dismissed_count": updated})
+
+    @action(detail=True, methods=["post"])
+    def assign_topic(self, request, pk=None):
+        event = self.get_object()
+        topic = get_object_or_404(Topic, pk=request.data.get("topic_id"))
+        if event.ingested_file:
+            # Already real, ingested content - just repoint the existing
+            # row to the new topic. Re-running _ingest_into_topic here would
+            # write a SECOND transcript file + a second IngestedFile row,
+            # leaving the original behind as an orphaned duplicate.
+            obj = event.ingested_file
+            if obj.topic_id != topic.id:
+                obj.topic = topic
+                obj.save(update_fields=["topic"])
+                _ask_topic(topic, CONTEXT_BRIEF_QUESTION)
+        else:
+            # Never ingested before (an older-style needs_review event with
+            # no IngestedFile yet) - first real ingest.
+            text = event.pending_extracted_text
+            if not text:
+                try:
+                    text = ingestion.extract_text(event.file_path)
+                except Exception as exc:  # noqa: BLE001 - report it, don't 500
+                    return Response({"error": f"Could not read this recording: {exc}"}, status=400)
+            obj = recordings._ingest_into_topic(topic, event.file_path, text)
+        event.topic = topic
+        event.ingested_file = obj
+        event.status = "routed"
+        event.detail = "Manually assigned."
+        event.pending_extracted_text = ""
+        event.save()
+        return Response(RecordingEventSerializer(event).data)
+
+    @action(detail=True, methods=["post"], url_path="confirm_new_project")
+    def confirm_new_project(self, request, pk=None):
+        """The approve half of the human-in-the-loop gate on new-project
+        creation - a person may edit the suggested name/one-liner/type
+        before it becomes real, so the request body's fields (all optional)
+        override the LLM's own suggestion rather than replace it blindly."""
+        event = self.get_object()
+        if event.status != "pending_new_project":
+            return Response({"error": "This recording has no pending new-project suggestion."}, status=400)
+        name = (request.data.get("name") or "").strip() or None
+        one_liner = request.data.get("one_liner")
+        if one_liner is not None:
+            one_liner = one_liner.strip()
+        topic_type = (request.data.get("topic_type") or "").strip() or None
+        try:
+            event = recordings.confirm_new_project(event, name=name, one_liner=one_liner, topic_type=topic_type)
+        except Exception as exc:  # noqa: BLE001 - report it, don't 500
+            return Response({"error": f"Could not create the project: {exc}"}, status=400)
+        return Response(RecordingEventSerializer(event).data)
+
+    @action(detail=True, methods=["post"], url_path="reject_new_project")
+    def reject_new_project(self, request, pk=None):
+        event = self.get_object()
+        if event.status != "pending_new_project":
+            return Response({"error": "This recording has no pending new-project suggestion."}, status=400)
+        event = recordings.reject_new_project(event)
+        return Response(RecordingEventSerializer(event).data)
+
+    @action(detail=True, methods=["post"], url_path="create_project")
+    def create_project(self, request, pk=None):
+        """The manual counterpart to confirm_new_project - a person deciding
+        ON THEIR OWN that a recording deserves its own project, rather than
+        only ever reacting to the LLM router's own suggestion. Works from
+        ANY status (needs_review, pre_existing, even routed/error) as long
+        as the recording's text is retrievable - recordings.
+        confirm_new_project already falls back to re-transcribing from
+        event.file_path when no text is cached yet, so a never-processed
+        'pre_existing' recording works here too, on demand, without a
+        separate 'process it first' step. Requires an explicit name (no
+        LLM suggestion to fall back to)."""
+        event = self.get_object()
+        name = (request.data.get("name") or "").strip()
+        if not name:
+            return Response({"error": "A project name is required."}, status=400)
+        one_liner = (request.data.get("one_liner") or "").strip()
+        topic_type = (request.data.get("topic_type") or "").strip() or "project"
+        try:
+            event = recordings.confirm_new_project(event, name=name, one_liner=one_liner, topic_type=topic_type)
+        except Exception as exc:  # noqa: BLE001 - report it, don't 500
+            return Response({"error": f"Could not create the project: {exc}"}, status=400)
+        return Response(RecordingEventSerializer(event).data)
+
+    @action(detail=True, methods=["get"])
+    def text(self, request, pk=None):
+        """The transcript detail page's raw-text panel - whatever text
+        currently represents this recording (see recordings.
+        _current_transcript_text's own docstring for why that's two
+        different fields depending on status)."""
+        event = self.get_object()
+        text = event.ingested_file.extracted_text if event.ingested_file else event.pending_extracted_text
+        return Response({"text": text})
+
+    @action(detail=True, methods=["post"], url_path="generate_summary")
+    def generate_summary(self, request, pk=None):
+        """The detail page's 'Generate Summary'/'Regenerate' button - never
+        run automatically, only from this explicit click. Code-based, not
+        an LLM call (see recordings.generate_summary_for_event's own
+        docstring) - is_llm/message are kept in the response shape for the
+        frontend's sake but are always False/None now."""
+        event = self.get_object()
+        event, is_llm, message = recordings.generate_summary_for_event(event)
+        return Response({**RecordingEventSerializer(event).data, "is_llm": is_llm, "message": message})
+
+    @action(detail=True, methods=["post"])
+    def diarize(self, request, pk=None):
+        """The detail page's 'Diarize' button - asks the local model (see
+        recordings.diarize_event) to produce the structured participants/
+        decisions/action-items/parked-items/per-speaker breakdown."""
+        event = self.get_object()
+        event, succeeded, message = recordings.diarize_event(event)
+        return Response(
+            {**RecordingEventSerializer(event).data, "succeeded": succeeded, "message": message}
+        )
+
+    @action(detail=True, methods=["post"], url_path="generate_transcript")
+    def generate_transcript(self, request, pk=None):
+        """The detail page's 'Generate Transcript' button - speaker name +
+        timestamp + speech, per turn (see recordings.generate_speaker_transcript)."""
+        event = self.get_object()
+        event, succeeded, message = recordings.generate_speaker_transcript(event)
+        return Response(
+            {**RecordingEventSerializer(event).data, "succeeded": succeeded, "message": message}
+        )
+
+    @action(detail=True, methods=["post"], url_path="save_summary")
+    def save_summary(self, request, pk=None):
+        """The detail page's 'Save to project folder' button - only
+        meaningful once this recording has a topic assigned; generating a
+        summary already persists it to the database on its own."""
+        event = self.get_object()
+        dest_path, error = recordings.save_summary_to_project(event)
+        if error:
+            return Response({"error": error}, status=400)
+        return Response({"saved_to": dest_path})
 
 
 def _topic_brief(topic):
@@ -1417,12 +2415,15 @@ class ResolveOnlyView(APIView):
 
 BRIEF_HTML_STYLE = """
 body{font-family:-apple-system,'Open Sans',Segoe UI,sans-serif;background:#faf9f5;color:#2a2a28;
-  max-width:780px;margin:0 auto;padding:32px 24px 60px}
+  max-width:1180px;margin:0 auto;padding:32px 32px 60px}
 .eyebrow{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:#8a8578}
 h1{font-size:26px;margin:4px 0 18px;color:#1a1a1a}
 .badge{display:inline-block;font-size:11px;font-weight:600;padding:2px 9px;border-radius:999px;
   background:#e6f6f6;color:#0a6e6e;margin-left:8px;vertical-align:middle}
-.card{background:#fff;border:1px solid #e8e5da;border-radius:10px;padding:20px 22px;margin-bottom:20px}
+.view-full-project{float:right;font-size:12.5px;font-weight:600;color:#0096af;text-decoration:none;
+  border:1px solid #cdeaea;background:#f2fbfb;border-radius:6px;padding:5px 12px;vertical-align:middle}
+.view-full-project:hover{background:#e6f6f6}
+.card{background:#fff;border:1px solid #e8e5da;border-radius:10px;padding:24px 28px;margin-bottom:20px}
 .answer{white-space:pre-wrap;line-height:1.55;font-size:14.5px}
 .note{font-size:12px;color:#9a6a1a;background:#fff6e6;border:1px solid #f0dcae;border-radius:6px;
   padding:8px 12px;margin-bottom:14px}
@@ -1432,21 +2433,77 @@ h2{font-size:13px;text-transform:uppercase;letter-spacing:.04em;color:#6b6658;ma
 .edit-link{flex:none;font-size:11px;font-weight:600;color:#0096af;text-decoration:none;
   border:1px solid #cdeaea;border-radius:999px;padding:1px 9px;white-space:nowrap}
 .edit-link:hover{background:#e6f6f6}
-.answer-summary{font-size:15px;line-height:1.5;color:#1a1a1a;margin:0 0 18px;padding-bottom:16px;
-  border-bottom:1px solid #eee}
+.answer-summary{font-size:15.5px;line-height:1.55;color:#1a1a1a;margin:0 0 18px;padding-bottom:16px;
+  border-bottom:1px solid #eee;max-width:760px}
 .brief-section{margin-bottom:16px}
 .brief-section h3{font-size:11.5px;text-transform:uppercase;letter-spacing:.04em;color:#0096af;
   margin:0 0 4px;font-weight:700}
-.para{font-size:14px;line-height:1.55;color:#2a2a28;margin:0 0 4px;white-space:pre-wrap}
+.para{font-size:14px;line-height:1.55;color:#2a2a28;margin:0 0 4px;white-space:pre-wrap;max-width:760px}
 .para-src{display:flex;flex-wrap:wrap;gap:6px;margin:0}
 .para-src .edit-link{color:#8a8578;border-color:#e8e5da;font-weight:500}
 .para-src .edit-link:hover{background:#f3f1ea;color:#0096af;border-color:#cdeaea}
-.tl-item{border-left:2px solid #e8e5da;padding:2px 0 14px 16px;margin-left:2px;position:relative}
-.tl-item::before{content:'';position:absolute;left:-5px;top:6px;width:8px;height:8px;border-radius:50%;
-  background:#0096af}
-.tl-date{font-size:11px;color:#9a9587}
-.tl-title{font-size:13.5px;font-weight:600;margin:2px 0 3px}
-.tl-body{font-size:12.5px;color:#57534a;line-height:1.5}
+.exec-eyebrow{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;
+  color:#0096af;margin:0 0 6px}
+
+/* Three columns, per the sketch: Stakeholders + Key State (left) - the
+   prompt result and its supporting detail (middle) - a NARROW Project
+   Timeline (right). */
+.three-col{display:flex;gap:28px;align-items:flex-start}
+.three-col .col-a{flex:0 0 230px}
+.three-col .col-b{flex:1;min-width:0;padding-top:2px}
+.three-col .col-c{flex:0 0 300px;min-width:0}
+.three-col h3{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:#6b6658;
+  margin:0 0 12px;font-weight:700;display:flex;align-items:center;gap:6px}
+.three-col .col-a h3.key-state-h3{margin-top:22px}
+
+.stakeholder-list{display:flex;flex-direction:column;gap:8px}
+.stakeholder-row{display:flex;align-items:center;gap:10px;background:#fff;border:1px solid #ece8db;
+  border-radius:10px;padding:8px 11px}
+.avatar{width:30px;height:30px;border-radius:50%;flex:none;display:flex;align-items:center;
+  justify-content:center;color:#fff;font-size:11.5px;font-weight:700;letter-spacing:.02em}
+.stakeholder-name{font-size:13px;font-weight:600;color:#332f27}
+
+.key-state-list{display:flex;flex-direction:column;gap:0;background:#fff;border:1px solid #ece8db;
+  border-radius:10px;overflow:hidden}
+.key-state-row{display:flex;justify-content:space-between;align-items:center;font-size:12px;
+  padding:8px 11px;border-bottom:1px solid #f3f1ea}
+.key-state-row:last-child{border-bottom:none}
+.key-state-row span:first-child{color:#57534a}
+.ks-val{font-weight:700;color:#221f19}
+.ks-val.ks-empty{font-weight:500;color:#b5b0a2;font-size:11px}
+
+/* Compact timeline: a <details> accordion per row - just the date + title
+   until clicked ("when i click any timeline title then it should drop
+   down with the details"), no permanently-visible body text. */
+.timeline{position:relative;max-height:560px;overflow-y:auto;padding-right:8px;margin-right:-8px}
+.tl-item{position:relative;padding:0 0 10px 22px}
+.tl-item:last-child{padding-bottom:0}
+.tl-item::after{content:'';position:absolute;left:5px;top:16px;bottom:0;width:2px;background:#ece8db}
+.tl-item:last-child::after{display:none}
+.tl-dot{position:absolute;left:0;top:5px;width:10px;height:10px;border-radius:50%;
+  border:2px solid #faf9f5;box-shadow:0 0 0 1px rgba(0,0,0,.06)}
+.tl-item--meeting .tl-dot{background:#0096af}
+.tl-item--status .tl-dot{background:#7c5cbf}
+.tl-card{display:block}
+.tl-card summary{cursor:pointer;list-style:none}
+.tl-card summary::-webkit-details-marker{display:none}
+.tl-card summary:hover .tl-title{color:#0096af}
+.tl-date{display:block;font-size:10px;font-weight:700;color:#9a9587;margin-bottom:2px}
+.tl-title{display:block;font-size:12.5px;font-weight:600;color:#221f19;line-height:1.4}
+.tl-body{font-size:12px;color:#57534a;line-height:1.5;margin:6px 0 0;padding-left:1px}
+
+/* "Relevant Topics for the Prompt" - the per-field detail, laid out as a
+   responsive multi-column grid instead of one long stacked column, now
+   that the page has real width to spend. */
+.sections-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));
+  gap:4px 28px}
+
+@media(max-width:900px){
+  body{padding:24px 18px 48px}
+  .three-col{flex-direction:column;gap:24px}
+  .three-col .col-a, .three-col .col-c{flex:none;width:100%}
+  .sections-grid{grid-template-columns:1fr}
+}
 """
 
 
@@ -1456,12 +2513,17 @@ h2{font-size:13px;text-transform:uppercase;letter-spacing:.04em;color:#6b6658;ma
 # gap this same rendering rewrite closes alongside the source-attribution one).
 _BRIEF_SECTION_LABELS = [
     ("why_now", "Why now"),
-    ("current_state", "Current state"),
+    ("current_state", "Current Position"),
     ("history", "History"),
     ("customer_thoughts", "What the customer thinks"),
-    ("promises_made", "Commitments & open loops"),
-    ("next_step", "Recommended next step"),
-    ("risks_and_gaps", "Risks & gaps"),
+    ("customer_need", "Customer need"),
+    ("proposed_solution", "Proposed solution"),
+    ("latest_updates", "Latest updates"),
+    ("decisions_made", "Decisions made"),
+    ("meeting_prep", "Meeting prep"),
+    ("promises_made", "Waiting"),
+    ("next_step", "Next"),
+    ("risks_and_gaps", "Open questions"),
 ]
 
 
@@ -1485,6 +2547,15 @@ _TIMELINE_HEADLINE_PRIORITY = [
 def _truncate(text, limit=110):
     text = (text or "").strip().replace("\n", " ")
     return text if len(text) <= limit else text[:limit].rstrip() + "…"
+
+
+# Python port of the frontend's toBullets (page.js) - used to count how many
+# risk bullets a summary has, for the HTML brief's Key State stat.
+def _count_bullets(text):
+    if not text:
+        return 0
+    lines = [re.sub(r"^[-•]\s*", "", ln).strip() for ln in text.split("\n")]
+    return len([ln for ln in lines if ln])
 
 
 # Short (~3-4 word), specific timeline titles for meetings - deterministic
@@ -1519,7 +2590,13 @@ def _dedupe_meetings(metas):
     best = {}
     order = []
     for m in metas:
-        key = (m.meeting_date, _meeting_timeline_title(m.meeting_title).lower())
+        if m.meeting_type:
+            # A typed meeting ("Discovery 2") is only the same meeting as one
+            # with the same full title, type and sequence - the 4-word title
+            # alone would merge two different calls held on the same day.
+            key = (m.meeting_date, (m.meeting_title or "").strip().lower(), m.meeting_type, m.meeting_sequence)
+        else:
+            key = (m.meeting_date, _meeting_timeline_title(m.meeting_title).lower())
         score = len(m.attendees or []) + len(m.agenda or "") + len(m.achieved or "")
         if key not in best or score > best[key][0]:
             if key not in best:
@@ -1547,36 +2624,160 @@ def _summary_timeline_entry(s):
     return title, _truncate(body)
 
 
-def _brief_html_page(topic, answer, summary=None):
-    tl_meetings = _dedupe_meetings(
-        ExtractedMeta.objects.filter(ingested_file__topic=topic)
-        .select_related("ingested_file")
-        .order_by(F("meeting_date").desc(nulls_last=True), "-ingested_file__first_added_at")
-    )[:8]
-    tl_summaries = topic.summaries.all()[:8]  # CaseSummary.Meta.ordering = ["-generated_at"]
+# Python port of the frontend's nameWords/dedupeNames (topics/[id]/page.js) -
+# kept in lockstep deliberately so the HTML brief's stakeholder list never
+# drifts from what the Context Node page shows for the same topic. See that
+# file's own comment for why longest-name-wins: the same person shows up
+# inconsistently across transcripts ("Ayush" / "Ayush Sinha" / "Ayush Sinha
+# A"), and a shorter name whose every word appears in a longer one is the
+# same person named less fully.
+def _name_words(name):
+    return re.findall(r"[a-z0-9]+", name.lower())
 
-    timeline_events = []
-    for m in tl_meetings:
+
+def _dedupe_names(names):
+    unique = list(dict.fromkeys(names))
+    ordered = sorted(unique, key=lambda n: -len(_name_words(n)))
+    kept = []
+    for name in ordered:
+        words = _name_words(name)
+        covered = any(all(w in _name_words(k) for w in words) for k in kept)
+        if not covered:
+            kept.append(name)
+    return kept
+
+
+def _collect_stakeholders(topic, metas):
+    names = set()
+    for m in metas:
+        for a in extraction.clean_attendees(m.attendees):
+            names.add(a)
+    for n in (topic.related_people or "").split(","):
+        n = n.strip()
+        if n:
+            names.add(n)
+    return _dedupe_names(list(names))
+
+
+# A small, distinct palette so the stakeholder list reads as designed rather
+# than one flat repeated color - picked deterministically from the name so
+# the same person always gets the same avatar color across page loads.
+_AVATAR_PALETTE = ["#0096af", "#7c5cbf", "#d0811c", "#3a8f5f", "#c0517a", "#5a6b8c"]
+
+
+def _avatar_style(name):
+    color = _AVATAR_PALETTE[sum(ord(c) for c in name) % len(_AVATAR_PALETTE)]
+    words = [w for w in re.split(r"\s+", name.strip()) if w]
+    initials = "".join(w[0].upper() for w in words[:2]) or "?"
+    return color, initials
+
+
+# A compact vertical timeline for the HTML brief page (per the pasted design
+# reference: a simple dot-and-line, date-labeled vertical timeline) - reuses
+# the exact same dedup/label logic already built for the React dashboard's
+# summary_history/meeting_metadata actions (_dedupe_meetings,
+# _meeting_timeline_title, _summary_timeline_entry) so the two surfaces never
+# drift apart. Newest first, capped so this stays a snapshot, not a full log
+# - the React Project Timeline is still the place for the complete history.
+def _brief_timeline_entries(topic, metas, limit=6):
+    entries = []
+    for m in _dedupe_meetings(metas):
         if not m.meeting_date:
             continue
-        timeline_events.append(
+        entries.append(
             {
-                "sort": m.meeting_date.isoformat(),
-                "date": m.meeting_date.strftime("%d %b %Y"),
+                "sort_key": (m.meeting_date.isoformat(), "00:00"),
+                "date_label": m.meeting_date.strftime("%d %b %Y"),
                 "title": _meeting_timeline_title(m.meeting_title),
-                "body": _truncate(m.achieved or m.agenda),
+                "body": _truncate(m.agenda or m.achieved or "", 90),
+                "kind": "meeting",
             }
         )
-    for s in tl_summaries:
+    for s in topic.summaries.all().order_by("generated_at"):
+        if not s.generated_at:
+            continue
         title, body = _summary_timeline_entry(s)
-        timeline_events.append(
-            {"sort": s.generated_at.isoformat(), "date": s.generated_at.strftime("%d %b %Y"), "title": title, "body": body}
+        entries.append(
+            {
+                "sort_key": (s.generated_at.date().isoformat(), s.generated_at.strftime("%H:%M")),
+                "date_label": s.generated_at.strftime("%d %b %Y"),
+                "title": title,
+                "body": body,
+                "kind": "status",
+            }
         )
-    timeline_events.sort(key=lambda e: e["sort"], reverse=True)  # newest first
+    entries.sort(key=lambda e: e["sort_key"], reverse=True)
+    return entries[:limit]
 
+
+def _brief_html_page(topic, answer, summary=None):
     note_html = ""
     if not answer.get("is_llm") and answer.get("generation_note"):
         note_html = f'<p class="note">{html_escape(answer["generation_note"])}</p>'
+
+    # Three columns, per the pasted sketch: Key Stakeholders + Key State
+    # (left) - the prompt result and its supporting detail (middle) - a
+    # NARROW Project Timeline (right). Stakeholders/timeline are topic-
+    # level, not tied to this particular answer/summary, so they show up on
+    # every visit as long as the topic has any real meeting/history data.
+    metas = list(ExtractedMeta.objects.filter(ingested_file__topic=topic).select_related("ingested_file"))
+    stakeholder_names = _collect_stakeholders(topic, metas)
+    timeline_entries = _brief_timeline_entries(topic, metas)
+
+    def _stakeholder_row(name):
+        color, initials = _avatar_style(name)
+        return (
+            f'<div class="stakeholder-row"><span class="avatar" style="background:{color}">'
+            f'{html_escape(initials)}</span><span class="stakeholder-name">{html_escape(name)}</span></div>'
+        )
+
+    col_a_html = (
+        '<h3>👥 Key Stakeholders</h3><div class="stakeholder-list">'
+        + "".join(_stakeholder_row(n) for n in stakeholder_names)
+        + "</div>"
+        if stakeholder_names
+        else '<h3>👥 Key Stakeholders</h3><p class="tl-body">None identified yet.</p>'
+    )
+    # Key State quick stats - same shape as the dashboard Context Node's own
+    # widget. Decisions/Commitments now have real backing models (Decision,
+    # Task) so their counts are real too; Facts still has nothing to count
+    # against, so it stays honestly "not yet tracked".
+    if summary:
+        risks_count = _count_bullets(summary.risks_and_gaps)
+        links_count = len(summary.sources_used or [])
+        decisions_count = topic.decisions.count()
+        commitments_count = topic.commitments.count()
+        col_a_html += (
+            '<h3 class="key-state-h3">📌 Key State</h3><div class="key-state-list">'
+            f'<div class="key-state-row"><span>Decisions</span><span class="ks-val">{decisions_count}</span></div>'
+            f'<div class="key-state-row"><span>Commitments</span><span class="ks-val">{commitments_count}</span></div>'
+            f'<div class="key-state-row"><span>People</span><span class="ks-val">{len(stakeholder_names)}</span></div>'
+            '<div class="key-state-row"><span>Facts</span><span class="ks-val ks-empty">not yet tracked</span></div>'
+            f'<div class="key-state-row"><span>Risks</span><span class="ks-val">{risks_count}</span></div>'
+            f'<div class="key-state-row"><span>Important links</span><span class="ks-val">{links_count}</span></div>'
+            "</div>"
+        )
+
+    def _timeline_card(e):
+        # <details>/<summary> gives a native click-to-expand accordion with
+        # zero JS - "when i click any timeline title then it should drop
+        # down with the details" - and stays a compact, narrow row (date +
+        # title only) until clicked, rather than always showing body text.
+        body_html = f'<p class="tl-body">{html_escape(e["body"])}</p>' if e["body"] else ""
+        return (
+            f'<div class="tl-item tl-item--{e["kind"]}"><span class="tl-dot"></span>'
+            f'<details class="tl-card"><summary><span class="tl-date">{html_escape(e["date_label"])}</span>'
+            f'<span class="tl-title">{html_escape(e["title"])}</span></summary>'
+            f'{body_html}</details></div>'
+        )
+
+    col_c_html = (
+        '<h3>🗓 Project Timeline</h3><div class="timeline">'
+        + "".join(_timeline_card(e) for e in timeline_entries)
+        + "</div>"
+        if timeline_entries
+        else '<h3>🗓 Project Timeline</h3><p class="tl-body">No history yet.</p>'
+    )
 
     # Per-paragraph source attribution (real, direct feedback: the old
     # bottom-of-page file list was "cluttered, I cannot understand which
@@ -1589,6 +2790,10 @@ def _brief_html_page(topic, answer, summary=None):
         (getattr(summary, key) or "").strip() for key, _label in _BRIEF_SECTION_LABELS
     )
 
+    # answer_first_html is whatever directly answers the question that was
+    # actually asked - it renders at the TOP of the middle column ("I need
+    # to see the prompt result first then the required info"). rest_html is
+    # the per-field breakdown - supporting detail, not the headline answer.
     if has_structured_content:
         files_by_path = {f.path: f for f in topic.files.all()}
 
@@ -1605,19 +2810,19 @@ def _brief_html_page(topic, answer, summary=None):
                 )
             return links
 
-        summary_html = ""
+        # No heading here - real feedback: "when i am giving the prompt the
+        # answer is comming under executive summary... i need this to come
+        # under no heading." The genuine Executive Summary (topic.one_liner)
+        # is a separate, always-static block - see exec_summary_html below.
+        answer_first_html = ""
         if (summary.answer_summary or "").strip():
-            summary_html = f'<p class="answer-summary">{html_escape(summary.answer_summary)}</p>'
+            answer_first_html = f'<p class="answer-summary">{html_escape(summary.answer_summary)}</p>'
 
-        # "Open first" - the 3-5 most valuable things to look at before the
-        # per-section detail below, per the PRD's own output contract.
-        open_first_links = _source_links(summary.sources_used)
-        open_first_html = (
-            f'<div class="brief-section"><h3>Open first</h3><p class="para-src">{"".join(open_first_links)}</p></div>'
-            if open_first_links
-            else ""
-        )
-
+        # No standalone "Reference documents" list anymore - real feedback:
+        # "no need of reffrence documents because already there with the
+        # texts" - every section below already carries its own source Edit
+        # links (field_sources), so a separate top-of-page file list was
+        # pure duplication.
         sections_html = ""
         field_sources = summary.field_sources or {}
         for key, label in _BRIEF_SECTION_LABELS:
@@ -1631,7 +2836,10 @@ def _brief_html_page(topic, answer, summary=None):
                 f'<p class="para">{html_escape(text)}</p>{src_html}</div>'
             )
 
-        body_html = f"{summary_html}{open_first_html}{sections_html}"
+        # "Relevant Topics for the Prompt" - a responsive multi-column grid
+        # instead of one long stacked column, now that the middle column has
+        # real width to spend (per the pasted design reference).
+        rest_html = f'<div class="sections-grid">{sections_html}</div>' if sections_html else ""
     else:
         sources_html = ""
         if answer.get("source_files"):
@@ -1644,26 +2852,41 @@ def _brief_html_page(topic, answer, summary=None):
                 for s in answer["source_files"]
             )
             sources_html = f'<h2>Sources</h2>{rows}'
-        body_html = f'<div class="answer">{html_escape(answer.get("content") or "")}</div>{sources_html}'
+        answer_first_html = f'<div class="answer">{html_escape(answer.get("content") or "")}</div>'
+        rest_html = sources_html
 
-    timeline_html = "".join(
-        f'<div class="tl-item"><p class="tl-date">{e["date"]}</p>'
-        f'<p class="tl-title">{html_escape(e["title"])}</p>'
-        f'<p class="tl-body">{html_escape(e["body"])}</p></div>'
-        for e in timeline_events
-    ) or '<p class="src">Nothing dated yet.</p>'
+    # Executive Summary is a genuine short project description
+    # (topic.one_liner), not the answer to whatever was just asked - kept
+    # separate from answer_first_html per that same feedback.
+    exec_summary_html = ""
+    if (topic.one_liner or "").strip():
+        exec_summary_html = (
+            f'<p class="exec-eyebrow">Executive Summary</p>'
+            f'<p class="answer-summary">{html_escape(topic.one_liner)}</p>'
+        )
+
+    col_b_html = f"{exec_summary_html}{answer_first_html}{rest_html}"
+
+    # "View Full Project" - the one link back to the React dashboard from
+    # this static HTML brief (opened straight in a browser, no session/SPA
+    # routing). Dev-only origin, same as CORS_ALLOWED_ORIGINS[0] - this page
+    # has no access to Next.js env vars since it's rendered server-side here.
+    full_project_url = f"http://localhost:3000/topics/{topic.id}"
 
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>{html_escape(topic.name)} — OrientMe</title>
 <style>{BRIEF_HTML_STYLE}</style></head><body>
 <p class="eyebrow">OrientMe</p>
-<h1>{html_escape(topic.name)}<span class="badge">{html_escape(topic.get_topic_type_display())}</span></h1>
+<h1>{html_escape(topic.name)}<span class="badge">{html_escape(topic.get_topic_type_display())}</span>
+<a class="view-full-project" href="{full_project_url}" target="_blank" rel="noopener">View Full Project →</a></h1>
 <div class="card">
   {note_html}
-  {body_html}
+  <div class="three-col">
+    <div class="col-a">{col_a_html}</div>
+    <div class="col-b">{col_b_html}</div>
+    <div class="col-c">{col_c_html}</div>
+  </div>
 </div>
-<h2>Timeline</h2>
-{timeline_html}
 </body></html>"""
 
 
@@ -1771,6 +2994,47 @@ class OpenSourceFileView(APIView):
         return HttpResponse(
             f"<!DOCTYPE html><html><body style='font-family:sans-serif;padding:40px;text-align:center;color:#57534a'>"
             f"<p>Opening <b>{name}</b> in its default application…</p>"
+            f"<p style='font-size:12px;color:#9a9587'>You can close this tab.</p></body></html>",
+            content_type="text/html; charset=utf-8",
+        )
+
+
+class OpenSourceFolderView(APIView):
+    """The Context Node's 'Project folder' launcher - same OS-open pattern
+    and same security shape as OpenSourceFileView (looked up by SourceFolder
+    id, never a raw path from the URL)."""
+
+    permission_classes = [AllowAny]
+
+    def get(self, request, pk=None):
+        folder = get_object_or_404(SourceFolder, pk=pk)
+        name = html_escape(folder.path)
+
+        if not os.path.isdir(folder.path):
+            return HttpResponse(
+                f"<!DOCTYPE html><html><body style='font-family:sans-serif;padding:40px'>"
+                f"<p>Can't open <b>{name}</b> — this folder no longer exists at its recorded "
+                f"location.</p></body></html>",
+                content_type="text/html; charset=utf-8", status=404,
+            )
+
+        try:
+            if sys.platform == "win32":
+                os.startfile(folder.path)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", folder.path])
+            else:
+                subprocess.Popen(["xdg-open", folder.path])
+        except OSError as e:
+            return HttpResponse(
+                f"<!DOCTYPE html><html><body style='font-family:sans-serif;padding:40px'>"
+                f"<p>Could not open <b>{name}</b>: {html_escape(str(e))}</p></body></html>",
+                content_type="text/html; charset=utf-8", status=500,
+            )
+
+        return HttpResponse(
+            f"<!DOCTYPE html><html><body style='font-family:sans-serif;padding:40px;text-align:center;color:#57534a'>"
+            f"<p>Opening <b>{name}</b> in its file browser…</p>"
             f"<p style='font-size:12px;color:#9a9587'>You can close this tab.</p></body></html>",
             content_type="text/html; charset=utf-8",
         )
@@ -1945,7 +3209,7 @@ class ConnectorRequestView(APIView):
     actually been asked for before any live integration is built."""
 
     def post(self, request, slug):
-        denied = _require_admin(request)
+        denied = _require_settings_password(request)
         if denied:
             return denied
         obj, _ = ConnectorStatus.objects.update_or_create(
@@ -1958,7 +3222,7 @@ class ConnectorResetView(APIView):
     """Withdraws a pending request, back to 'Not Connected'."""
 
     def post(self, request, slug):
-        denied = _require_admin(request)
+        denied = _require_settings_password(request)
         if denied:
             return denied
         ConnectorStatus.objects.filter(slug=slug).update(status="not_connected", requested_at=None)
@@ -1978,17 +3242,60 @@ class CsrfTokenView(APIView):
         return Response({"ok": True})
 
 
+ONE_LOGIN_MESSAGE = "This app has one shared login, so sign-up and email password reset are turned off."
+
+
 class LoginView(APIView):
+    """Signs in the one shared login only (settings.SINGLE_LOGIN_USERNAME).
+    Any other username - including accounts that still exist in the database -
+    gets the same generic error as a wrong password, so this can't be used to
+    find out which accounts exist."""
+
     permission_classes = [AllowAny]
 
     def post(self, request):
         username = (request.data.get("username") or "").strip()
         password = request.data.get("password") or ""
-        user = authenticate(request, username=username, password=password)
+        if username.lower() != django_settings.SINGLE_LOGIN_USERNAME.lower():
+            return Response({"error": "Incorrect username or password."}, status=400)
+        # The configured spelling, not what was typed: Django's own username
+        # match is case-sensitive, and "User" / "USER" should open the same login.
+        user = authenticate(request, username=django_settings.SINGLE_LOGIN_USERNAME, password=password)
         if user is None:
             return Response({"error": "Incorrect username or password."}, status=400)
         django_login(request, user)
         return Response(_profile_payload(user))
+
+
+class RegisterView(APIView):
+    """Switched off: the app has one shared login (Ayush, 8 Oct 2026), so no
+    account can be created from outside."""
+
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        return Response({"error": ONE_LOGIN_MESSAGE}, status=403)
+
+
+class PasswordResetRequestView(APIView):
+    """Switched off with sign-up: with one shared login there is no email
+    address to send a reset link to. The login's password is changed from the
+    Profile page while signed in, or from the command line
+    (`python manage.py changepassword <username>`)."""
+
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        return Response({"error": ONE_LOGIN_MESSAGE}, status=403)
+
+
+class PasswordResetConfirmView(APIView):
+    """Switched off - see PasswordResetRequestView."""
+
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        return Response({"error": ONE_LOGIN_MESSAGE}, status=403)
 
 
 class LogoutView(APIView):
@@ -2011,9 +3318,9 @@ class MeView(APIView):
 
 
 class ChangePasswordView(APIView):
-    """Self-service password change - any logged-in person (Admin or User)
-    can change their own password; this has nothing to do with the
-    Admin/User role split, which only governs Settings/Connectors."""
+    """Self-service password change for the signed-in login. This is the
+    login's own password; it has nothing to do with the settings password
+    (settings.SETTINGS_EDIT_PASSWORD), which guards the Settings page."""
 
     def post(self, request):
         old_password = request.data.get("old_password") or ""
@@ -2042,3 +3349,346 @@ class UpdateProfileView(APIView):
             request.user.last_name = parts[1] if len(parts) > 1 else ""
             request.user.save()
         return Response(_profile_payload(request.user))
+
+
+# ===========================================================================
+# 5 Oct 2026 - additive sales-oriented features (file metadata, meeting
+# types, human notes, business timeline, contacts, metadata CSV).
+# Nothing above this line was removed or re-purposed.
+# ===========================================================================
+
+_TIMELINE_DOC_TYPES = ("proposal", "quotation_sow", "prd_brd", "project_charter", "project_plan", "opportunity_scorecard")
+_TIMELINE_KIND_ORDER = {"meeting": 0, "email": 1, "document": 2, "note": 3}
+MAX_NOTE_LENGTH = 2000
+
+
+def _meeting_display_title(m):
+    return doc_meta.meeting_display_title(
+        _meeting_timeline_title(m.meeting_title), m.meeting_title, m.meeting_type, m.meeting_sequence
+    )
+
+
+def _meeting_payload(m, include_turns=False):
+    """The meeting_metadata item shape: every key it always had, plus the
+    meeting type/sequence, the "who said what" summary and the meeting's notes."""
+    payload = {
+        "id": m.id,
+        "file_id": m.ingested_file_id,
+        "file_display_name": m.ingested_file.display_name,
+        "file_path": m.ingested_file.path,
+        "meeting_title": m.meeting_title,
+        "timeline_title": _meeting_display_title(m),
+        "meeting_date": m.meeting_date.isoformat() if m.meeting_date else None,
+        "meeting_time": m.meeting_time,
+        "attendees": extraction.clean_attendees(m.attendees),
+        "agenda": m.agenda,
+        "achieved": m.achieved,
+        "meeting_type": m.meeting_type,
+        "meeting_type_label": doc_meta.MEETING_TYPE_LABELS.get(m.meeting_type, ""),
+        "meeting_sequence": m.meeting_sequence,
+        "meeting_type_source": m.meeting_type_source,
+        "speaker_turn_count": len(m.speaker_turns or []),
+        "speaker_summary": extraction.summarize_speakers(m.speaker_turns),
+        "notes": [
+            {"id": n.id, "text": n.text, "author": n.author, "created_at": n.created_at.isoformat()}
+            for n in m.notes.all()
+        ],
+    }
+    if include_turns:
+        payload["speaker_turns"] = m.speaker_turns or []
+    return payload
+
+
+def _business_timeline_events(topic):
+    """Business events for a topic, oldest first: meetings (type + sequence in
+    the title), emails (by document_date), key documents with their version,
+    and human notes. Additive to the app's own timeline - see API_CONTRACT.md."""
+    events = []
+
+    def event(kind, date_iso, title, body="", **extra):
+        row = {
+            "kind": kind, "date": date_iso, "title": title, "body": body, "approx_date": False,
+            "file_id": None, "meta_id": None, "note_id": None, "doc_type": "", "version_label": "",
+            "meeting_type": "", "meeting_sequence": None, "author": "", "meeting_title": "",
+        }
+        row.update(extra)
+        events.append(row)
+
+    metas = (
+        ExtractedMeta.objects.filter(ingested_file__topic=topic, meeting_date__isnull=False)
+        .select_related("ingested_file")
+        .order_by("meeting_date", "ingested_file__first_added_at")
+    )
+    for m in _dedupe_meetings(metas):
+        event(
+            "meeting", m.meeting_date.isoformat(), _meeting_display_title(m),
+            _truncate(m.achieved or m.agenda or "", 160),
+            file_id=m.ingested_file_id, meta_id=m.id, meeting_type=m.meeting_type,
+            meeting_sequence=m.meeting_sequence,
+        )
+
+    files = topic.files.filter(doc_type__in=("email",) + _TIMELINE_DOC_TYPES).exclude(meta_state="error")
+    for f in files:
+        when = f.document_date
+        approx = when is None
+        if approx:
+            when = f.first_added_at.date()
+        if f.doc_type == "email":
+            subject = doc_meta.email_subject(f.extracted_text)
+            event(
+                "email", when.isoformat(), subject or f.display_name or "Email", f.signal,
+                approx_date=approx, file_id=f.id, doc_type=f.doc_type, version_label=f.version_label,
+            )
+        else:
+            label = doc_meta.DOC_TYPE_LABELS.get(f.doc_type, "Document")
+            title = f"{label} {f.version_label}".strip()
+            event(
+                "document", when.isoformat(), title, f.signal,
+                approx_date=approx, file_id=f.id, doc_type=f.doc_type, version_label=f.version_label,
+            )
+
+    for n in topic.meeting_notes.select_related("meta"):
+        first_line = " ".join((n.text or "").split())
+        event(
+            "note", n.created_at.date().isoformat(), "Note: " + _truncate(first_line, 70), n.text,
+            note_id=n.id, meta_id=n.meta_id, author=n.author,
+            meeting_title=n.meta.meeting_title if n.meta_id else "",
+        )
+
+    events.sort(key=lambda e: (e["date"], _TIMELINE_KIND_ORDER[e["kind"]], e["file_id"] or e["note_id"] or e["meta_id"] or 0))
+    return events
+
+
+# ---- metadata CSV --------------------------------------------------------
+METADATA_CSV_COLUMNS = [
+    "file", "document_type", "topic_tags", "signal", "state", "seconds", "review_notes",  # Siddharth's contract
+    "phase", "version", "doc_date", "participants",  # optional, to the right
+]
+_DELIVERY_DOC_TYPES = ("prd_brd", "project_charter", "project_plan", "stakeholder_map")
+_DELIVERY_MEETING_TYPES = ("kickoff", "standup", "review")
+
+
+def _csv_safe(value):
+    """Neutralise spreadsheet formula injection (a cell starting = + @ or a
+    '-' that is not a plain negative number would be run as a formula by
+    Excel); email-derived text is not trusted."""
+    value = "" if value is None else str(value)
+    if value and (value[0] in "=+@\t\r" or (value[0] == "-" and not re.match(r"^-\d+(\.\d+)?$", value))):
+        return "'" + value
+    return value
+
+
+def _csv_file_label(f):
+    path = f.path or ""
+    norm = path.replace("\\", "/")
+    for folder in f.topic.folders.all():
+        base = (folder.path or "").replace("\\", "/").rstrip("/")
+        if base and norm.lower().startswith(base.lower() + "/"):
+            return norm[len(base) + 1:]
+    if path.startswith(("pasted:", "mbox:", "ics:")):
+        return f.display_name or path
+    return f.display_name or os.path.basename(norm) or path
+
+
+def _csv_phase(f):
+    topic = f.topic
+    meta = getattr(f, "meta", None)
+    if f.doc_type in _DELIVERY_DOC_TYPES or (meta is not None and meta.meeting_type in _DELIVERY_MEETING_TYPES):
+        return "Delivery"
+    if topic.topic_type in ("opportunity", "customer") or topic.stage:
+        return "Pre-sales"
+    return ""
+
+
+def _csv_participants(f):
+    if f.doc_type == "email":
+        names = doc_meta.email_participants(f.extracted_text)
+    else:
+        meta = getattr(f, "meta", None)
+        names = extraction.clean_attendees(meta.attendees) if meta is not None else []
+    return "; ".join(names)
+
+
+def _metadata_csv_row(f, with_topic):
+    meta = getattr(f, "meta", None)
+    state = f.meta_state or ("error" if f.extraction_error else "")
+    when = f.document_date or (meta.meeting_date if meta is not None else None)
+    notes = f.review_notes or (f.extraction_error if state == "error" else "")
+    row = [
+        _csv_file_label(f),
+        doc_meta.DOC_TYPE_LABELS.get(f.doc_type, ""),
+        f.topic_tags,
+        f.signal,
+        state,
+        f"{f.meta_seconds:.1f}" if f.meta_seconds is not None else "",
+        notes,
+        _csv_phase(f),
+        f.version_label,
+        when.isoformat() if when else "",
+        _csv_participants(f),
+    ]
+    if with_topic:
+        row.append(f.topic.name)
+    return [_csv_safe(c) for c in row], (when.isoformat() if when else "9999-12-31")
+
+
+def _metadata_csv_response(files, filename, with_topic=False):
+    rows = [_metadata_csv_row(f, with_topic) for f in files]
+    rows.sort(key=lambda r: (r[1], r[0][0].lower()))
+    buf = io.StringIO()
+    writer = csv.writer(buf, lineterminator="\r\n")
+    writer.writerow(METADATA_CSV_COLUMNS + (["topic"] if with_topic else []))
+    for row, _sort in rows:
+        writer.writerow(row)
+    response = HttpResponse(buf.getvalue(), content_type="text/csv; charset=utf-8")
+    safe_name = re.sub(r'[^A-Za-z0-9._ -]+', "_", filename).strip() or "metadata.csv"
+    response["Content-Disposition"] = f'attachment; filename="{safe_name}"'
+    return response
+
+
+class GlobalMetadataCsvView(APIView):
+    """GET /api/metadata_csv/ - every ingested file across every project (or
+    one project with ?topic_id=): the same CSV as TopicViewSet.metadata_csv
+    with one extra trailing "topic" column."""
+
+    def get(self, request):
+        qs = IngestedFile.objects.select_related("topic", "meta").prefetch_related("topic__folders")
+        topic_id = request.query_params.get("topic_id")
+        if topic_id:
+            qs = qs.filter(topic_id=topic_id)
+        return _metadata_csv_response(qs, "orientme-metadata.csv", with_topic=True)
+
+
+# ---- file metadata edit / confirm ----------------------------------------
+class FileMetadataView(APIView):
+    """GET/PATCH /api/files/<id>/metadata/ - read or correct one file's
+    metadata. A PATCH that changes doc_type / topic_tags / signal /
+    version_label / document_date marks the row "corrected" (and doc_type as
+    manually set); review_notes can be edited without changing the state."""
+
+    EDITABLE = ("doc_type", "topic_tags", "signal", "version_label", "document_date", "review_notes")
+
+    def _payload(self, f):
+        return {"id": f.id, "topic_id": f.topic_id, **file_metadata_payload(f)}
+
+    def get(self, request, pk=None):
+        return Response(self._payload(get_object_or_404(IngestedFile, pk=pk)))
+
+    def patch(self, request, pk=None):
+        f = get_object_or_404(IngestedFile, pk=pk)
+        data = request.data
+        present = [k for k in self.EDITABLE if k in data]
+        if not present:
+            return Response({"error": "Send at least one of: " + ", ".join(self.EDITABLE)}, status=400)
+
+        errors, changes = {}, {}
+        if "doc_type" in data:
+            value = str(data["doc_type"] or "").strip()
+            if value and value not in dict(DOC_TYPES):
+                errors["doc_type"] = "Unknown document type. Allowed: " + ", ".join(dict(DOC_TYPES))
+            else:
+                changes["doc_type"] = value
+        if "topic_tags" in data:
+            changes["topic_tags"] = ", ".join(doc_meta.normalize_tags(data["topic_tags"]))
+        if "signal" in data:
+            value = " ".join(str(data["signal"] or "").split())
+            if len(value) > 400:
+                errors["signal"] = "At most 400 characters."
+            else:
+                changes["signal"] = value
+        if "version_label" in data:
+            value = " ".join(str(data["version_label"] or "").split())
+            if len(value) > 30:
+                errors["version_label"] = "At most 30 characters."
+            else:
+                changes["version_label"] = value
+        if "document_date" in data:
+            raw = data["document_date"]
+            if raw in (None, ""):
+                changes["document_date"] = None
+            else:
+                try:
+                    changes["document_date"] = datetime.strptime(str(raw)[:10], "%Y-%m-%d").date()
+                except ValueError:
+                    errors["document_date"] = "Use YYYY-MM-DD."
+        if "review_notes" in data:
+            changes["review_notes"] = str(data["review_notes"] or "").strip()
+        if errors:
+            return Response({"errors": errors}, status=400)
+
+        fields = []
+        material_change = False
+        for key, value in changes.items():
+            if getattr(f, key) != value:
+                setattr(f, key, value)
+                fields.append(key)
+                if key != "review_notes":
+                    material_change = True
+        if "doc_type" in fields:
+            f.doc_type_source = "manual"
+            fields.append("doc_type_source")
+        if material_change and f.meta_state != "corrected":
+            f.meta_state = "corrected"
+            fields.append("meta_state")
+        if fields:
+            f.save(update_fields=fields)  # update_fields: last_ingested_at is left alone
+        return Response(self._payload(f))
+
+
+class FileMetadataConfirmView(APIView):
+    """POST /api/files/<id>/confirm/ - a person vouches for the current
+    metadata: generated_unconfirmed (or never-filled) -> confirmed. Already
+    corrected rows stay "corrected"; an unreadable (error) file cannot be
+    confirmed."""
+
+    def post(self, request, pk=None):
+        f = get_object_or_404(IngestedFile, pk=pk)
+        if f.meta_state == "error":
+            return Response({"error": "This file could not be read, so there is nothing to confirm."}, status=400)
+        if f.meta_state != "corrected" and f.meta_state != "confirmed":
+            f.meta_state = "confirmed"
+            f.save(update_fields=["meta_state"])
+        return Response({"id": f.id, "topic_id": f.topic_id, **file_metadata_payload(f)})
+
+
+# ---- meeting type / sequence ---------------------------------------------
+class MeetingDetailView(APIView):
+    """GET/PATCH /api/meetings/<meta_id>/ - one meeting (ExtractedMeta). PATCH
+    meeting_type and/or meeting_sequence by hand; a manual choice is never
+    overwritten by auto-detection on re-ingest."""
+
+    def _get(self, pk):
+        return get_object_or_404(ExtractedMeta.objects.select_related("ingested_file"), pk=pk)
+
+    def get(self, request, pk=None):
+        return Response(_meeting_payload(self._get(pk), include_turns=True))
+
+    def patch(self, request, pk=None):
+        m = self._get(pk)
+        data = request.data
+        if "meeting_type" not in data and "meeting_sequence" not in data:
+            return Response({"error": "Send meeting_type and/or meeting_sequence."}, status=400)
+        errors = {}
+        if "meeting_type" in data:
+            value = str(data["meeting_type"] or "").strip()
+            if value and value not in dict(MEETING_TYPES):
+                errors["meeting_type"] = "Allowed: " + ", ".join(dict(MEETING_TYPES))
+            else:
+                m.meeting_type = value
+        if "meeting_sequence" in data:
+            raw = data["meeting_sequence"]
+            if raw in (None, ""):
+                m.meeting_sequence = None
+            else:
+                try:
+                    seq = int(raw)
+                    if not 1 <= seq <= 99:
+                        raise ValueError
+                    m.meeting_sequence = seq
+                except (TypeError, ValueError):
+                    errors["meeting_sequence"] = "A whole number from 1 to 99, or null."
+        if errors:
+            return Response({"errors": errors}, status=400)
+        m.meeting_type_source = "manual"
+        m.save(update_fields=["meeting_type", "meeting_sequence", "meeting_type_source"])
+        return Response(_meeting_payload(m, include_turns=True))

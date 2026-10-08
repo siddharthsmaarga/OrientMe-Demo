@@ -6,6 +6,25 @@ import { api } from "../../lib/api";
 import { formatAdded, recordingDisplayDate } from "../../lib/format";
 import { STATUS_STYLES } from "../page";
 
+// Same palette as the project page's stakeholder avatars - one colour per
+// speaker, assigned in order of first appearance so it stays stable.
+const SPEAKER_COLORS = ["#0096af", "#7c5cbf", "#d0811c", "#3a8f5f", "#c0517a", "#5a6b8c"];
+const UNATTRIBUTED = "Unattributed";
+
+// Consecutive turns by the same speaker read as one message.
+function mergeTurns(turns) {
+  const merged = [];
+  for (const t of turns || []) {
+    const last = merged[merged.length - 1];
+    if (last && last.speaker === t.speaker) {
+      last.text = `${last.text}\n${t.text}`;
+    } else {
+      merged.push({ speaker: t.speaker, ts: t.ts, text: t.text });
+    }
+  }
+  return merged;
+}
+
 // One recording's own detail page - the transcript text plus an on-demand
 // summary panel. The summary is deliberately NEVER generated automatically
 // on load; it only appears once a person clicks "Generate Summary" (see
@@ -29,7 +48,15 @@ export default function TranscriptDetailClient({ id }) {
 
   const [generatingTranscript, setGeneratingTranscript] = useState(false);
   const [transcriptError, setTranscriptError] = useState(null);
-  const [transcriptView, setTranscriptView] = useState("raw"); // "raw" | "speaker"
+  // "raw" | "speaker" | "conversation" - null until a person picks one, so the
+  // default can follow whether speaker turns exist (Conversation) or not (Raw).
+  const [transcriptView, setTranscriptView] = useState(null);
+
+  const [renamingSpeaker, setRenamingSpeaker] = useState(false);
+  const [renameOld, setRenameOld] = useState("");
+  const [renameNew, setRenameNew] = useState("");
+  const [renameBusy, setRenameBusy] = useState(false);
+  const [renameError, setRenameError] = useState(null);
 
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState(null);
@@ -51,6 +78,24 @@ export default function TranscriptDetailClient({ id }) {
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
+
+  async function handleRenameSpeaker(e) {
+    e.preventDefault();
+    const newName = renameNew.trim();
+    if (!renameOld || !newName) return;
+    setRenameBusy(true);
+    setRenameError(null);
+    try {
+      const updated = await api.renameRecordingSpeaker(id, renameOld, newName);
+      setEvent(updated);
+      setRenamingSpeaker(false);
+      setRenameNew("");
+    } catch (err) {
+      setRenameError(err.message);
+    } finally {
+      setRenameBusy(false);
+    }
+  }
 
   async function handleGenerateSummary() {
     setGenerating(true);
@@ -127,6 +172,26 @@ export default function TranscriptDetailClient({ id }) {
 
   const style = STATUS_STYLES[event.status] || STATUS_STYLES.needs_review;
 
+  const turns = Array.isArray(event.speaker_turns) ? event.speaker_turns : [];
+  const hasTurns = turns.length > 0;
+  const view = transcriptView || (hasTurns ? "conversation" : "raw");
+  const mergedTurns = mergeTurns(turns);
+  // Legend: one entry per speaker (order of first appearance) with how many
+  // chat turns they have as shown, so the counts match what's on screen.
+  const speakerOrder = [];
+  const speakerCounts = {};
+  mergedTurns.forEach((t) => {
+    if (!(t.speaker in speakerCounts)) {
+      speakerCounts[t.speaker] = 0;
+      speakerOrder.push(t.speaker);
+    }
+    speakerCounts[t.speaker] += 1;
+  });
+  const speakerColor = (name) =>
+    name === UNATTRIBUTED ? "#9ca3af" : SPEAKER_COLORS[speakerOrder.indexOf(name) % SPEAKER_COLORS.length];
+  const showToggle = !!event.speaker_transcript || hasTurns;
+  const source = event.speaker_turns_source;
+
   return (
     <div className="max-w-5xl mx-auto px-6 py-10">
       <Link href="/transcripts" className="text-sm text-teal-dark hover:underline">
@@ -171,35 +236,153 @@ export default function TranscriptDetailClient({ id }) {
 
           {transcriptError && <p className="text-red-600 text-xs mb-2">{transcriptError}</p>}
 
-          {event.speaker_transcript && (
+          {showToggle && (
             <div className="flex items-center gap-1 mb-2 text-xs">
               <button
                 type="button"
                 onClick={() => setTranscriptView("raw")}
                 className={`px-2.5 py-1 rounded-full font-medium ${
-                  transcriptView === "raw" ? "bg-teal-tint text-teal-dark" : "text-ink-muted hover:bg-cream"
+                  view === "raw" ? "bg-teal-tint text-teal-dark" : "text-ink-muted hover:bg-cream"
                 }`}
               >
                 Raw
               </button>
-              <button
-                type="button"
-                onClick={() => setTranscriptView("speaker")}
-                className={`px-2.5 py-1 rounded-full font-medium ${
-                  transcriptView === "speaker" ? "bg-teal-tint text-teal-dark" : "text-ink-muted hover:bg-cream"
-                }`}
-              >
-                By Speaker
-              </button>
+              {event.speaker_transcript && (
+                <button
+                  type="button"
+                  onClick={() => setTranscriptView("speaker")}
+                  className={`px-2.5 py-1 rounded-full font-medium ${
+                    view === "speaker" ? "bg-teal-tint text-teal-dark" : "text-ink-muted hover:bg-cream"
+                  }`}
+                >
+                  By Speaker
+                </button>
+              )}
+              {hasTurns && (
+                <button
+                  type="button"
+                  onClick={() => setTranscriptView("conversation")}
+                  className={`px-2.5 py-1 rounded-full font-medium ${
+                    view === "conversation" ? "bg-teal-tint text-teal-dark" : "text-ink-muted hover:bg-cream"
+                  }`}
+                >
+                  Conversation
+                </button>
+              )}
             </div>
           )}
 
+          {view === "conversation" && hasTurns ? (
+            <div data-testid="conversation-view">
+              <div className="flex items-center gap-2 flex-wrap mb-2" data-testid="speaker-legend">
+                {speakerOrder.map((name) => (
+                  <span
+                    key={name}
+                    className="inline-flex items-center gap-1.5 text-[11px] text-[#1a1a1a] rounded-full border border-border-warm px-2 py-0.5"
+                  >
+                    <span className="w-2 h-2 rounded-full" style={{ background: speakerColor(name) }} />
+                    {name}
+                    <span className="text-ink-muted">
+                      · {speakerCounts[name]} turn{speakerCounts[name] === 1 ? "" : "s"}
+                    </span>
+                  </span>
+                ))}
+                {!renamingSpeaker && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setRenameOld(speakerOrder[0] || "");
+                      setRenameNew("");
+                      setRenameError(null);
+                      setRenamingSpeaker(true);
+                    }}
+                    className="text-[11px] font-medium text-teal-dark hover:underline"
+                  >
+                    Rename speaker
+                  </button>
+                )}
+              </div>
+
+              {renamingSpeaker && (
+                <form onSubmit={handleRenameSpeaker} className="flex items-center gap-1.5 flex-wrap mb-2">
+                  <select
+                    value={renameOld}
+                    onChange={(e) => setRenameOld(e.target.value)}
+                    aria-label="Speaker to rename"
+                    className="text-xs rounded-md border border-border-warm bg-white px-2 py-1"
+                  >
+                    {speakerOrder.map((name) => (
+                      <option key={name} value={name}>
+                        {name}
+                      </option>
+                    ))}
+                  </select>
+                  <span className="text-xs text-ink-muted">→</span>
+                  <input
+                    value={renameNew}
+                    onChange={(e) => setRenameNew(e.target.value)}
+                    maxLength={60}
+                    autoFocus
+                    placeholder="Real name"
+                    aria-label="New speaker name"
+                    className="text-xs rounded-md border border-border-warm px-2 py-1 w-40"
+                  />
+                  <button
+                    type="submit"
+                    disabled={renameBusy || !renameNew.trim()}
+                    className="px-2.5 py-1 text-xs font-semibold rounded-md bg-brand text-white hover:bg-brand-dark disabled:opacity-40"
+                  >
+                    {renameBusy ? "Saving…" : "Save"}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setRenamingSpeaker(false)}
+                    className="text-xs font-medium text-ink-muted hover:text-[#1a1a1a]"
+                  >
+                    Cancel
+                  </button>
+                  {renameError && <p className="w-full text-red-600 text-xs">{renameError}</p>}
+                </form>
+              )}
+
+              <div className="space-y-3 max-h-[70vh] overflow-y-auto rounded-md bg-[#faf9f5] border border-border-warm px-3 py-3">
+                {mergedTurns.map((t, i) => (
+                  <div key={i} className="flex gap-2.5" data-testid="conversation-turn">
+                    <span
+                      className="w-7 h-7 rounded-full flex items-center justify-center text-[11px] font-bold text-white shrink-0"
+                      style={{ background: speakerColor(t.speaker) }}
+                    >
+                      {(t.speaker || "?").trim()[0]?.toUpperCase() || "?"}
+                    </span>
+                    <div className="min-w-0">
+                      <p className="text-xs font-semibold text-[#1a1a1a]">
+                        {t.speaker}
+                        {t.ts && <span className="ml-2 font-normal text-ink-muted">{t.ts}</span>}
+                      </p>
+                      <p className="text-sm text-[#1a1a1a] leading-relaxed whitespace-pre-wrap">{t.text}</p>
+                    </div>
+                  </div>
+                ))}
+              </div>
+              {speakerOrder.length === 1 && (
+                <p className="text-[11px] text-ink-muted mt-2" data-testid="single-speaker-note">
+                  Only one speaker was found in this recording. Use Rename speaker to give them a real name.
+                </p>
+              )}
+              <p className="text-[11px] text-ink-muted mt-2">
+                {source === "teams"
+                  ? "Speaker names were read straight from the transcript text, in plain code - no model was used. Rename a speaker if the label is wrong."
+                  : "This static demo has no model behind it, so lines without speaker names are shown under one placeholder speaker rather than guessed. Rename a speaker if the label is wrong."}
+              </p>
+            </div>
+          ) : (
           <div className="whitespace-pre-wrap font-mono text-xs text-[#1a1a1a] leading-relaxed max-h-[70vh] overflow-y-auto rounded-md bg-[#faf9f5] border border-border-warm px-3 py-3">
-            {transcriptView === "speaker" && event.speaker_transcript
+            {view === "speaker" && event.speaker_transcript
               ? event.speaker_transcript
               : text || "(no transcript text available)"}
           </div>
-          {transcriptView === "speaker" && event.speaker_transcript_generated_at && (
+          )}
+          {view === "speaker" && event.speaker_transcript_generated_at && (
             <p className="text-[11px] text-ink-muted mt-2">
               Generated {formatAdded(event.speaker_transcript_generated_at)} · speaker labels are a
               best-effort read of who&apos;s speaking, not verified audio-based

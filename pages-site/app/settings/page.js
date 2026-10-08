@@ -3,7 +3,6 @@
 import Link from "next/link";
 import { useEffect, useState } from "react";
 import { api } from "../lib/api";
-import { useAuth } from "../lib/AuthContext";
 
 // Presets for the providers this app has actually been run against - picking
 // one auto-fills the base URL (rarely worth hand-typing) and suggests a
@@ -45,7 +44,6 @@ const PROVIDER_PRESETS = {
 };
 
 export default function SettingsPage() {
-  const { isAdmin } = useAuth();
   const [form, setForm] = useState({
     llm_provider: "openrouter",
     llm_api_key: "",
@@ -62,11 +60,17 @@ export default function SettingsPage() {
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState(null);
 
-  // Unlocked (editable) by default - a person should always be able to
-  // change the provider/key/model without fighting the UI. Lock is purely
-  // an accidental-edit guard someone can turn on for themselves, remembered
-  // per-browser via localStorage, and always reversible with one click.
-  const [locked, setLocked] = useState(false);
+  // Locked until the settings password is typed (changing anything here needs a
+  // password). The unlocked password lives only in this page's memory - never
+  // stored in the browser - and goes along with every save, where the backend
+  // checks it again, so the lock cannot be skipped by editing the page. After a
+  // successful save the page locks itself again. (In this static demo there is
+  // no backend, so the demo API plays that part, with a published demo password.)
+  const [unlockedWith, setUnlockedWith] = useState(null);
+  const [askingPassword, setAskingPassword] = useState(false);
+  const [passwordInput, setPasswordInput] = useState("");
+  const [unlockError, setUnlockError] = useState(null);
+  const [unlocking, setUnlocking] = useState(false);
 
   useEffect(() => {
     api
@@ -76,29 +80,33 @@ export default function SettingsPage() {
         setKeyIsSet(data.llm_api_key_set);
       })
       .catch((e) => setError(e.message));
-    try {
-      setLocked(localStorage.getItem("orientme_settings_locked") === "1");
-    } catch {
-      // localStorage can be unavailable (private browsing, blocked site
-      // data) - fields just stay unlocked/editable in that case.
-    }
   }, []);
 
-  function toggleLock() {
-    setLocked((prev) => {
-      const next = !prev;
-      try {
-        localStorage.setItem("orientme_settings_locked", next ? "1" : "0");
-      } catch {
-        // Nothing to persist to - the toggle still works for this session.
-      }
-      return next;
-    });
+  const effectiveLocked = !unlockedWith;
+
+  async function handleUnlock(e) {
+    e.preventDefault();
+    if (!passwordInput) return;
+    setUnlocking(true);
+    setUnlockError(null);
+    try {
+      await api.unlockSettings(passwordInput);
+      setUnlockedWith(passwordInput);
+      setPasswordInput("");
+      setAskingPassword(false);
+    } catch (err) {
+      setUnlockError(err.message.startsWith("403") ? "That is not the settings password." : err.message);
+    } finally {
+      setUnlocking(false);
+    }
   }
 
-  // A User can view every field but never change one - Admin keeps the
-  // existing self-serve lock/unlock toggle for accidental-edit protection.
-  const effectiveLocked = !isAdmin || locked;
+  function lockAgain() {
+    setUnlockedWith(null);
+    setAskingPassword(false);
+    setPasswordInput("");
+    setUnlockError(null);
+  }
 
   const preset = PROVIDER_PRESETS[form.llm_provider] || PROVIDER_PRESETS.custom;
 
@@ -115,13 +123,20 @@ export default function SettingsPage() {
   async function handleSave(e) {
     e.preventDefault();
     try {
-      await api.saveSettings(form);
+      await api.saveSettings(form, unlockedWith);
+      setError(null);
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
       if (form.llm_api_key) setKeyIsSet(true);
       setForm((f) => ({ ...f, llm_api_key: "" }));
+      lockAgain();
     } catch (e) {
-      setError(e.message);
+      if (e.message.startsWith("403")) {
+        lockAgain();
+        setError("The settings password was not accepted, so nothing was saved. Unlock again and retry.");
+      } else {
+        setError(e.message);
+      }
     }
   }
 
@@ -139,35 +154,73 @@ export default function SettingsPage() {
       {error && <p className="text-red-600 text-sm mb-4">{error}</p>}
 
       <form onSubmit={handleSave} className="space-y-5">
-        <div className="flex items-center justify-between gap-3 rounded-md border border-slate-200 bg-slate-50 px-3 py-2.5">
-          <div>
-            <p className="text-sm font-medium text-slate-700">
-              {!isAdmin
-                ? "🔒 View only"
-                : locked
-                  ? "🔒 Provider settings are locked"
-                  : "🔓 Provider settings are unlocked"}
-            </p>
-            <p className="text-xs text-slate-400 mt-0.5">
-              {!isAdmin
-                ? "Your account can view these settings but can't change them — ask an Admin."
-                : locked
-                  ? "Unlock to change the provider, API key, model, or base URL."
-                  : "Editable by default — lock these if you want to avoid changing them by accident."}
-            </p>
+        <div className="rounded-md border border-slate-200 bg-slate-50 px-3 py-2.5">
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <p className="text-sm font-medium text-slate-700">
+                {effectiveLocked ? "🔒 Settings are locked" : "🔓 Unlocked — saving will lock them again"}
+              </p>
+              <p className="text-xs text-slate-400 mt-0.5">
+                {effectiveLocked
+                  ? "Enter the settings password to change the API key, model, folders or anything else here. (Demo build: the password is “demo”.)"
+                  : "Make your changes and press Save."}
+              </p>
+            </div>
+            {effectiveLocked ? (
+              !askingPassword && (
+                <button
+                  type="button"
+                  onClick={() => setAskingPassword(true)}
+                  className="px-3 py-1.5 text-xs font-medium rounded-md shrink-0 bg-brand text-white hover:bg-brand-dark"
+                >
+                  Unlock
+                </button>
+              )
+            ) : (
+              <button
+                type="button"
+                onClick={lockAgain}
+                className="px-3 py-1.5 text-xs font-medium rounded-md shrink-0 border border-slate-300 text-slate-600 hover:bg-slate-100"
+              >
+                Lock now
+              </button>
+            )}
           </div>
-          {isAdmin && (
-            <button
-              type="button"
-              onClick={toggleLock}
-              className={`px-3 py-1.5 text-xs font-medium rounded-md shrink-0 ${
-                locked
-                  ? "bg-brand text-white hover:bg-brand-dark"
-                  : "border border-slate-300 text-slate-600 hover:bg-slate-100"
-              }`}
-            >
-              {locked ? "Unlock" : "Lock"}
-            </button>
+          {effectiveLocked && askingPassword && (
+            <div className="mt-3 flex items-start gap-2">
+              <div className="flex-1">
+                <input
+                  type="password"
+                  name="settings-password"
+                  autoComplete="new-password"
+                  autoFocus
+                  value={passwordInput}
+                  onChange={(e) => setPasswordInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") handleUnlock(e);
+                  }}
+                  placeholder="Settings password"
+                  aria-label="Settings password"
+                  className="w-full rounded-md border border-slate-300 px-3 py-1.5 text-sm bg-white"
+                />
+                {unlockError && <p className="text-xs text-red-600 mt-1">{unlockError}</p>}
+              </div>
+              <button
+                type="button"
+                onClick={handleUnlock}
+                disabled={unlocking || !passwordInput}
+                className="px-3 py-1.5 text-xs font-medium rounded-md bg-brand text-white hover:bg-brand-dark disabled:opacity-50"
+              >
+                {unlocking ? "Checking…" : "Unlock"}
+              </button>
+              <button
+                type="button"
+                onClick={lockAgain}
+                className="px-3 py-1.5 text-xs rounded-md border border-slate-300 text-slate-600 hover:bg-slate-100"
+              >
+                Cancel
+              </button>
+            </div>
           )}
         </div>
 

@@ -28,6 +28,16 @@ export function recordingDisplayDate(ev) {
   return ev?.recording_date || ev?.detected_at;
 }
 
+// "08 Oct 2026" from a full timestamp (no time of day) - the "Added ..." date
+// on an action item. Uses the viewer's own timezone, so an item added late in
+// the evening shows the day it was added for them.
+export function formatAddedDate(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return "";
+  return d.toLocaleDateString(undefined, { day: "2-digit", month: "short", year: "numeric" });
+}
+
 export function formatMeetingDate(iso) {
   if (!iso) return "";
   const d = new Date(String(iso) + "T00:00:00");
@@ -65,10 +75,11 @@ export function formatRelativeDay(timestampMs) {
   return d.toLocaleDateString(undefined, { day: "2-digit", month: "short" });
 }
 
-// Automatic urgency for one task, derived purely from its own due_date vs
+// Automatic urgency for one item that has a due_date (today: commitments -
+// action items no longer carry a due date), derived purely from that date vs
 // today - never a status a person sets by hand. "red" = overdue, "yellow" =
 // due within 3 days, "green" = has a due date and isn't urgent yet, null =
-// no due date to judge urgency from (done tasks are never urgent).
+// no due date to judge urgency from (done items are never urgent).
 export function taskUrgency(task) {
   if (!task || task.status === "done" || !task.due_date) return null;
   const today = new Date();
@@ -81,18 +92,15 @@ export function taskUrgency(task) {
   return "green";
 }
 
-// A project's overall urgency is the worst urgency among its own open
-// tasks - one overdue task makes the whole project read red, same idea as
-// a build going red if any single check fails.
-export function projectUrgency(tasks) {
-  let worst = null;
-  for (const t of tasks) {
-    const u = taskUrgency(t);
-    if (u === "red") return "red";
-    if (u === "yellow") worst = "yellow";
-    else if (u === "green" && worst !== "yellow") worst = "green";
-  }
-  return worst;
+// Bullet-formatted field text (one "- line" per line) -> array of lines.
+// Tolerant of a plain sentence too (no leading "- ") - it just renders as
+// one line, never broken, if the model ever ignores the bullet instruction.
+export function toBullets(text) {
+  if (!text) return [];
+  return text
+    .split("\n")
+    .map((line) => line.replace(/^[-•]\s*/, "").trim())
+    .filter(Boolean);
 }
 
 export const TYPE_STYLES = {

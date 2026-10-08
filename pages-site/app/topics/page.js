@@ -6,18 +6,21 @@ import { Fragment, Suspense, useEffect, useRef, useState } from "react";
 import { api } from "../lib/api";
 import {
   formatAdded,
+  formatAddedDate,
   formatMeetingDate,
-  formatRelativeDay,
   formatTimeAgo,
-  projectUrgency,
   taskUrgency,
+  toBullets,
   TYPE_LABELS,
   TYPE_STYLES,
   URGENCY_STYLES,
 } from "../lib/format";
 import CalendarWidget from "../components/CalendarWidget";
+import ProjectGlance, { ANCHOR_KINDS } from "../components/ProjectGlance";
 import ProjectTabs from "../components/ProjectTabs";
 import TaskBoard from "../components/TaskBoard";
+import FileMetadata from "../components/FileMetadata";
+import { MeetingNotes, MeetingTypeEditor, WhoSaidWhat } from "../components/MeetingExtras";
 import {
   briefHtmlPage,
   briefMarkdown,
@@ -27,6 +30,18 @@ import {
   summaryCsv,
   tasksCsv,
 } from "../lib/demoFiles";
+
+// Optional sales-flavoured stage on a topic (additive - no topic type or
+// existing field changes meaning because of it).
+const STAGE_OPTIONS = [
+  { key: "intro", label: "Intro" },
+  { key: "discovery", label: "Discovery" },
+  { key: "solution", label: "Solution" },
+  { key: "commercial", label: "Commercial" },
+  { key: "won", label: "Won" },
+  { key: "lost", label: "Lost" },
+  { key: "delivery", label: "Delivery" },
+];
 
 const PROJECT_TABS = [
   { key: "overview", label: "Overview" },
@@ -216,6 +231,9 @@ function TopicDetailContent() {
   // from `activeTab` below (the unrelated "Manage sources" modal's own
   // fetch-method tab) to avoid confusing the two.
   const [projectTab, setProjectTab] = useState(() => searchParams.get("tab") || "overview");
+  // Which timeline entry an "at a glance" anchor asked the full timeline to open
+  // (n changes on every click so clicking the same anchor twice still reacts).
+  const [timelineFocus, setTimelineFocus] = useState({ key: null, n: 0 });
 
   function selectProjectTab(key) {
     setProjectTab(key);
@@ -255,6 +273,9 @@ function TopicDetailContent() {
   const [pasting, setPasting] = useState(false);
 
   const [meetingMetadata, setMeetingMetadata] = useState([]);
+  // Business events (emails, key documents, human notes) - merged into the
+  // timeline next to the existing client-side events.
+  const [businessEvents, setBusinessEvents] = useState([]);
 
   const [payrollRuns, setPayrollRuns] = useState([]);
   const [computingPayroll, setComputingPayroll] = useState(false);
@@ -316,6 +337,29 @@ function TopicDetailContent() {
     }
   }
 
+  async function loadBusinessEvents() {
+    try {
+      const evs = await api.getTimelineEvents(id);
+      setBusinessEvents((evs || []).filter((e) => e.kind !== "meeting"));
+    } catch (e) {
+      console.error("Could not load timeline events:", e.message);
+    }
+  }
+
+  // A meeting type/sequence edit or a new note changes the meeting list and
+  // what the timeline shows - refresh both.
+  function handleMeetingChanged() {
+    loadMeetingMetadata();
+    loadBusinessEvents();
+  }
+
+  // A file's metadata edit/confirm: patch the loaded file in place (no full
+  // reload, so the open Manage sources list keeps its scroll position).
+  function handleFileMetaChanged(fileId, meta) {
+    setTopic((t) => (t ? { ...t, files: t.files.map((f) => (f.id === fileId ? { ...f, ...meta } : f)) } : t));
+    loadBusinessEvents();
+  }
+
   async function loadCalendar() {
     try {
       setCalendarEvents(await api.getCalendar(id));
@@ -364,9 +408,14 @@ function TopicDetailContent() {
     }
   }
 
-  async function handleSaveProjectState(currentPosition) {
+  async function handleSaveProjectState(currentPosition, topicFields) {
     const state = await api.updateProjectState(id, currentPosition);
     setProjectState(state);
+    // Optional Stage / Customer name - only sent when one actually changed.
+    if (topicFields && Object.keys(topicFields).length > 0) {
+      await api.updateTopic(id, topicFields);
+      load();
+    }
   }
 
   async function handleImportTasksCsv(e) {
@@ -429,6 +478,7 @@ function TopicDetailContent() {
 
   async function refreshExtras() {
     loadMeetingMetadata();
+    loadBusinessEvents();
     loadCalendar();
     loadTasks();
     loadCommitments();
@@ -542,6 +592,17 @@ function TopicDetailContent() {
 
   function handleExportTasksCsv() {
     downloadText(`${exportBaseName()}-tasks.csv`, "text/csv", tasksCsv(tasks));
+  }
+
+  // One row per file: document type, topic tags, signal, state, review notes
+  // (+ phase, version, date, participants) - built in the browser.
+  async function handleExportMetadataCsv() {
+    try {
+      const { filename, csv } = await api.getMetadataCsv(id);
+      downloadText(filename, "text/csv", csv);
+    } catch (e) {
+      setError(e.message);
+    }
   }
 
   async function handleAddFolder(e) {
@@ -727,8 +788,15 @@ function TopicDetailContent() {
     return <div className="max-w-4xl mx-auto px-6 py-10 text-slate-400 text-sm">Loading...</div>;
   }
 
-  const urgency = projectUrgency(tasks);
-  const urgencyStyle = urgency ? URGENCY_STYLES[urgency] : null;
+  // The "at a glance" anchors: the events worth a place on the one-screen
+  // timeline (meetings, key documents, emails, notes) - not every task/status
+  // entry, which stay in the full timeline further down.
+  const timelineEvents = buildTimelineEvents(topic, meetingMetadata, tasks, summaryHistory, workflowHistory, businessEvents);
+  const glanceAnchors = timelineEvents.filter((e) => ANCHOR_KINDS.includes(e.kind)).slice(-10);
+
+  function focusTimelineEvent(key) {
+    setTimelineFocus((prev) => ({ key, n: prev.n + 1 }));
+  }
 
   return (
     <div className="w-full">
@@ -744,12 +812,17 @@ function TopicDetailContent() {
           >
             {TYPE_LABELS[topic.topic_type] || topic.topic_type}
           </span>
-          {urgencyStyle && (
+          {topic.stage && (
             <span
-              className={`inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full font-medium shrink-0 ${urgencyStyle.bg} ${urgencyStyle.text} border ${urgencyStyle.border}`}
+              data-testid="topic-stage"
+              className="text-xs px-2 py-0.5 rounded-full font-medium shrink-0 bg-violet-50 text-violet-700 border border-violet-100"
             >
-              <span className={`w-1.5 h-1.5 rounded-full ${urgencyStyle.dot}`} />
-              {urgencyStyle.label}
+              Stage: {STAGE_OPTIONS.find((st) => st.key === topic.stage)?.label || topic.stage}
+            </span>
+          )}
+          {topic.customer_name && (
+            <span data-testid="topic-customer" className="text-xs text-ink-muted shrink-0 truncate max-w-[200px]">
+              {topic.customer_name}
             </span>
           )}
         </div>
@@ -837,6 +910,17 @@ function TopicDetailContent() {
                 >
                   {importingTasksCsv ? "Importing…" : "↑ Import edited tasks (.csv)"}
                 </button>
+                <div className="mt-1 px-3 py-1.5 text-[11px] font-semibold uppercase tracking-wider text-ink-muted border-t border-border-warm">
+                  Files
+                </div>
+                <button
+                  type="button"
+                  onClick={() => { handleExportMetadataCsv(); setDataMenuOpen(false); }}
+                  className="w-full text-left px-3 py-1.5 text-slate-700 hover:bg-slate-50"
+                  title="One row per file: document type, topic tags, signal, state, review notes"
+                >
+                  ↓ Export metadata CSV
+                </button>
               </div>
             )}
           </div>
@@ -897,11 +981,26 @@ function TopicDetailContent() {
           per direct product feedback: no fragmented chat surface inside
           OrientMe itself; asking questions stays a backend capability, not
           a UI here - see api.ask()). */}
-      <div className="max-w-5xl mx-auto px-6 py-6">
+      <div className={`${projectTab === "overview" ? "max-w-7xl" : "max-w-5xl"} mx-auto px-6 py-4`}>
         {projectTab === "overview" && (
+          <div className="space-y-6">
+          <ProjectGlance
+            summary={summary}
+            projectState={projectState}
+            commitments={commitments}
+            tasks={tasks}
+            files={topic.files}
+            anchors={glanceAnchors}
+            refreshing={refreshingSummary}
+            hasFiles={topic.files.length > 0}
+            onRefresh={handleRefreshSummary}
+            onOpenSources={() => setSourcesModalOpen(true)}
+            onGoTo={selectProjectTab}
+            onAnchorClick={focusTimelineEvent}
+            onViewTimeline={() => focusTimelineEvent(null)}
+          />
           <div className="grid grid-cols-1 lg:grid-cols-[1fr_300px] gap-4 items-start">
             <div className="space-y-4 min-w-0">
-              <AttentionCard tasks={tasks} commitments={commitments} limit={5} onViewAll={() => selectProjectTab("work")} />
               <ContextBriefPanel
                 topic={topic}
                 summary={summary}
@@ -917,6 +1016,7 @@ function TopicDetailContent() {
                 workflowHistory={workflowHistory}
                 onOpenSources={() => setSourcesModalOpen(true)}
                 projectState={projectState}
+                businessEvents={businessEvents}
               />
             </div>
             <div className="lg:sticky lg:top-4 min-w-0">
@@ -926,8 +1026,11 @@ function TopicDetailContent() {
                 tasks={tasks}
                 summaryHistory={summaryHistory}
                 workflowHistory={workflowHistory}
+                businessEvents={businessEvents}
+                focus={timelineFocus}
               />
             </div>
+          </div>
           </div>
         )}
 
@@ -961,7 +1064,7 @@ function TopicDetailContent() {
                 <div className="flex flex-wrap gap-3">
                   {meetingMetadata.map((m) => (
                     <div key={m.id} className="flex-1 min-w-[220px]">
-                      <MeetingInfoCard entry={m} />
+                      <MeetingInfoCard entry={m} topicId={id} onChanged={handleMeetingChanged} />
                     </div>
                   ))}
                 </div>
@@ -985,6 +1088,7 @@ function TopicDetailContent() {
       {editProjectOpen && (
         <EditProjectModal
           projectState={projectState}
+          topic={topic}
           onClose={() => setEditProjectOpen(false)}
           onSave={handleSaveProjectState}
         />
@@ -1286,20 +1390,31 @@ function TopicDetailContent() {
               {topic.files.map((f) => (
                 <li key={f.id} className="text-xs border-b border-slate-50 pb-2 last:border-0">
                   {f.extraction_error ? (
-                    <span className="text-red-600">
-                      ⚠ {(f.display_name || f.path).split(/[\\/]/).pop()} — {f.extraction_error}
-                    </span>
+                    <>
+                      <span className="text-red-600">
+                        ⚠ {(f.display_name || f.path).split(/[\\/]/).pop()} — {f.extraction_error}
+                      </span>
+                      <FileMetadata file={f} onChanged={handleFileMetaChanged} />
+                    </>
                   ) : (
                     <>
                       <div className="flex items-center justify-between gap-2">
-                        <span className="font-mono text-slate-700 truncate">
-                          {(f.display_name || f.path).split(/[\\/]/).pop()}
+                        {/* What the file IS first (its template name, e.g. "Proposal V2"),
+                            its real file name second - a renamed file still reads right. */}
+                        <span className="font-medium text-slate-800 truncate">
+                          {f.display_title || (f.display_name || f.path).split(/[\\/]/).pop()}
                         </span>
                         <span className="text-[10px] uppercase tracking-wide text-slate-400 shrink-0">
                           {SOURCE_METHOD_LABELS[f.source_method] || f.source_method}
                         </span>
                       </div>
+                      {f.display_title && f.display_title !== (f.display_name || "").split(/[\\/]/).pop() && (
+                        <p className="font-mono text-[11px] text-slate-400 truncate">
+                          {(f.display_name || f.path).split(/[\\/]/).pop()}
+                        </p>
+                      )}
                       <span className="text-slate-400">Added {formatAdded(f.first_added_at)}</span>
+                      <FileMetadata file={f} onChanged={handleFileMetaChanged} />
                     </>
                   )}
                 </li>
@@ -1313,24 +1428,14 @@ function TopicDetailContent() {
   );
 }
 
-// Bullet-formatted field text ("- line one\n- line two") -> array of lines.
-// Tolerant of a plain sentence too (no leading "- ") - it just renders as
-// one line, never broken, if the model ever ignores the bullet instruction.
-function toBullets(text) {
-  if (!text) return [];
-  return text
-    .split("\n")
-    .map((line) => line.replace(/^[-•]\s*/, "").trim())
-    .filter(Boolean);
-}
-
-// The "Context Node" one-screen primary view - follows the supplied UI
-// prototype's low-friction capture pattern
-// Products (1).md") - Current Objective / Where was I / Next-Waiting-Open
-// Questions / Recent Activity / Key State / Launchers - replacing the
-// earlier flat 7-section dump, which he called out as "becoming fixed"
-// (24 Sep standup). Persisted (CaseSummary) so it doesn't need a fresh
-// question typed in every time this page is opened.
+// The "Context Node" - the one-click questions, the AI's longer sections for
+// the question just asked, key-state counts, launchers and prompt history.
+// Persisted (CaseSummary) so it doesn't need a fresh question typed in every
+// time this page is opened.
+//
+// The first screen of the Overview is ProjectGlance (where we are, needs
+// attention, timeline anchors, Next / Waiting on / Open questions / Action
+// items); this panel sits underneath it.
 // topic.messages alternates user/assistant, one pair per _ask_topic call -
 // pairs each question with the answer that immediately followed it.
 function buildPromptHistory(messages) {
@@ -1366,6 +1471,7 @@ function ContextBriefPanel({
   workflowHistory,
   onOpenSources,
   projectState,
+  businessEvents,
 }) {
   const byPath = Object.fromEntries((files || []).map((f) => [f.path, f]));
   const fieldSources = summary?.field_sources || {};
@@ -1406,35 +1512,6 @@ function ContextBriefPanel({
       </p>
     );
   }
-
-  function BulletColumn({ icon, label, text, sourceKey }) {
-    const bullets = toBullets(text);
-    if (bullets.length === 0) return null;
-    return (
-      <div className="flex-1 min-w-[150px]">
-        <p className="text-[11px] font-semibold uppercase tracking-wider text-ink-muted mb-1">
-          {icon} {label}
-        </p>
-        <ul className="space-y-0.5">
-          {bullets.map((b, i) => (
-            <li key={i} className="text-sm text-slate-700 flex gap-1.5">
-              <span className="text-slate-300 shrink-0">•</span>
-              <span>{b}</span>
-            </li>
-          ))}
-        </ul>
-        {sourceKey && <EditLinks paths={fieldSources[sourceKey]} />}
-      </div>
-    );
-  }
-
-  // Compact Recent Activity - top 4, newest first. The full history lives
-  // in Project Timeline further down this same page (#project-timeline).
-  const recentEvents = summary
-    ? [...buildTimelineEvents(topic, meetingMetadata, tasks, summaryHistory, workflowHistory)]
-        .reverse()
-        .slice(0, 4)
-    : [];
 
   const stakeholderNames = collectStakeholders(meetingMetadata, topic.related_people);
   const firstFolder = topic.folders?.[0];
@@ -1497,30 +1574,6 @@ function ContextBriefPanel({
         </div>
       )}
 
-      {/* Explicit Project Intelligence - a person's own stated current
-          position, distinct from (and higher-priority to the LLM than) the
-          AI-regenerated brief below. Always visible, even before any brief
-          has been generated. */}
-      <div className="mb-3 pb-3 border-b border-brand/10">
-        <p className="text-[11px] font-semibold uppercase tracking-wider text-ink-muted mb-1">
-          📝 Current Position (confirmed)
-        </p>
-        {(projectState?.current_position || "").trim() ? (
-          <>
-            <p className="text-sm text-slate-800 whitespace-pre-wrap">{projectState.current_position}</p>
-            <p className="text-[11px] text-slate-400 mt-1">
-              Updated by {projectState.updated_by || "someone"}
-              {projectState.updated_at ? ` · ${formatTimeAgo(projectState.updated_at)}` : ""}
-            </p>
-          </>
-        ) : (
-          <p className="text-xs text-slate-500">
-            Not set yet — use &ldquo;✎ Edit Project&rdquo; above to state where things actually
-            stand, so OrientMe treats it as ground truth without editing any source document.
-          </p>
-        )}
-      </div>
-
       {!summary && (
         <p className="text-xs text-slate-500">
           {hasFiles
@@ -1552,32 +1605,6 @@ function ContextBriefPanel({
             <p className="text-sm text-slate-800">{summary.answer_summary}</p>
           )}
 
-          {(summary.why_now || "").trim() && (
-            <div>
-              <p className="text-[11px] font-semibold uppercase tracking-wider text-ink-muted mb-0.5">
-                🎯 Current objective
-              </p>
-              <p className="text-sm text-slate-800 font-medium">{summary.why_now}</p>
-            </div>
-          )}
-
-          {toBullets(summary.current_state).length > 0 && (
-            <div>
-              <p className="text-[11px] font-semibold uppercase tracking-wider text-ink-muted mb-1">
-                ▶ Current Position
-              </p>
-              <ul className="space-y-0.5">
-                {toBullets(summary.current_state).map((b, i) => (
-                  <li key={i} className="text-sm text-slate-700 flex gap-1.5">
-                    <span className="text-slate-300 shrink-0">•</span>
-                    <span>{b}</span>
-                  </li>
-                ))}
-              </ul>
-              <EditLinks paths={fieldSources.current_state} />
-            </div>
-          )}
-
           {/* Dynamic, question-specific sections - only render the ones the
               LLM actually filled in for this particular answer (per prompt
               rule in llm_brief.py: each of these fires only for a specific
@@ -1602,28 +1629,6 @@ function ContextBriefPanel({
                   <EditLinks paths={fieldSources[key]} />
                 </div>
               )
-          )}
-
-          <div className="flex flex-wrap gap-4 border-t border-brand/10 pt-3">
-            <BulletColumn icon="➜" label="Next" text={summary.next_step} sourceKey="next_step" />
-            <BulletColumn icon="⏳" label="Waiting" text={summary.promises_made} sourceKey="promises_made" />
-            <BulletColumn icon="❓" label="Open questions" text={summary.risks_and_gaps} sourceKey="risks_and_gaps" />
-          </div>
-
-          {recentEvents.length > 0 && (
-            <div className="border-t border-brand/10 pt-3">
-              <p className="text-[11px] font-semibold uppercase tracking-wider text-ink-muted mb-1">
-                🕘 Recent activity
-              </p>
-              <ul className="space-y-1">
-                {recentEvents.map((e) => (
-                  <li key={e.key} className="text-sm text-slate-700 flex gap-2">
-                    <span className="text-slate-400 w-14 shrink-0">{formatRelativeDay(e.sortTs)}</span>
-                    <span>{e.label}</span>
-                  </li>
-                ))}
-              </ul>
-            </div>
           )}
 
           {/* Decisions/Commitments/Facts aren't tracked as their own fields
@@ -1760,77 +1765,6 @@ function ContextBriefPanel({
           <p className="text-[11px] text-slate-400">Generated {formatAdded(summary.generated_at)}</p>
         </div>
       )}
-    </section>
-  );
-}
-
-// "What needs my attention" - calm and minimal, not a notification feed.
-// Computed client-side from Task.due_date (see lib/format.taskUrgency) -
-// no new backend data needed. Renders nothing at all when there's genuinely
-// nothing to flag, matching this page's existing "don't show empty
-// sections" convention.
-// Trimmed to the top few items (spec: "do not flood this section with
-// ordinary tasks") with a "View all →" out to the Action Items tab, where every
-// task/commitment is visible in full. Overdue commitments rank above
-// overdue tasks (a person's broken promise is a higher signal than a
-// slipping task), matching the spec's own attention-priority ordering.
-function AttentionCard({ tasks, commitments, limit = 5, onViewAll }) {
-  const items = [
-    ...(commitments || []).map((c) => ({
-      id: `c-${c.id}`,
-      label: `${c.person}: ${c.commitment}`,
-      due_date: c.due_date,
-      urgency: taskUrgency(c),
-      type: "commitment",
-    })),
-    ...(tasks || []).map((t) => ({
-      id: `t-${t.id}`,
-      label: t.title,
-      due_date: t.due_date,
-      urgency: taskUrgency(t),
-      type: "task",
-    })),
-  ].filter((i) => i.urgency === "red" || i.urgency === "yellow");
-
-  if (items.length === 0) return null;
-
-  items.sort((a, b) => {
-    const rank = (i) => (i.urgency === "red" ? 0 : 2) + (i.type === "commitment" ? 0 : 1);
-    return rank(a) - rank(b);
-  });
-
-  const shown = items.slice(0, limit);
-  const hiddenCount = items.length - shown.length;
-
-  return (
-    <section className="rounded-xl border border-border-warm border-l-4 border-l-accent-orange bg-white shadow-sm p-4 min-w-0">
-      <div className="flex items-center justify-between gap-2 mb-2">
-        <h2 className="text-[15px] font-bold text-[#1a1a1a]">⚠ What needs your attention</h2>
-        {onViewAll && (
-          <button
-            type="button"
-            onClick={onViewAll}
-            className="text-xs font-medium text-amber-700 hover:underline shrink-0"
-          >
-            View all →
-          </button>
-        )}
-      </div>
-      <ul className="space-y-1">
-        {shown.map((i) => (
-          <li key={i.id} className={`text-sm flex gap-1.5 ${i.urgency === "red" ? "text-red-700" : "text-amber-800"}`}>
-            <span className="shrink-0">●</span>
-            <span>
-              {i.label}{" "}
-              <span className={i.urgency === "red" ? "text-red-500" : "text-amber-600"}>
-                — {i.urgency === "red" ? "overdue" : "due soon"}
-                {i.due_date ? ` (${i.due_date})` : ""}
-              </span>
-            </span>
-          </li>
-        ))}
-      </ul>
-      {hiddenCount > 0 && <p className="text-[11px] text-amber-700 mt-1.5">+{hiddenCount} more</p>}
     </section>
   );
 }
@@ -2331,24 +2265,6 @@ function WorkTabPanel({ topicId, tasks, onChanged, topicType, payrollRuns, compu
     }
   }
 
-  async function handleStatusChange(taskId, status) {
-    try {
-      await api.updateTask(taskId, { status });
-      onChanged();
-    } catch (e) {
-      alert(e.message);
-    }
-  }
-
-  async function handleDueDateChange(taskId, dueDate) {
-    try {
-      await api.updateTask(taskId, { due_date: dueDate || null });
-      onChanged();
-    } catch (e) {
-      alert(e.message);
-    }
-  }
-
   return (
     <div className="space-y-4">
       <section className="rounded-lg border border-slate-200 bg-white p-4 min-w-0">
@@ -2390,8 +2306,6 @@ function WorkTabPanel({ topicId, tasks, onChanged, topicType, payrollRuns, compu
         )}
         <TaskBoard
           tasks={tasks}
-          onStatusChange={handleStatusChange}
-          onDueDateChange={handleDueDateChange}
           emptyMessage="No tasks yet — they're pulled automatically from meeting transcripts, or add one directly."
         />
       </section>
@@ -2415,14 +2329,19 @@ function WorkTabPanel({ topicId, tasks, onChanged, topicType, payrollRuns, compu
 // Explicit "Project Intelligence" editing - same overlay/close-button shell
 // as CalendarModal/ManageSourcesModal further down this file, not a new
 // pattern.
-function EditProjectModal({ projectState, onClose, onSave }) {
+function EditProjectModal({ projectState, topic, onClose, onSave }) {
   const [value, setValue] = useState(projectState?.current_position || "");
+  const [stage, setStage] = useState(topic?.stage || "");
+  const [customerName, setCustomerName] = useState(topic?.customer_name || "");
   const [saving, setSaving] = useState(false);
 
   async function handleSave() {
     setSaving(true);
     try {
-      await onSave(value);
+      const topicFields = {};
+      if (stage !== (topic?.stage || "")) topicFields.stage = stage;
+      if (customerName.trim() !== (topic?.customer_name || "")) topicFields.customer_name = customerName.trim();
+      await onSave(value, topicFields);
       onClose();
     } catch (e) {
       alert(e.message);
@@ -2457,6 +2376,34 @@ function EditProjectModal({ projectState, onClose, onSave }) {
             className="w-full text-sm border border-slate-200 rounded-md px-3 py-2"
             autoFocus
           />
+          {/* Optional - for tracking a customer opportunity through its
+              stages; leaving both blank changes nothing. */}
+          <div className="grid grid-cols-2 gap-3 mt-3">
+            <label className="block text-xs text-slate-500">
+              Stage (optional)
+              <select
+                value={stage}
+                onChange={(e) => setStage(e.target.value)}
+                className="mt-1 w-full text-sm border border-slate-200 rounded-md px-2 py-1.5 bg-white text-slate-800"
+              >
+                <option value="">Not set</option>
+                {STAGE_OPTIONS.map((st) => (
+                  <option key={st.key} value={st.key}>
+                    {st.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="block text-xs text-slate-500">
+              Customer name (optional)
+              <input
+                value={customerName}
+                onChange={(e) => setCustomerName(e.target.value)}
+                maxLength={200}
+                className="mt-1 w-full text-sm border border-slate-200 rounded-md px-2 py-1.5 text-slate-800"
+              />
+            </label>
+          </div>
         </div>
         <div className="flex items-center justify-end gap-2 px-4 pb-4">
           <button
@@ -2571,7 +2518,7 @@ function ManageSourcesModal({ onClose, children }) {
   );
 }
 
-function MeetingInfoCard({ entry }) {
+function MeetingInfoCard({ entry, topicId, onChanged }) {
   const name = fileDisplayName(entry);
   const dateLabel = formatMeetingDate(entry.meeting_date);
   const chip = [dateLabel, entry.meeting_time].filter(Boolean).join(" · ");
@@ -2612,6 +2559,13 @@ function MeetingInfoCard({ entry }) {
       {entry.meeting_title && (
         <p className="text-[11px] text-slate-400 mt-2 font-mono truncate">{name}</p>
       )}
+      {topicId && (
+        <>
+          <MeetingTypeEditor entry={entry} onChanged={onChanged} />
+          <WhoSaidWhat entry={entry} />
+          <MeetingNotes topicId={topicId} entry={entry} onChanged={onChanged} />
+        </>
+      )}
     </div>
   );
 }
@@ -2631,7 +2585,14 @@ const TIMELINE_DOT_STYLES = {
   "status-update": "bg-violet-500",
   "payroll-computed": "bg-amber-400",
   "payroll-approved": "bg-amber-600",
+  email: "bg-sky-500",
+  document: "bg-indigo-500",
+  note: "bg-amber-500",
 };
+
+// Small marker in front of the label for the business event kinds, so they
+// read apart from meetings/tasks at a glance (existing kinds get none).
+const TIMELINE_KIND_ICONS = { email: "✉", document: "📄", note: "📝" };
 
 function truncateText(text, max) {
   if (!text) return "";
@@ -2643,8 +2604,28 @@ function truncateText(text, max) {
 // entry, oldest first) share one computation - two independent copies of
 // this merge/label logic already drifted apart once this session (see the
 // meeting-title dedup fix), not repeating that.
-function buildTimelineEvents(topic, meetingMetadata, tasks, summaryHistory, workflowHistory) {
+function buildTimelineEvents(topic, meetingMetadata, tasks, summaryHistory, workflowHistory, businessEvents) {
   const events = [];
+
+  // Emails, key documents (proposal/quotation/PRD/charter/plan) and human
+  // notes from getTimelineEvents() - meetings are NOT taken from there (they
+  // already come from meetingMetadata below, with type + sequence in
+  // timeline_title), so nothing shows twice.
+  (businessEvents || []).forEach((b, i) => {
+    if (!b.date || !TIMELINE_KIND_ICONS[b.kind]) return;
+    const dateOnly = String(b.date).length <= 10;
+    const ts = new Date(dateOnly ? `${b.date}T00:00:00` : b.date).getTime();
+    if (isNaN(ts)) return;
+    events.push({
+      key: `${b.kind}-${b.file_id || b.note_id || i}`,
+      sortTs: ts,
+      dateLabel: dateOnly ? `${formatMeetingDate(b.date)}${b.approx_date ? " (approx.)" : ""}` : formatAdded(b.date),
+      label: b.title,
+      kind: b.kind,
+      path: "",
+      detail: b,
+    });
+  });
 
   meetingMetadata.forEach((m) => {
     if (!m.meeting_date) return;
@@ -2753,9 +2734,22 @@ function buildTimelineEvents(topic, meetingMetadata, tasks, summaryHistory, work
 // The compact, height-bounded sidebar column used on the Overview tab, next
 // to Context Node (the separate Timeline tab this once also powered was
 // redundant with this column and was removed - see PROJECT_TABS above).
-function ProjectTimeline({ topic, meetingMetadata, tasks, summaryHistory, workflowHistory }) {
+function ProjectTimeline({ topic, meetingMetadata, tasks, summaryHistory, workflowHistory, businessEvents, focus }) {
   const [expandedKey, setExpandedKey] = useState(null);
-  const events = buildTimelineEvents(topic, meetingMetadata, tasks, summaryHistory, workflowHistory);
+  const events = buildTimelineEvents(topic, meetingMetadata, tasks, summaryHistory, workflowHistory, businessEvents);
+
+  // An anchor on the "at a glance" strip (or its "Full timeline" link) asks
+  // this list to open that entry and bring it into view.
+  const [handledFocus, setHandledFocus] = useState(0);
+  if (focus && focus.n !== handledFocus) {
+    setHandledFocus(focus.n);
+    setExpandedKey(focus.key);
+  }
+  useEffect(() => {
+    if (!focus || !focus.n) return;
+    const el = focus.key ? document.getElementById(`tl-${focus.key}`) : document.getElementById("project-timeline");
+    el?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }, [focus]);
 
   if (events.length === 0) return null;
 
@@ -2776,7 +2770,7 @@ function ProjectTimeline({ topic, meetingMetadata, tasks, summaryHistory, workfl
         {events.map((e, i) => {
           const expanded = expandedKey === e.key;
           return (
-            <div key={e.key} className="flex gap-2">
+            <div key={e.key} id={`tl-${e.key}`} className="flex gap-2">
               <div className="flex flex-col items-center pt-1.5">
                 <span className={`w-2 h-2 rounded-full shrink-0 ${TIMELINE_DOT_STYLES[e.kind] || "bg-slate-300"}`} />
                 {i < events.length - 1 && <span className="w-px flex-1 bg-slate-200 my-1" />}
@@ -2791,6 +2785,7 @@ function ProjectTimeline({ topic, meetingMetadata, tasks, summaryHistory, workfl
                     {e.dateLabel}
                   </span>
                   <span className="block text-[12.5px] font-medium text-slate-700 leading-snug group-hover:text-brand">
+                    {TIMELINE_KIND_ICONS[e.kind] && <span className="mr-1">{TIMELINE_KIND_ICONS[e.kind]}</span>}
                     {e.label}
                   </span>
                 </button>
@@ -2831,12 +2826,10 @@ function ProjectTimeline({ topic, meetingMetadata, tasks, summaryHistory, workfl
                             {e.detail.assignee}
                           </p>
                         )}
-                        {e.detail.due_date && (
-                          <p>
-                            <span className="font-medium text-slate-500">Due: </span>
-                            {formatMeetingDate(e.detail.due_date)}
-                          </p>
-                        )}
+                        <p>
+                          <span className="font-medium text-slate-500">Added: </span>
+                          {formatAddedDate(e.detail.created_at)}
+                        </p>
                         <p>
                           <span className="font-medium text-slate-500">Status: </span>
                           {e.detail.status}
@@ -2861,6 +2854,18 @@ function ProjectTimeline({ topic, meetingMetadata, tasks, summaryHistory, workfl
                           <p>
                             <span className="font-medium text-slate-500">Next step: </span>
                             {e.detail.next_step}
+                          </p>
+                        )}
+                      </>
+                    )}
+                    {(e.kind === "email" || e.kind === "document") && e.detail.body && <p>{e.detail.body}</p>}
+                    {e.kind === "note" && (
+                      <>
+                        <p className="whitespace-pre-wrap">{e.detail.body}</p>
+                        {(e.detail.author || e.detail.meeting_title) && (
+                          <p className="text-slate-400">
+                            {e.detail.author}
+                            {e.detail.meeting_title ? ` · after ${e.detail.meeting_title}` : ""}
                           </p>
                         )}
                       </>

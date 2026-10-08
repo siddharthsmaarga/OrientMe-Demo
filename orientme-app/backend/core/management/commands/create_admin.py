@@ -10,8 +10,11 @@ class Command(BaseCommand):
     previously documented or automated. A plain `createsuperuser` alone
     isn't enough: this app has no signal wiring a Profile row to every new
     User, so a superuser created that way still reads back as role='user'
-    from _profile_payload's own graceful-default behavior (see views.py)
-    and can't reach admin-only actions like Settings' API key field.
+    from _profile_payload's own graceful-default behavior (see views.py).
+
+    Since 8 Oct 2026 the app has one shared login (settings.SINGLE_LOGIN_USERNAME)
+    and the Settings page is guarded by a password instead of the admin role, so
+    this command now only matters for the Django admin site (/admin/).
 
     Usage: python manage.py create_admin --username admin --password change-me
     """

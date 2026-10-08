@@ -16,6 +16,20 @@
 
 import { store, newId } from "./fixtures";
 import { generateDemoAnswer } from "./localModel";
+import { findSupportingPassage } from "./evidence";
+import {
+  DOC_TYPE_LABELS,
+  MEETING_TYPE_LABELS,
+  TIMELINE_DOC_TYPES,
+  csvPhase,
+  displayTitle,
+  ensureFileMeta,
+  meetingTimelineTitle,
+  normaliseTags,
+  speakerSummary,
+  tagList,
+} from "./docMeta";
+import { metadataCsv } from "./demoFiles";
 
 // Deterministic, code-based meeting summary - ported from the real app's
 // core/extraction.py::build_meeting_summary. No model call at all (not
@@ -126,6 +140,14 @@ function ingestEventIntoTopic(ev, topic) {
   });
 }
 
+export const DEMO_SETTINGS_PASSWORD = "demo";
+
+function requireSettingsPassword(supplied) {
+  if (supplied !== DEMO_SETTINGS_PASSWORD) {
+    throw new Error('403 Forbidden: {"error": "The settings password is missing or wrong.", "code": "settings_password"}');
+  }
+}
+
 function wait(ms = 220) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -134,13 +156,55 @@ function topicBrief(t) {
   return { id: t.id, name: t.name, one_liner: t.one_liner, topic_type: t.topic_type };
 }
 
-function fileWithMeta(f) {
+// Meeting-side additions (type + sequence, who-said-what summary, notes).
+// speaker_turns itself stays in the store; only the code-built summary and a
+// count are exposed, like the real meeting serializer.
+function meetingExtras(meta) {
+  const turns = meta.speaker_turns || [];
   return {
+    meeting_type: meta.meeting_type || "",
+    meeting_type_label: MEETING_TYPE_LABELS[meta.meeting_type] || "",
+    meeting_sequence: meta.meeting_sequence ?? null,
+    meeting_type_source: meta.meeting_type_source || "",
+    speaker_turn_count: turns.length,
+    speaker_summary: speakerSummary(turns),
+  };
+}
+
+function metaKeys(f) {
+  ensureFileMeta(f);
+  const tags = tagList(f.topic_tags);
+  return {
+    doc_type: f.doc_type,
+    doc_type_label: DOC_TYPE_LABELS[f.doc_type] || "",
+    doc_type_source: f.doc_type_source || "",
+    // What the file IS ("Proposal V2"), shown ahead of its real file name.
+    display_title: displayTitle(f),
+    topic_tags: tags.join(", "),
+    topic_tag_list: tags,
+    signal: f.signal || "",
+    meta_state: f.meta_state || "",
+    review_notes: f.review_notes || "",
+    version_label: f.version_label || "",
+    document_date: f.document_date || null,
+    meta_seconds: f.meta_seconds ?? null,
+  };
+}
+
+function fileWithMeta(f) {
+  const meta = f.meta
+    ? (() => {
+        const { speaker_turns, ...rest } = f.meta;
+        return { ...rest, ...meetingExtras(f.meta) };
+      })()
+    : null;
+  return {
+    ...metaKeys(f),
     id: f.id,
     path: f.path,
     display_name: f.display_name,
     source_method: f.source_method,
-    artifact_type: f.meta ? "meeting" : "file",
+    artifact_type: f.meta ? "meeting" : f.doc_type === "email" ? "email" : "file",
     content_hash: f.content_hash,
     extraction_error: f.extraction_error,
     // Fixture-only: lets the "Edit" link on a cited source open the sample
@@ -148,7 +212,7 @@ function fileWithMeta(f) {
     extracted_text: f.extracted_text || "",
     first_added_at: f.first_added_at,
     last_ingested_at: f.last_ingested_at,
-    meta: f.meta,
+    meta,
   };
 }
 
@@ -187,6 +251,8 @@ function topicListItem(topic) {
     one_liner: topic.one_liner,
     related_people: topic.related_people,
     created_at: topic.created_at,
+    stage: topic.stage || "",
+    customer_name: topic.customer_name || "",
     folders: store.folders.filter((f) => f.topic === topic.id),
     file_count: topicFiles(topic.id).length,
     last_activity_at: lastActivityAt(topic),
@@ -200,6 +266,12 @@ function topicDetail(topic) {
     files: topicFiles(topic.id).map(fileWithMeta),
     messages: store.messages.filter((m) => m.topic === topic.id),
   };
+}
+
+// The task shape the API returns: action items carry no due date.
+function taskOut(t) {
+  const { due_date, ...rest } = t;
+  return { ...rest, topic_name: findTopic(t.topic)?.name || "" };
 }
 
 function findTopic(id) {
@@ -227,7 +299,7 @@ function readLocalProjects() {
 
 function saveLocalProjects() {
   if (typeof window === "undefined") return;
-  const demoIds = new Set([1, 2, 3]);
+  const demoIds = new Set([1, 2, 3, 4]);
   const localProjects = store.topics.filter((topic) => !demoIds.has(Number(topic.id)));
   try {
     window.localStorage.setItem(LOCAL_PROJECTS_KEY, JSON.stringify(localProjects));
@@ -353,6 +425,38 @@ function recordMessages(topicId, question, answer) {
   });
 }
 
+function noteOut(n) {
+  const f = n.meta ? store.files.find((x) => x.meta && x.meta.id === n.meta) : null;
+  return {
+    id: n.id,
+    topic: n.topic,
+    meta: n.meta,
+    meeting_title: f?.meta?.meeting_title || "",
+    meeting_date: f?.meta?.meeting_date || null,
+    text: n.text,
+    author: n.author,
+    created_at: n.created_at,
+  };
+}
+
+function meetingEntry(f) {
+  return {
+    id: f.meta.id,
+    file_id: f.id,
+    file_display_name: f.display_name,
+    file_path: f.path,
+    meeting_title: f.meta.meeting_title,
+    timeline_title: meetingTimelineTitle(f.meta, f.display_name),
+    meeting_date: f.meta.meeting_date,
+    meeting_time: f.meta.meeting_time,
+    attendees: f.meta.attendees,
+    agenda: f.meta.agenda,
+    achieved: f.meta.achieved,
+    ...meetingExtras(f.meta),
+    notes: store.notes.filter((n) => n.meta === f.meta.id).map(noteOut),
+  };
+}
+
 export const api = {
   listTopics: async () => {
     await wait();
@@ -398,6 +502,8 @@ export const api = {
       one_liner: data.one_liner || "",
       related_people: data.related_people || "",
       created_at: new Date().toISOString(),
+      stage: data.stage || "",
+      customer_name: data.customer_name || "",
     };
     store.topics.unshift(topic);
     saveLocalProjects();
@@ -536,19 +642,220 @@ export const api = {
     await wait();
     return topicFiles(Number(topicId))
       .filter((f) => f.meta)
-      .map((f) => ({
-        id: f.meta.id,
-        file_display_name: f.display_name,
-        file_path: f.path,
-        meeting_title: f.meta.meeting_title,
-        timeline_title: f.meta.meeting_title,
-        meeting_date: f.meta.meeting_date,
-        meeting_time: f.meta.meeting_time,
-        attendees: f.meta.attendees,
-        agenda: f.meta.agenda,
-        achieved: f.meta.achieved,
-      }))
+      .map(meetingEntry)
       .sort((a, b) => (b.meeting_date || "").localeCompare(a.meeting_date || ""));
+  },
+  // Meeting type + sequence (editable; marks it as set by a person) - the
+  // demo counterpart of PATCH /meetings/<id>/.
+  updateMeeting: async (metaId, fields) => {
+    await wait(150);
+    const f = store.files.find((x) => x.meta && x.meta.id === Number(metaId));
+    if (!f) throw new Error("404 Not Found: no such meeting in this demo");
+    const has = (k) => Object.prototype.hasOwnProperty.call(fields || {}, k);
+    if (!has("meeting_type") && !has("meeting_sequence")) throw new Error("Send meeting_type and/or meeting_sequence.");
+    if (has("meeting_type")) {
+      if (fields.meeting_type && !MEETING_TYPE_LABELS[fields.meeting_type]) throw new Error("Unknown meeting type.");
+      f.meta.meeting_type = fields.meeting_type || "";
+    }
+    if (has("meeting_sequence")) {
+      const n = fields.meeting_sequence;
+      if (n !== null && (!Number.isInteger(n) || n < 1 || n > 99)) {
+        throw new Error("Meeting sequence must be a whole number from 1 to 99.");
+      }
+      f.meta.meeting_sequence = n;
+    }
+    f.meta.meeting_type_source = "manual";
+    return meetingEntry(f);
+  },
+  // File metadata edit / confirm - demo counterparts of PATCH /files/<id>/metadata/
+  // and POST /files/<id>/confirm/ (same rules: only changed fields count, and a
+  // review-note-only edit does not flip the state to "corrected").
+  updateFileMetadata: async (fileId, fields) => {
+    await wait(150);
+    const f = store.files.find((x) => x.id === Number(fileId));
+    if (!f) throw new Error("404 Not Found: no such file in this demo");
+    ensureFileMeta(f);
+    const has = (k) => Object.prototype.hasOwnProperty.call(fields || {}, k);
+    const editable = ["doc_type", "topic_tags", "signal", "version_label", "document_date", "review_notes"];
+    if (!editable.some(has)) throw new Error(`Send at least one of: ${editable.join(", ")}`);
+    let corrected = false;
+    if (has("doc_type")) {
+      if (!DOC_TYPE_LABELS[fields.doc_type]) throw new Error("Unknown document type.");
+      f.doc_type = fields.doc_type;
+      f.doc_type_source = "manual";
+      corrected = true;
+    }
+    if (has("topic_tags")) {
+      f.topic_tags = normaliseTags(fields.topic_tags).join(", ");
+      corrected = true;
+    }
+    if (has("signal")) {
+      f.signal = String(fields.signal || "").trim().slice(0, 400);
+      corrected = true;
+    }
+    if (has("version_label")) {
+      f.version_label = String(fields.version_label || "").trim().slice(0, 30);
+      corrected = true;
+    }
+    if (has("document_date")) {
+      const d = fields.document_date;
+      if (d && !/^\d{4}-\d{2}-\d{2}$/.test(d)) throw new Error("document_date must be YYYY-MM-DD.");
+      f.document_date = d || null;
+      corrected = true;
+    }
+    if (has("review_notes")) f.review_notes = String(fields.review_notes || "");
+    if (corrected) f.meta_state = "corrected";
+    return { id: f.id, topic_id: f.topic, ...metaKeys(f) };
+  },
+  confirmFileMetadata: async (fileId) => {
+    await wait(150);
+    const f = store.files.find((x) => x.id === Number(fileId));
+    if (!f) throw new Error("404 Not Found: no such file in this demo");
+    ensureFileMeta(f);
+    if (f.meta_state === "error" || f.extraction_error) {
+      throw new Error("This file could not be read, so there is nothing to confirm.");
+    }
+    if (f.meta_state === "generated_unconfirmed" || !f.meta_state) f.meta_state = "confirmed";
+    return { id: f.id, topic_id: f.topic, ...metaKeys(f) };
+  },
+  // Per-meeting human notes (high-signal, shown on the timeline).
+  getNotes: async (topicId) => {
+    await wait(100);
+    return store.notes.filter((n) => n.topic === Number(topicId)).map(noteOut);
+  },
+  addNote: async (topicId, text, metaId) => {
+    await wait(150);
+    const clean = String(text || "").trim();
+    if (!clean) throw new Error("text is required");
+    if (clean.length > 2000) throw new Error("That note is too long (2000 characters max).");
+    const note = {
+      id: newId(),
+      topic: Number(topicId),
+      meta: metaId ? Number(metaId) : null,
+      text: clean,
+      author: store.user.username,
+      created_at: new Date().toISOString(),
+    };
+    store.notes.push(note);
+    return noteOut(note);
+  },
+  deleteNote: async (topicId, noteId) => {
+    await wait(120);
+    store.notes = store.notes.filter((n) => !(n.id === Number(noteId) && n.topic === Number(topicId)));
+    return null;
+  },
+  // Business events for the topic timeline (emails, key documents, notes),
+  // oldest first - same item shape as the real /timeline_events/ endpoint.
+  getTimelineEvents: async (topicId) => {
+    await wait(120);
+    const tid = Number(topicId);
+    const events = [];
+    const blank = {
+      approx_date: false,
+      file_id: null,
+      meta_id: null,
+      note_id: null,
+      doc_type: "",
+      version_label: "",
+      meeting_type: "",
+      meeting_sequence: null,
+      author: "",
+      meeting_title: "",
+    };
+    for (const f of topicFiles(tid)) {
+      ensureFileMeta(f);
+      if (f.meta_state === "error" || f.extraction_error) continue;
+      if (f.meta?.meeting_date) {
+        events.push({
+          ...blank,
+          kind: "meeting",
+          date: f.meta.meeting_date,
+          title: meetingTimelineTitle(f.meta, f.display_name),
+          body: f.meta.achieved || f.meta.agenda || "",
+          file_id: f.id,
+          meta_id: f.meta.id,
+          meeting_type: f.meta.meeting_type || "",
+          meeting_sequence: f.meta.meeting_sequence ?? null,
+        });
+      }
+      const date = f.document_date || (f.first_added_at || "").slice(0, 10);
+      const approx = !f.document_date;
+      if (f.doc_type === "email") {
+        events.push({ ...blank, kind: "email", date, approx_date: approx, title: f.subject || f.display_name, body: f.signal || "", file_id: f.id, doc_type: "email" });
+      } else if (TIMELINE_DOC_TYPES.includes(f.doc_type)) {
+        const label = DOC_TYPE_LABELS[f.doc_type];
+        events.push({
+          ...blank,
+          kind: "document",
+          date,
+          approx_date: approx,
+          title: f.version_label ? `${label} ${f.version_label}` : label,
+          body: f.signal || "",
+          file_id: f.id,
+          doc_type: f.doc_type,
+          version_label: f.version_label || "",
+        });
+      }
+    }
+    for (const n of store.notes.filter((x) => x.topic === tid)) {
+      const mf = n.meta ? store.files.find((x) => x.meta && x.meta.id === n.meta) : null;
+      events.push({
+        ...blank,
+        kind: "note",
+        date: n.created_at,
+        title: `Note: ${n.text.split(/\s+/).slice(0, 8).join(" ")}`,
+        body: n.text,
+        note_id: n.id,
+        meta_id: n.meta,
+        author: n.author,
+        meeting_title: mf?.meta?.meeting_title || "",
+      });
+    }
+    return events.sort((a, b) => String(a.date).localeCompare(String(b.date)));
+  },
+  // "Export metadata CSV" - built in the browser from the fixture store (the
+  // real app serves it from /topics/<id>/metadata_csv/). The first 7 columns
+  // are the contract columns, in order; phase/version/doc_date/participants
+  // follow.
+  getMetadataCsv: async (topicId) => {
+    await wait(100);
+    const topic = findTopic(topicId);
+    const rows = topicFiles(Number(topicId)).map((f) => {
+      ensureFileMeta(f);
+      const isErr = f.meta_state === "error" || !!f.extraction_error;
+      return {
+        file: f.path,
+        document_type: DOC_TYPE_LABELS[f.doc_type] || "",
+        topic_tags: tagList(f.topic_tags).join(", "),
+        signal: f.signal || "",
+        state: isErr ? "error" : f.meta_state || "",
+        seconds: (f.meta_seconds ?? 0).toFixed(1),
+        review_notes: f.review_notes || (isErr ? f.extraction_error : ""),
+        phase: csvPhase(topic, f),
+        version: f.version_label || "",
+        doc_date: f.document_date || f.meta?.meeting_date || "",
+        participants: (f.meta ? f.meta.attendees : f.participants || []).join("; "),
+      };
+    });
+    rows.sort((a, b) => (a.doc_date ? 0 : 1) - (b.doc_date ? 0 : 1) || a.doc_date.localeCompare(b.doc_date));
+    const base = (topic?.name || "project").replace(/[^a-z0-9]+/gi, "-").replace(/^-|-$/g, "") || "project";
+    return { filename: `${base}-metadata.csv`, csv: metadataCsv(rows) };
+  },
+  // Topic edit (Stage / Customer name) - in-memory like every other edit.
+  updateTopic: async (id, fields) => {
+    await wait(150);
+    const topic = findTopic(id);
+    if (!topic) throw new Error("404 Not Found: no such project in this demo");
+    const stages = ["", "intro", "discovery", "solution", "commercial", "won", "lost", "delivery"];
+    if (Object.prototype.hasOwnProperty.call(fields, "stage")) {
+      if (!stages.includes(fields.stage || "")) throw new Error("Unknown stage.");
+      topic.stage = fields.stage || "";
+    }
+    if (Object.prototype.hasOwnProperty.call(fields, "customer_name")) {
+      topic.customer_name = String(fields.customer_name || "").slice(0, 200);
+    }
+    saveLocalProjects();
+    return topicListItem(topic);
   },
   computePayroll: async (topicId) => {
     await wait(500);
@@ -595,34 +902,18 @@ export const api = {
         attendees: f.meta.attendees,
         agenda: f.meta.agenda,
         achieved: f.meta.achieved,
+        meeting_type: f.meta.meeting_type || "",
+        meeting_sequence: f.meta.meeting_sequence ?? null,
       });
     });
-    store.tasks.forEach((t) => {
-      if (!t.due_date) return;
-      if (topicId && t.topic !== Number(topicId)) return;
-      const topic = findTopic(t.topic);
-      events.push({
-        kind: "task",
-        date: t.due_date,
-        topic_id: topic.id,
-        topic_name: topic.name,
-        topic_type: topic.topic_type,
-        id: t.id,
-        title: t.title,
-        assignee: t.assignee,
-        status: t.status,
-        due_date: t.due_date,
-      });
-    });
+    // Action items have no due date, so the calendar shows meetings only.
     return events.sort((a, b) => b.date.localeCompare(a.date));
   },
   getTasks: async (topicId) => {
     await wait();
-    return store.tasks
-      .filter((t) => !topicId || t.topic === Number(topicId))
-      .map((t) => ({ ...t, topic_name: findTopic(t.topic)?.name || "" }));
+    return store.tasks.filter((t) => !topicId || t.topic === Number(topicId)).map(taskOut);
   },
-  createTask: async (topicId, { title, assignee, due_date }) => {
+  createTask: async (topicId, { title, assignee }) => {
     await wait();
     const task = {
       id: newId(),
@@ -630,25 +921,54 @@ export const api = {
       source_file: null,
       title,
       assignee: assignee || "",
-      due_date: due_date || null,
+      due_date: null,
       status: "backlog",
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
     };
     store.tasks.push(task);
-    return { ...task, topic_name: findTopic(task.topic)?.name || "" };
+    return taskOut(task);
   },
   updateTask: async (taskId, fields) => {
     await wait();
     const task = store.tasks.find((t) => t.id === Number(taskId));
     if (!task) throw new Error("404 Not Found");
     Object.assign(task, fields, { updated_at: new Date().toISOString() });
-    return { ...task, topic_name: findTopic(task.topic)?.name || "" };
+    return taskOut(task);
   },
   deleteTask: async (taskId) => {
     await wait();
     store.tasks = store.tasks.filter((t) => t.id !== Number(taskId));
     return null;
+  },
+  // Where an action item came from: its file (template name first, real name
+  // second) and the closest-matching passage of it - the demo's stand-in for
+  // the real app's GET /api/tasks/<id>/source/.
+  getTaskSource: async (taskId) => {
+    await wait(120);
+    const task = store.tasks.find((t) => t.id === Number(taskId));
+    if (!task) throw new Error("404 Not Found");
+    const f = task.source_file ? store.files.find((x) => x.id === Number(task.source_file)) : null;
+    if (!f) return { added_by_hand: true, file: null, passage: null };
+    ensureFileMeta(f);
+    return {
+      added_by_hand: false,
+      file: {
+        id: f.id,
+        name: f.display_name || f.path,
+        label: displayTitle(f),
+        doc_type: f.doc_type,
+        read_by_ai: f.doc_type_source === "llm",
+        meeting_title: f.meta?.meeting_title || "",
+        date: f.meta?.meeting_date || f.document_date || String(f.first_added_at || "").slice(0, 10),
+        openable: true,
+        // Fixture-only: lets "Open file" show the sample text in a read-only tab.
+        display_name: f.display_name,
+        path: f.path,
+        extracted_text: f.extracted_text || "",
+      },
+      passage: findSupportingPassage(f, task.title),
+    };
   },
   getCommitments: async (topicId) => {
     await wait();
@@ -792,8 +1112,6 @@ export const api = {
     return { content: "No project matches that question in this demo.", is_llm: false, generation_note: "No model was called because no sample project matched.", source_files: [] };
   },
   clearGlobalChat: async () => null,
-  updateTaskStatus: (taskId, status) => api.updateTask(taskId, { status }),
-  updateTaskDueDate: (taskId, dueDate) => api.updateTask(taskId, { due_date: dueDate || null }),
   deleteTopic: async (topicId) => {
     await wait();
     store.topics = store.topics.filter((t) => t.id !== Number(topicId));
@@ -805,8 +1123,17 @@ export const api = {
     const { llm_api_key, ...rest } = store.settings;
     return rest;
   },
-  saveSettings: async (data) => {
+  // The real app checks a settings password on every save. The demo has no
+  // backend, so this plays that part with a published demo password (the real
+  // password is never in the repository).
+  unlockSettings: async (settingsPassword) => {
+    await wait(150);
+    requireSettingsPassword(settingsPassword);
+    return { ok: true };
+  },
+  saveSettings: async (data, settingsPassword) => {
     await wait();
+    requireSettingsPassword(settingsPassword);
     const keySet = data.llm_api_key ? true : store.settings.llm_api_key_set;
     store.settings = { ...store.settings, ...data, llm_api_key_set: keySet };
     delete store.settings.llm_api_key;
@@ -997,7 +1324,31 @@ export const api = {
     await wait(150);
     const ev = store.recordingEvents.find((e) => e.id === Number(eventId));
     if (!ev) throw new Error("404 Not Found: no such recording in this demo");
-    return { ...ev };
+    return { ...ev, speaker_turn_count: (ev.speaker_turns || []).length };
+  },
+  // Rename a speaker in the Conversation view (renamed turns are marked
+  // edited; renaming to an existing label merges the two) - in-memory only.
+  renameRecordingSpeaker: async (eventId, oldName, newName) => {
+    await wait(150);
+    const ev = store.recordingEvents.find((e) => e.id === Number(eventId));
+    if (!ev) throw new Error("404 Not Found: no such recording in this demo");
+    const from = String(oldName || "").trim();
+    const to = String(newName || "").trim();
+    if (!from || !to) throw new Error("Both the old and the new speaker name are required.");
+    if (to.length > 60) throw new Error("The new name is too long (60 characters max).");
+    const hit = (ev.speaker_turns || []).filter((t) => t.speaker === from);
+    if (hit.length === 0) throw new Error(`No turns are labelled '${from}'.`);
+    hit.forEach((t) => {
+      t.speaker = to;
+      t.edited = true;
+    });
+    if (ev.speaker_transcript) {
+      ev.speaker_transcript = ev.speaker_transcript
+        .split("\n")
+        .map((line) => (line.includes(`] ${from}:`) ? line.replace(`] ${from}:`, `] ${to}:`) : line))
+        .join("\n");
+    }
+    return { ...ev, speaker_turn_count: ev.speaker_turns.length, renamed_turns: hit.length };
   },
   getRecordingEventText: async (eventId) => {
     await wait(150);
@@ -1166,8 +1517,9 @@ export const api = {
           path: f.path,
           display_name: f.display_name,
           source_method: f.source_method,
-          artifact_type: f.meta ? "meeting" : "file",
+          artifact_type: f.meta ? "meeting" : f.doc_type === "email" ? "email" : "file",
           first_added_at: f.first_added_at,
+          ...metaKeys(f),
         };
       })
       .sort((a, b) => new Date(b.first_added_at) - new Date(a.first_added_at));
@@ -1185,7 +1537,7 @@ export const api = {
         date: f.meta.meeting_date,
         topic_id: topic.id,
         topic_name: topic.name,
-        title: f.meta.meeting_title || f.display_name,
+        title: meetingTimelineTitle(f.meta, f.display_name),
       });
     });
 
@@ -1227,24 +1579,7 @@ export const api = {
   },
   primeCsrf: async () => ({ ok: true }),
   login: async () => ({ ...store.user }),
-  // Demo mode has one fixed user and no real account store, so "creating an
-  // account" here just renames the existing demo user and signs them in -
-  // same honest, no-fabrication approach as updateProfile() below, not a
-  // simulation of a real multi-user signup.
-  register: async (username, email, password, displayName) => {
-    await wait();
-    store.user.display_name = displayName || username || store.user.display_name;
-    store.user.username = username || store.user.username;
-    return { ...store.user };
-  },
-  requestPasswordReset: async () => {
-    await wait();
-    return { ok: true };
-  },
-  confirmPasswordReset: async () => {
-    await wait();
-    return { ok: true };
-  },
+  // One shared login: sign-up and email password reset do not exist.
   logout: async () => ({ ok: true }),
   me: async () => {
     await api.loadLocalProjects();

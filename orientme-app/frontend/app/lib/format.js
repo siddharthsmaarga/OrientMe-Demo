@@ -16,6 +16,29 @@ export function formatAdded(iso) {
   });
 }
 
+// The real meeting date for a RecordingEvent, never detected_at - fixes a
+// real, reported bug: detected_at is only ever when this app's watcher
+// happened to notice the file (can be days later for anything synced from
+// OneDrive, or the same single backfill timestamp for every 'pre_existing'
+// row) - recording_date (backend core/recordings.py's
+// _resolve_recording_date) is the real one, parsed from the Teams
+// filename or the file's own mtime. Only falls back to detected_at for
+// rows from before that field existed and whose backfill somehow found
+// neither a filename match nor a readable mtime.
+export function recordingDisplayDate(ev) {
+  return ev?.recording_date || ev?.detected_at;
+}
+
+// "08 Oct 2026" from a full timestamp (no time of day) - the "Added ..." date
+// on an action item. Uses the viewer's own timezone, so an item added late in
+// the evening shows the day it was added for them.
+export function formatAddedDate(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return "";
+  return d.toLocaleDateString(undefined, { day: "2-digit", month: "short", year: "numeric" });
+}
+
 export function formatMeetingDate(iso) {
   if (!iso) return "";
   const d = new Date(String(iso) + "T00:00:00");
@@ -23,10 +46,41 @@ export function formatMeetingDate(iso) {
   return d.toLocaleDateString(undefined, { day: "2-digit", month: "short", year: "numeric" });
 }
 
-// Automatic urgency for one task, derived purely from its own due_date vs
+// "2h ago" / "5m ago" / "3d ago" - the Context Node header's "Updated ..."
+// stamp, matching the reference mockup exactly ("Updated 2h ago").
+export function formatTimeAgo(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return "";
+  const diffMs = Date.now() - d.getTime();
+  const mins = Math.round(diffMs / 60000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.round(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.round(hours / 24);
+  if (days < 14) return `${days}d ago`;
+  return formatMeetingDate(iso.slice(0, 10));
+}
+
+// "Today" / "Yesterday" / "23 Sep" - the Context Node's Recent Activity list
+// wants this relative style (matches the reference mockup exactly), not a
+// full date+time - the day is what matters at a glance, not the minute.
+export function formatRelativeDay(timestampMs) {
+  const d = new Date(timestampMs);
+  if (isNaN(d.getTime())) return "";
+  const startOfDay = (date) => new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime();
+  const diffDays = Math.round((startOfDay(new Date()) - startOfDay(d)) / 86400000);
+  if (diffDays === 0) return "Today";
+  if (diffDays === 1) return "Yesterday";
+  return d.toLocaleDateString(undefined, { day: "2-digit", month: "short" });
+}
+
+// Automatic urgency for one item that has a due_date (today: commitments -
+// action items no longer carry a due date), derived purely from that date vs
 // today - never a status a person sets by hand. "red" = overdue, "yellow" =
 // due within 3 days, "green" = has a due date and isn't urgent yet, null =
-// no due date to judge urgency from (done tasks are never urgent).
+// no due date to judge urgency from (done items are never urgent).
 export function taskUrgency(task) {
   if (!task || task.status === "done" || !task.due_date) return null;
   const today = new Date();
@@ -39,18 +93,15 @@ export function taskUrgency(task) {
   return "green";
 }
 
-// A project's overall urgency is the worst urgency among its own open
-// tasks - one overdue task makes the whole project read red, same idea as
-// a build going red if any single check fails.
-export function projectUrgency(tasks) {
-  let worst = null;
-  for (const t of tasks) {
-    const u = taskUrgency(t);
-    if (u === "red") return "red";
-    if (u === "yellow") worst = "yellow";
-    else if (u === "green" && worst !== "yellow") worst = "green";
-  }
-  return worst;
+// Bullet-formatted field text (one "- line" per line) -> array of lines.
+// Tolerant of a plain sentence too (no leading "- ") - it just renders as
+// one line, never broken, if the model ever ignores the bullet instruction.
+export function toBullets(text) {
+  if (!text) return [];
+  return text
+    .split("\n")
+    .map((line) => line.replace(/^[-•]\s*/, "").trim())
+    .filter(Boolean);
 }
 
 export const TYPE_STYLES = {

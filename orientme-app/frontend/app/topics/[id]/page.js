@@ -1,17 +1,47 @@
 "use client";
 
 import Link from "next/link";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { Fragment, use, useEffect, useRef, useState } from "react";
 import { api, API_BASE } from "../../lib/api";
 import {
   formatAdded,
+  formatAddedDate,
   formatMeetingDate,
-  projectUrgency,
+  formatTimeAgo,
+  taskUrgency,
+  toBullets,
   TYPE_LABELS,
   TYPE_STYLES,
   URGENCY_STYLES,
 } from "../../lib/format";
 import CalendarWidget from "../../components/CalendarWidget";
+import ProjectGlance, { ANCHOR_KINDS } from "../../components/ProjectGlance";
+import ProjectTabs from "../../components/ProjectTabs";
+import TaskBoard from "../../components/TaskBoard";
+import FileMetadata from "../../components/FileMetadata";
+import { MeetingNotes, MeetingTypeEditor, WhoSaidWhat } from "../../components/MeetingExtras";
+
+// Optional sales-flavoured stage on a topic (additive - no topic type or
+// existing field changes meaning because of it).
+const STAGE_OPTIONS = [
+  { key: "intro", label: "Intro" },
+  { key: "discovery", label: "Discovery" },
+  { key: "solution", label: "Solution" },
+  { key: "commercial", label: "Commercial" },
+  { key: "won", label: "Won" },
+  { key: "lost", label: "Lost" },
+  { key: "delivery", label: "Delivery" },
+];
+
+const PROJECT_TABS = [
+  { key: "overview", label: "Overview" },
+  { key: "work", label: "Action Items" },
+  { key: "commitments", label: "Commitments" },
+  { key: "decisions", label: "Decisions" },
+  { key: "meetings", label: "Meetings" },
+  { key: "risks", label: "Risks" },
+];
 
 const FETCH_TABS = [
   { key: "folder", label: "Lookup folder" },
@@ -19,6 +49,40 @@ const FETCH_TABS = [
   { key: "folderUpload", label: "Upload folder" },
   { key: "paste", label: "Paste text" },
   { key: "more", label: "More sources" },
+];
+
+// The 5 sections a CaseSummary fills in only for a specific kind of
+// question (see llm_brief.py's prompt rule) - meeting_prep only for "help me
+// prepare for..." asks, latest_updates only for "what's changed" asks, etc.
+// Rendered in ContextBriefPanel only when the field actually has content, so
+// a routine question never shows five empty-feeling headers ("make it
+// dynamic... automatically add according to the prompt").
+const DYNAMIC_SECTION_FIELDS = [
+  { key: "customer_need", icon: "🧩", label: "Customer need" },
+  { key: "proposed_solution", icon: "💡", label: "Proposed solution" },
+  { key: "decisions_made", icon: "✅", label: "Decisions made" },
+  { key: "latest_updates", icon: "🆕", label: "Latest updates" },
+  { key: "meeting_prep", icon: "📋", label: "Meeting prep" },
+];
+
+// One-click preset questions (spec's "Smart Suggestions") - each just
+// regenerates the SAME on-page brief via the existing refresh_summary
+// endpoint with a different question, exactly like the "↻ Refresh" button
+// already does. Deliberately NOT a chat input - a free-text ask box was
+// removed from this page per direct product feedback (see the comment
+// further down where the reading column starts).
+const SMART_SUGGESTIONS = [
+  {
+    key: "catchup",
+    label: "Catch me up",
+    question: "Catch me up on this project — what's the current state and what's changed recently?",
+  },
+  { key: "changed", label: "What's changed?", question: "What's changed since last time?" },
+  {
+    key: "meeting_prep",
+    label: "Prepare me for next meeting",
+    question: "Help me prepare for my next meeting on this project.",
+  },
 ];
 
 const SOURCE_METHOD_LABELS = {
@@ -109,6 +173,20 @@ function collectStakeholders(meetingMetadata, relatedPeople) {
   return dedupeNames(Array.from(names));
 }
 
+// Same palette + deterministic-by-name selection as the backend's
+// _avatar_style (views.py) - kept in lockstep so a stakeholder's avatar
+// color matches whether they're viewed here or on the HTML brief page.
+const AVATAR_PALETTE = ["#0096af", "#7c5cbf", "#d0811c", "#3a8f5f", "#c0517a", "#5a6b8c"];
+
+function avatarStyle(name) {
+  let sum = 0;
+  for (let i = 0; i < name.length; i++) sum += name.charCodeAt(i);
+  const color = AVATAR_PALETTE[sum % AVATAR_PALETTE.length];
+  const words = name.trim().split(/\s+/).filter(Boolean);
+  const initials = words.slice(0, 2).map((w) => w[0].toUpperCase()).join("") || "?";
+  return { color, initials };
+}
+
 function fileDisplayName(entry) {
   // Backend may nest this under "file" ({display_name, path}) or return it
   // flat as "file_display_name"/"file_path" (its actual current shape) -
@@ -127,6 +205,24 @@ function fileDisplayName(entry) {
 
 export default function TopicDetail({ params }) {
   const { id } = use(params);
+  const router = useRouter();
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
+  // The project-level tab (Overview | Work | Commitments | ...) - synced to
+  // a `?tab=` query param so each tab stays a shareable URL, without a
+  // bigger Next.js routing change (no new routes/layouts). Named distinctly
+  // from `activeTab` below (the unrelated "Manage sources" modal's own
+  // fetch-method tab) to avoid confusing the two.
+  const [projectTab, setProjectTab] = useState(() => searchParams.get("tab") || "overview");
+  // Which timeline entry an "at a glance" anchor asked the full timeline to open
+  // (n changes on every click so clicking the same anchor twice still reacts).
+  const [timelineFocus, setTimelineFocus] = useState({ key: null, n: 0 });
+
+  function selectProjectTab(key) {
+    setProjectTab(key);
+    router.replace(`${pathname}?tab=${key}`, { scroll: false });
+  }
+
   const [topic, setTopic] = useState(null);
   const [error, setError] = useState(null);
   const [activeTab, setActiveTab] = useState("folder");
@@ -160,12 +256,20 @@ export default function TopicDetail({ params }) {
   const [pasting, setPasting] = useState(false);
 
   const [meetingMetadata, setMeetingMetadata] = useState([]);
+  // Business events (emails, key documents, human notes) from the backend -
+  // merged into the timeline next to the existing client-side events.
+  const [businessEvents, setBusinessEvents] = useState([]);
 
   const [payrollRuns, setPayrollRuns] = useState([]);
   const [computingPayroll, setComputingPayroll] = useState(false);
 
   const [calendarEvents, setCalendarEvents] = useState([]);
   const [tasks, setTasks] = useState([]);
+  const [commitments, setCommitments] = useState([]);
+  const [decisions, setDecisions] = useState([]);
+  const [risks, setRisks] = useState([]);
+  const [projectState, setProjectState] = useState(null);
+  const [editProjectOpen, setEditProjectOpen] = useState(false);
 
   const [summary, setSummary] = useState(null);
   const [refreshingSummary, setRefreshingSummary] = useState(false);
@@ -201,7 +305,8 @@ export default function TopicDetail({ params }) {
 
   async function load() {
     try {
-      setTopic(await api.getTopic(id));
+      const t = await api.getTopic(id);
+      setTopic(t);
       setError(null);
     } catch (e) {
       setError(e.message);
@@ -214,6 +319,29 @@ export default function TopicDetail({ params }) {
     } catch (e) {
       console.error("Could not load meeting metadata:", e.message);
     }
+  }
+
+  async function loadBusinessEvents() {
+    try {
+      const evs = await api.getTimelineEvents(id);
+      setBusinessEvents((evs || []).filter((e) => e.kind !== "meeting"));
+    } catch (e) {
+      console.error("Could not load timeline events:", e.message);
+    }
+  }
+
+  // A meeting type/sequence edit or a new note changes the meeting list and
+  // what the timeline shows - refresh both.
+  function handleMeetingChanged() {
+    loadMeetingMetadata();
+    loadBusinessEvents();
+  }
+
+  // A file's metadata edit/confirm: patch the loaded file in place (no full
+  // reload, so the open Manage sources list keeps its scroll position).
+  function handleFileMetaChanged(fileId, meta) {
+    setTopic((t) => (t ? { ...t, files: t.files.map((f) => (f.id === fileId ? { ...f, ...meta } : f)) } : t));
+    loadBusinessEvents();
   }
 
   async function loadCalendar() {
@@ -229,6 +357,48 @@ export default function TopicDetail({ params }) {
       setTasks(await api.getTasks(id));
     } catch (e) {
       console.error("Could not load tasks:", e.message);
+    }
+  }
+
+  async function loadCommitments() {
+    try {
+      setCommitments(await api.getCommitments(id));
+    } catch (e) {
+      console.error("Could not load commitments:", e.message);
+    }
+  }
+
+  async function loadDecisions() {
+    try {
+      setDecisions(await api.getDecisions(id));
+    } catch (e) {
+      console.error("Could not load decisions:", e.message);
+    }
+  }
+
+  async function loadRisks() {
+    try {
+      setRisks(await api.getRisks(id));
+    } catch (e) {
+      console.error("Could not load risks:", e.message);
+    }
+  }
+
+  async function loadProjectState() {
+    try {
+      setProjectState(await api.getProjectState(id));
+    } catch (e) {
+      console.error("Could not load project state:", e.message);
+    }
+  }
+
+  async function handleSaveProjectState(currentPosition, topicFields) {
+    const state = await api.updateProjectState(id, currentPosition);
+    setProjectState(state);
+    // Optional Stage / Customer name - only sent when one actually changed.
+    if (topicFields && Object.keys(topicFields).length > 0) {
+      await api.updateTopic(id, topicFields);
+      load();
     }
   }
 
@@ -292,8 +462,13 @@ export default function TopicDetail({ params }) {
 
   async function refreshExtras() {
     loadMeetingMetadata();
+    loadBusinessEvents();
     loadCalendar();
     loadTasks();
+    loadCommitments();
+    loadDecisions();
+    loadRisks();
+    loadProjectState();
     loadSummary();
     loadSummaryHistory();
     loadWorkflowHistory();
@@ -305,10 +480,13 @@ export default function TopicDetail({ params }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
 
-  async function handleRefreshSummary() {
+  // question is optional - the Smart Suggestions preset buttons pass their
+  // own fixed question through; the plain "↻ Refresh" button calls this
+  // with none, falling back to the backend's own default question.
+  async function handleRefreshSummary(question) {
     setRefreshingSummary(true);
     try {
-      const s = await api.refreshSummary(id);
+      const s = await api.refreshSummary(id, question);
       setSummary(s);
       loadSummaryHistory(); // so the new status update shows up on the timeline right away
       load(); // the refresh also lands as a chat turn - pull it into the chat panel too
@@ -443,8 +621,20 @@ export default function TopicDetail({ params }) {
     runBulkJob(api.ingest(id), setIngesting, setIngestResult);
   }
 
+  const MEDIA_EXTENSIONS = [".mp4", ".mov", ".webm", ".wav", ".mp3", ".m4a"];
+
   async function handleFileUpload(file) {
     if (!file) return;
+    const ext = file.name.slice(file.name.lastIndexOf(".")).toLowerCase();
+    // Audio/video goes through the background-job path (transcription can
+    // take minutes) - the backend returns {job_id} instead of {id} for
+    // these, so this reuses the same polling runBulkJob already does for
+    // folder scans, rather than blocking on a slow synchronous request.
+    if (MEDIA_EXTENSIONS.includes(ext)) {
+      runBulkJob(api.uploadFile(id, file), setUploading, () => {});
+      if (fileInputRef.current) fileInputRef.current.value = "";
+      return;
+    }
     setUploading(true);
     try {
       await api.uploadFile(id, file);
@@ -555,8 +745,15 @@ export default function TopicDetail({ params }) {
     return <div className="max-w-4xl mx-auto px-6 py-10 text-slate-400 text-sm">Loading...</div>;
   }
 
-  const urgency = projectUrgency(tasks);
-  const urgencyStyle = urgency ? URGENCY_STYLES[urgency] : null;
+  // The "at a glance" anchors: the events worth a place on the one-screen
+  // timeline (meetings, key documents, emails, notes) - not every task/status
+  // entry, which stay in the full timeline further down.
+  const timelineEvents = buildTimelineEvents(topic, meetingMetadata, tasks, summaryHistory, workflowHistory, businessEvents);
+  const glanceAnchors = timelineEvents.filter((e) => ANCHOR_KINDS.includes(e.kind)).slice(-10);
+
+  function focusTimelineEvent(key) {
+    setTimelineFocus((prev) => ({ key, n: prev.n + 1 }));
+  }
 
   return (
     <div className="w-full">
@@ -566,22 +763,34 @@ export default function TopicDetail({ params }) {
           <Link href="/dashboard" className="text-sm text-teal-dark hover:underline shrink-0">
             ← All projects
           </Link>
-          <h1 className="text-lg font-semibold text-slate-900 truncate">{topic.name}</h1>
+          <h1 className="text-[22px] font-bold tracking-tight text-[#1a1a1a] truncate">{topic.name}</h1>
           <span
             className={`text-xs px-2 py-0.5 rounded-full font-medium shrink-0 ${TYPE_STYLES[topic.topic_type] || "bg-slate-100 text-slate-700"}`}
           >
             {TYPE_LABELS[topic.topic_type] || topic.topic_type}
           </span>
-          {urgencyStyle && (
+          {topic.stage && (
             <span
-              className={`inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full font-medium shrink-0 ${urgencyStyle.bg} ${urgencyStyle.text} border ${urgencyStyle.border}`}
+              data-testid="topic-stage"
+              className="text-xs px-2 py-0.5 rounded-full font-medium shrink-0 bg-violet-50 text-violet-700 border border-violet-100"
             >
-              <span className={`w-1.5 h-1.5 rounded-full ${urgencyStyle.dot}`} />
-              {urgencyStyle.label}
+              Stage: {STAGE_OPTIONS.find((s) => s.key === topic.stage)?.label || topic.stage}
+            </span>
+          )}
+          {topic.customer_name && (
+            <span data-testid="topic-customer" className="text-xs text-ink-muted shrink-0 truncate max-w-[200px]">
+              {topic.customer_name}
             </span>
           )}
         </div>
         <div className="flex items-center gap-1.5 shrink-0">
+          <button
+            type="button"
+            onClick={() => setEditProjectOpen(true)}
+            className="px-2.5 py-1.5 text-xs font-medium rounded-md text-slate-600 hover:bg-slate-100"
+          >
+            ✎ Edit Project
+          </button>
           <button
             type="button"
             onClick={() => setCalendarModalOpen(true)}
@@ -607,7 +816,7 @@ export default function TopicDetail({ params }) {
             </button>
             {dataMenuOpen && (
               <div className="absolute right-0 mt-1 w-64 bg-white border border-border-warm rounded-lg shadow-lg py-1 z-30 text-sm">
-                <div className="px-3 py-1.5 text-[11px] font-semibold uppercase tracking-wide text-slate-400">
+                <div className="px-3 py-1.5 text-[11px] font-semibold uppercase tracking-wider text-ink-muted">
                   Brief
                 </div>
                 <button
@@ -640,7 +849,7 @@ export default function TopicDetail({ params }) {
                 >
                   {importingSummaryCsv ? "Importing…" : "↑ Import edited brief (.csv)"}
                 </button>
-                <div className="mt-1 px-3 py-1.5 text-[11px] font-semibold uppercase tracking-wide text-slate-400 border-t border-border-warm">
+                <div className="mt-1 px-3 py-1.5 text-[11px] font-semibold uppercase tracking-wider text-ink-muted border-t border-border-warm">
                   Tasks
                 </div>
                 <a
@@ -658,6 +867,17 @@ export default function TopicDetail({ params }) {
                 >
                   {importingTasksCsv ? "Importing…" : "↑ Import edited tasks (.csv)"}
                 </button>
+                <div className="mt-1 px-3 py-1.5 text-[11px] font-semibold uppercase tracking-wider text-ink-muted border-t border-border-warm">
+                  Files
+                </div>
+                <a
+                  href={api.metadataCsvUrl(id)}
+                  onClick={() => setDataMenuOpen(false)}
+                  className="block px-3 py-1.5 text-slate-700 hover:bg-slate-50"
+                  title="One row per file: document type, topic tags, signal, state, review notes"
+                >
+                  ↓ Export metadata CSV
+                </a>
               </div>
             )}
           </div>
@@ -691,80 +911,144 @@ export default function TopicDetail({ params }) {
         </div>
       )}
 
-      {/* One scrollable reading column - no fixed side chat drawer anymore
-          (removed per direct product feedback: no fragmented chat surface
-          inside OrientMe itself; asking questions about a project's data
-          stays a backend capability, not a UI here - see api.ask()). */}
-      <div>
-        <div className="max-w-3xl mx-auto px-6 py-6 space-y-6">
-          {topic.one_liner && <p className="text-slate-500 -mt-2">{topic.one_liner}</p>}
+      <ProjectTabs tabs={PROJECT_TABS} activeKey={projectTab} onChange={selectProjectTab} />
 
-          {topic.files.length === 0 && (
-            <div className="rounded-lg border-2 border-dashed border-amber-300 bg-amber-50 px-5 py-4">
-              <p className="text-sm font-medium text-amber-900">
-                No files added to this project yet &mdash; add some so OrientMe can actually answer
-                questions about it.
-              </p>
-              <button
-                type="button"
-                onClick={() => setSourcesModalOpen(true)}
-                className="text-sm font-medium text-amber-700 hover:underline mt-1"
-              >
-                ↓ Manage sources (Lookup folder, Upload file, Upload folder, or Paste text)
-              </button>
-            </div>
-          )}
-
-          {/* 1. Executive summary, always first. */}
-          <ContextBriefPanel
-            summary={summary}
-            refreshing={refreshingSummary}
-            onRefresh={handleRefreshSummary}
-            hasFiles={topic.files.length > 0}
-            files={topic.files}
-          />
-
-          {/* 2. Who this involves. */}
-          <StakeholdersCard meetingMetadata={meetingMetadata} relatedPeople={topic.related_people} />
-
-          {/* 3. Chronological meeting info, then the combined meetings+files
-              timeline, then the calendar/payroll views built on the same data. */}
-          {meetingMetadata.length > 0 && (
-            <section className="rounded-lg border border-slate-200 bg-white p-4">
-              <h2 className="text-sm font-semibold text-slate-700 mb-3">Meeting Info</h2>
-              <div className="flex flex-wrap gap-3">
-                {meetingMetadata.map((m) => (
-                  <div key={m.id} className="flex-1 min-w-[220px]">
-                    <MeetingInfoCard entry={m} />
-                  </div>
-                ))}
-              </div>
-            </section>
-          )}
-
-          <ProjectTimeline
-            topic={topic}
-            meetingMetadata={meetingMetadata}
-            tasks={tasks}
-            summaryHistory={summaryHistory}
-            workflowHistory={workflowHistory}
-          />
-
-          {topic.topic_type === "process" && (
-            <PayrollWorkflowPanel
-              runs={payrollRuns}
-              computing={computingPayroll}
-              onCompute={handleComputePayroll}
-              onApprove={handleApprovePayroll}
-            />
-          )}
+      {topic.files.length === 0 && (
+        <div className="max-w-5xl mx-auto px-6 pt-6">
+          <div className="rounded-lg border-2 border-dashed border-amber-300 bg-amber-50 px-5 py-4">
+            <p className="text-sm font-medium text-amber-900">
+              No files added to this project yet &mdash; add some so OrientMe can actually answer
+              questions about it.
+            </p>
+            <button
+              type="button"
+              onClick={() => setSourcesModalOpen(true)}
+              className="text-sm font-medium text-amber-700 hover:underline mt-1"
+            >
+              ↓ Manage sources (Lookup folder, Upload file, Upload folder, or Paste text)
+            </button>
+          </div>
         </div>
+      )}
+
+      {/* Only one tab's content is ever mounted at a time - all topic data
+          was already loaded once via refreshExtras() on page load, so
+          switching tabs never re-fetches anything, it only changes what's
+          rendered (no fixed side chat drawer anywhere in any tab - removed
+          per direct product feedback: no fragmented chat surface inside
+          OrientMe itself; asking questions stays a backend capability, not
+          a UI here - see api.ask()). */}
+      <div className={`${projectTab === "overview" ? "max-w-7xl" : "max-w-5xl"} mx-auto px-6 py-4`}>
+        {projectTab === "overview" && (
+          <div className="space-y-6">
+          <ProjectGlance
+            summary={summary}
+            projectState={projectState}
+            commitments={commitments}
+            tasks={tasks}
+            files={topic.files}
+            anchors={glanceAnchors}
+            refreshing={refreshingSummary}
+            hasFiles={topic.files.length > 0}
+            onRefresh={handleRefreshSummary}
+            onOpenSources={() => setSourcesModalOpen(true)}
+            onGoTo={selectProjectTab}
+            onAnchorClick={focusTimelineEvent}
+            onViewTimeline={() => focusTimelineEvent(null)}
+          />
+          <div className="grid grid-cols-1 lg:grid-cols-[1fr_300px] gap-4 items-start">
+            <div className="space-y-4 min-w-0">
+              <ContextBriefPanel
+                topic={topic}
+                summary={summary}
+                refreshing={refreshingSummary}
+                onRefresh={handleRefreshSummary}
+                hasFiles={topic.files.length > 0}
+                files={topic.files}
+                meetingMetadata={meetingMetadata}
+                tasks={tasks}
+                decisions={decisions}
+                commitments={commitments}
+                summaryHistory={summaryHistory}
+                workflowHistory={workflowHistory}
+                businessEvents={businessEvents}
+                onOpenSources={() => setSourcesModalOpen(true)}
+                projectState={projectState}
+              />
+            </div>
+            <div className="lg:sticky lg:top-4 min-w-0">
+              <ProjectTimeline
+                topic={topic}
+                meetingMetadata={meetingMetadata}
+                tasks={tasks}
+                summaryHistory={summaryHistory}
+                workflowHistory={workflowHistory}
+                businessEvents={businessEvents}
+                focus={timelineFocus}
+              />
+            </div>
+          </div>
+          </div>
+        )}
+
+        {projectTab === "work" && (
+          <WorkTabPanel
+            topicId={id}
+            tasks={tasks}
+            onChanged={loadTasks}
+            topicType={topic.topic_type}
+            payrollRuns={payrollRuns}
+            computingPayroll={computingPayroll}
+            onComputePayroll={handleComputePayroll}
+            onApprovePayroll={handleApprovePayroll}
+          />
+        )}
+
+        {projectTab === "commitments" && (
+          <CommitmentsCard topicId={id} commitments={commitments} tasks={tasks} onChanged={loadCommitments} />
+        )}
+
+        {projectTab === "decisions" && (
+          <DecisionsCard topicId={id} decisions={decisions} onChanged={loadDecisions} />
+        )}
+
+        {projectTab === "meetings" &&
+          (meetingMetadata.length > 0 ? (
+            <div className="grid grid-cols-1 lg:grid-cols-[250px_1fr] gap-4 items-start">
+              <StakeholdersCard meetingMetadata={meetingMetadata} relatedPeople={topic.related_people} />
+              <section id="meeting-info" className="rounded-lg border border-slate-200 bg-white p-4 scroll-mt-4 min-w-0">
+                <h2 className="text-sm font-semibold text-slate-700 mb-3">Meeting Info</h2>
+                <div className="flex flex-wrap gap-3">
+                  {meetingMetadata.map((m) => (
+                    <div key={m.id} className="flex-1 min-w-[220px]">
+                      <MeetingInfoCard entry={m} topicId={id} onChanged={handleMeetingChanged} />
+                    </div>
+                  ))}
+                </div>
+              </section>
+            </div>
+          ) : (
+            <StakeholdersCard meetingMetadata={meetingMetadata} relatedPeople={topic.related_people} />
+          ))}
+
+        {projectTab === "risks" && (
+          <RisksCard topicId={id} risks={risks} onChanged={loadRisks} aiRisksText={summary?.risks_and_gaps} />
+        )}
       </div>
 
       {calendarModalOpen && (
         <CalendarModal onClose={() => setCalendarModalOpen(false)}>
           <CalendarWidget events={calendarEvents} />
         </CalendarModal>
+      )}
+
+      {editProjectOpen && (
+        <EditProjectModal
+          projectState={projectState}
+          topic={topic}
+          onClose={() => setEditProjectOpen(false)}
+          onSave={handleSaveProjectState}
+        />
       )}
 
       {/* "Manage sources" - the old "Add data" + "Ingested" sections - lives
@@ -880,11 +1164,13 @@ export default function TopicDetail({ params }) {
                       {uploading ? "Uploading…" : "Click or drag and drop to upload a file"}
                     </p>
                     <p className="text-[10px] text-slate-400 mt-1">
-                      .txt, .md, .docx, .pdf, .xlsx, .pptx
+                      .txt, .md, .docx, .pdf, .xlsx, .pptx, .eml, .msg — or a meeting recording
+                      (.mp4, .mov, .webm, .wav, .mp3, .m4a), transcribed locally on upload
                     </p>
                     <input
                       ref={fileInputRef}
                       type="file"
+                      accept=".txt,.md,.docx,.pdf,.xlsx,.xlsm,.pptx,.eml,.msg,.mp4,.mov,.webm,.wav,.mp3,.m4a"
                       onChange={(e) => {
                         const file = e.target.files?.[0];
                         if (file) handleFileUpload(file);
@@ -893,6 +1179,8 @@ export default function TopicDetail({ params }) {
                       className="hidden"
                     />
                   </div>
+
+                  <BulkJobProgress busy={uploading} job={scanJob} />
                 </div>
               )}
 
@@ -1065,14 +1353,22 @@ export default function TopicDetail({ params }) {
                   ) : (
                     <>
                       <div className="flex items-center justify-between gap-2">
-                        <span className="font-mono text-slate-700 truncate">
-                          {(f.display_name || f.path).split(/[\\/]/).pop()}
+                        {/* What the file IS first (its template name, e.g. "Proposal V2"),
+                            its real file name second - a renamed file still reads right. */}
+                        <span className="font-medium text-slate-800 truncate">
+                          {f.display_title || (f.display_name || f.path).split(/[\\/]/).pop()}
                         </span>
                         <span className="text-[10px] uppercase tracking-wide text-slate-400 shrink-0">
                           {SOURCE_METHOD_LABELS[f.source_method] || f.source_method}
                         </span>
                       </div>
+                      {f.display_title && f.display_title !== (f.display_name || "").split(/[\\/]/).pop() && (
+                        <p className="font-mono text-[11px] text-slate-400 truncate">
+                          {(f.display_name || f.path).split(/[\\/]/).pop()}
+                        </p>
+                      )}
                       <span className="text-slate-400">Added {formatAdded(f.first_added_at)}</span>
+                      <FileMetadata file={f} onChanged={handleFileMetaChanged} />
                     </>
                   )}
                 </li>
@@ -1086,33 +1382,79 @@ export default function TopicDetail({ params }) {
   );
 }
 
-// The Sybill-style pre-meeting brief pattern, generalized: "current state" +
-// "next move" at a glance, persisted (CaseSummary) so it doesn't need a
-// fresh question typed into chat every time this page is opened. Every real
-// chat answer also refreshes this automatically (see handleAsk) - the
-// button is only for "I haven't asked anything yet, generate one now".
-// Same 7-section order/labels as the backend's own _BRIEF_SECTION_LABELS
-// (views.py) - kept in sync deliberately so the dashboard, the exported
-// Markdown, and the Wox/Raycast HTML brief page never disagree on shape.
-const BRIEF_SECTIONS = [
-  ["why_now", "Why now"],
-  ["current_state", "Current state"],
-  ["history", "History"],
-  ["customer_thoughts", "What the customer thinks"],
-  ["promises_made", "Commitments & open loops"],
-  ["next_step", "Recommended next step"],
-  ["risks_and_gaps", "Risks & gaps"],
-];
+// The "Context Node" - matches Venki's own ChatGPT mockup reference (24 Sep:
+// "Venki inputs/Low Friction Capture Products (1).md") - replacing the earlier
+// flat 7-section dump, which he called out as "becoming fixed" (24 Sep
+// standup). Persisted (CaseSummary) so it doesn't need a fresh question typed
+// in every time this page is opened.
+//
+// Since 8 Oct 2026 the first screen of the Overview is ProjectGlance (where we
+// are, needs attention, timeline anchors, Next / Waiting / Open questions /
+// Action items). This panel is what sits under it: the one-click questions,
+// the AI's longer sections for the question just asked, key-state counts,
+// launchers and prompt history.
+// topic.messages alternates user/assistant, one pair per _ask_topic call -
+// pairs each question with the answer that immediately followed it.
+function buildPromptHistory(messages) {
+  const msgs = messages || [];
+  const pairs = [];
+  for (let i = 0; i < msgs.length; i++) {
+    if (msgs[i].role === "user" && msgs[i + 1]?.role === "assistant") {
+      pairs.push({
+        id: msgs[i].id,
+        question: msgs[i].content,
+        answer: msgs[i + 1].content,
+        date: msgs[i].created_at,
+        answerId: msgs[i + 1].id,
+        feedback: msgs[i + 1].feedback || "",
+      });
+    }
+  }
+  return pairs.reverse(); // newest first
+}
 
-function ContextBriefPanel({ summary, refreshing, onRefresh, hasFiles, files }) {
+function ContextBriefPanel({
+  topic,
+  summary,
+  refreshing,
+  onRefresh,
+  hasFiles,
+  files,
+  meetingMetadata,
+  tasks,
+  decisions,
+  commitments,
+  summaryHistory,
+  workflowHistory,
+  businessEvents,
+  onOpenSources,
+  projectState,
+}) {
   const byPath = Object.fromEntries((files || []).map((f) => [f.path, f]));
   const fieldSources = summary?.field_sources || {};
+  const [promptHistoryOpen, setPromptHistoryOpen] = useState(false);
+  const [expandedPromptId, setExpandedPromptId] = useState(null);
+  const [feedbackOverrides, setFeedbackOverrides] = useState({});
+  const promptHistory = buildPromptHistory(topic.messages).map((p) => ({
+    ...p,
+    feedback: feedbackOverrides[p.answerId] ?? p.feedback,
+  }));
+
+  async function handleFeedback(answerId, value) {
+    setFeedbackOverrides((prev) => ({ ...prev, [answerId]: value }));
+    try {
+      await api.setMessageFeedback("topic", answerId, value);
+    } catch {
+      // Unobtrusive by design (Venki, 30 Sep) - a failed feedback click
+      // isn't worth surfacing an error for; it just won't have persisted.
+    }
+  }
 
   function EditLinks({ paths }) {
     const matched = (paths || []).map((p) => byPath[p]).filter(Boolean);
     if (matched.length === 0) return null;
     return (
-      <p className="mt-0.5 flex flex-wrap gap-x-2 gap-y-0.5">
+      <p className="mt-1 flex flex-wrap gap-x-2 gap-y-0.5">
         {matched.map((f) => (
           <a
             key={f.id}
@@ -1129,66 +1471,920 @@ function ContextBriefPanel({ summary, refreshing, onRefresh, hasFiles, files }) 
     );
   }
 
+  const stakeholderNames = collectStakeholders(meetingMetadata, topic.related_people);
+  const firstFolder = topic.folders?.[0];
+  const briefHtmlUrl = `${API_BASE}/topics/${topic.id}/brief_html/`;
+
+  // Meetings/Documents/Full history dropped from here - all three are
+  // already visible further down this same page (Meeting Info, Manage
+  // sources, Project Timeline), so a launcher pointing back at them was
+  // pure redundancy (real feedback: "dont add the things which are already
+  // in the page"). Project folder stays - it opens an external app, not
+  // something already shown here. index.html stays - a distinct, shareable
+  // generated page (what Wox/Raycast open), not duplicated on this page.
+  const launchers = [
+    { icon: "✅", label: "Tasks", href: "/tasks" },
+    { icon: "🌐", label: "index.html", href: briefHtmlUrl, external: true },
+    firstFolder && {
+      icon: "📁",
+      label: "Project folder",
+      href: `${API_BASE}/folders/${firstFolder.id}/open/`,
+      external: true,
+    },
+  ].filter(Boolean);
+
   return (
-    <section className="rounded-lg border border-brand/30 bg-brand/[0.03] p-4">
+    <section className="rounded-xl border border-border-warm border-l-4 border-l-brand bg-white shadow-sm p-4 min-w-0">
       <div className="flex items-center justify-between gap-2 mb-2">
-        <h2 className="text-sm font-semibold text-brand">AI Context Brief</h2>
-        <button
-          type="button"
-          onClick={onRefresh}
-          disabled={refreshing || !hasFiles}
-          title={hasFiles ? "Regenerate from the latest ingested files" : "Add files first"}
-          className="text-xs font-medium text-brand hover:underline disabled:opacity-40 disabled:no-underline shrink-0"
-        >
-          {refreshing ? "Refreshing…" : "↻ Refresh brief"}
-        </button>
+        <h2 className="text-[15px] font-bold text-brand">Context Node</h2>
+        <div className="flex items-center gap-3 shrink-0">
+          {summary?.generated_at && (
+            <span className="text-[11px] text-ink-muted">Updated {formatTimeAgo(summary.generated_at)}</span>
+          )}
+          <button
+            type="button"
+            onClick={() => onRefresh()}
+            disabled={refreshing || !hasFiles}
+            title={hasFiles ? "Regenerate from the latest ingested files" : "Add files first"}
+            className="text-xs font-medium text-brand hover:underline disabled:opacity-40 disabled:no-underline"
+          >
+            {refreshing ? "Refreshing…" : "↻ Refresh"}
+          </button>
+        </div>
       </div>
+
+      {/* Smart Suggestions - one-click preset questions that regenerate
+          this same panel via the existing refresh mechanism, never a chat
+          input (see the standing product decision noted further down this
+          file where the reading column begins). */}
+      {hasFiles && (
+        <div className="flex flex-wrap gap-1.5 mb-3 scroll-mt-6">
+          {SMART_SUGGESTIONS.map((s) => (
+            <button
+              key={s.key}
+              type="button"
+              onClick={() => onRefresh(s.question)}
+              disabled={refreshing}
+              className="text-[11px] px-2 py-1 rounded-full border border-brand/20 bg-white text-brand hover:bg-brand/5 disabled:opacity-40"
+            >
+              {s.label}
+            </button>
+          ))}
+        </div>
+      )}
 
       {!summary && (
         <p className="text-xs text-slate-500">
           {hasFiles
-            ? 'No brief generated yet — click "Refresh brief", or just ask a question in chat.'
-            : "Add some files, then generate a brief — this is where the current state and recommended next move will show up automatically."}
+            ? 'No brief generated yet — click "Refresh", or just ask a question via search.'
+            : "Add some files, then generate a brief — this is where your current state and next move will show up automatically."}
         </p>
       )}
 
       {summary && (
-        <div className="space-y-2.5">
-          {summary.answer_summary && (
-            <p className="text-sm text-slate-800 font-medium">{summary.answer_summary}</p>
-          )}
-
-          {/* "Open first" - the 3-5 most valuable things to look at before
-              diving into the sections below, per the PRD's own output
-              contract - previously generated by the LLM but never actually
-              shown anywhere on this page. */}
-          {summary.sources_used?.length > 0 && (
+        <div className="space-y-4">
+          {/* Executive Summary is a genuine short project description
+              (topic.one_liner), NOT the answer to whatever was just asked -
+              real feedback: "when i am giving the prompt the answer is
+              comming under executive summary... this should come under no
+              heading. executive summary should just give me the project
+              summary in short." */}
+          {(topic.one_liner || "").trim() && (
             <div>
-              <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">
-                Open first
+              <p className="text-[11px] font-semibold uppercase tracking-wide text-brand mb-0.5">
+                Executive Summary
               </p>
-              <EditLinks paths={summary.sources_used} />
+              <p className="text-sm text-slate-800">{topic.one_liner}</p>
             </div>
           )}
 
-          {BRIEF_SECTIONS.map(([key, label]) =>
-            summary[key] ? (
-              <div key={key}>
-                <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">
-                  {label}
-                </p>
-                <p className="text-sm text-slate-700 mt-0.5">{summary[key]}</p>
-                <EditLinks paths={fieldSources[key]} />
-              </div>
-            ) : null
+          {/* The direct answer to the actual question asked - no heading,
+              per that same feedback. */}
+          {(summary.answer_summary || "").trim() && (
+            <p className="text-sm text-slate-800">{summary.answer_summary}</p>
           )}
 
-          <p className="text-[11px] text-slate-400 pt-1">
-            Generated {formatAdded(summary.generated_at)}
-          </p>
+          {/* Dynamic, question-specific sections - only render the ones the
+              LLM actually filled in for this particular answer (per prompt
+              rule in llm_brief.py: each of these fires only for a specific
+              kind of question, e.g. meeting_prep only for "help me prepare
+              for..."). Never a fixed template - "make it dynamic... if open
+              questions not required dont add." */}
+          {DYNAMIC_SECTION_FIELDS.map(
+            ({ key, icon, label }) =>
+              toBullets(summary[key]).length > 0 && (
+                <div key={key} className="border-t border-brand/10 pt-3">
+                  <p className="text-[11px] font-semibold uppercase tracking-wider text-ink-muted mb-1">
+                    {icon} {label}
+                  </p>
+                  <ul className="space-y-0.5">
+                    {toBullets(summary[key]).map((b, i) => (
+                      <li key={i} className="text-sm text-slate-700 flex gap-1.5">
+                        <span className="text-slate-300 shrink-0">•</span>
+                        <span>{b}</span>
+                      </li>
+                    ))}
+                  </ul>
+                  <EditLinks paths={fieldSources[key]} />
+                </div>
+              )
+          )}
+
+          {/* Decisions/Commitments/Facts aren't tracked as their own fields
+              yet (see PROJECT-CONTEXT / the 24 Sep mockup) - shown honestly
+              as not-yet-tracked rather than faked, while People/Risks/
+              Important links reuse data that's already real. */}
+          <div className="border-t border-brand/10 pt-3">
+            <p className="text-[11px] font-semibold uppercase tracking-wider text-ink-muted mb-1">
+              📌 Key state
+            </p>
+            <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-slate-500">
+              <span>
+                Decisions <span className="font-medium text-slate-700">{(decisions || []).length}</span>
+              </span>
+              <span>
+                Commitments <span className="font-medium text-slate-700">{(commitments || []).length}</span>
+              </span>
+              <span>
+                People <span className="font-medium text-slate-700">{stakeholderNames.length}</span>
+              </span>
+              <span>
+                Facts <span className="text-slate-300">— not yet tracked</span>
+              </span>
+              <span>
+                Risks <span className="font-medium text-slate-700">{toBullets(summary.risks_and_gaps).length}</span>
+              </span>
+              <span>
+                Important links{" "}
+                <span className="font-medium text-slate-700">{(summary.sources_used || []).length}</span>
+              </span>
+            </div>
+          </div>
+
+          <div className="border-t border-brand/10 pt-3">
+            <p className="text-[11px] font-semibold uppercase tracking-wider text-ink-muted mb-1.5">Launchers</p>
+            <div className="flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={() => setPromptHistoryOpen((v) => !v)}
+                disabled={promptHistory.length === 0}
+                title={promptHistory.length === 0 ? "No questions asked yet" : "Show past questions and answers"}
+                className="text-xs px-2.5 py-1 rounded-full border border-slate-200 bg-white text-slate-600 hover:border-brand hover:text-brand transition-colors disabled:opacity-40 disabled:hover:border-slate-200 disabled:hover:text-slate-600"
+              >
+                🤖 AI conversations{promptHistory.length > 0 ? ` (${promptHistory.length})` : ""}
+              </button>
+              {launchers.map((l) =>
+                l.onClick ? (
+                  <button
+                    key={l.label}
+                    type="button"
+                    onClick={l.onClick}
+                    className="text-xs px-2.5 py-1 rounded-full border border-slate-200 bg-white text-slate-600 hover:border-brand hover:text-brand transition-colors"
+                  >
+                    {l.icon} {l.label}
+                  </button>
+                ) : (
+                  <a
+                    key={l.label}
+                    href={l.href}
+                    target={l.external ? "_blank" : undefined}
+                    rel={l.external ? "noreferrer" : undefined}
+                    className="text-xs px-2.5 py-1 rounded-full border border-slate-200 bg-white text-slate-600 hover:border-brand hover:text-brand transition-colors"
+                  >
+                    {l.icon} {l.label}
+                  </a>
+                )
+              )}
+            </div>
+          </div>
+
+          {/* Prompt history - "click a past question, see its answer" - the
+              questions/answers already exist as ChatMessage rows (topic.
+              messages); this just surfaces them instead of only ever
+              showing the latest brief. */}
+          {promptHistoryOpen && (
+            <div className="border-t border-brand/10 pt-3">
+              <p className="text-[11px] font-semibold uppercase tracking-wider text-ink-muted mb-1.5">
+                Prompt history
+              </p>
+              {promptHistory.length === 0 ? (
+                <p className="text-xs text-slate-400">No questions asked yet.</p>
+              ) : (
+                <ul className="space-y-1.5">
+                  {promptHistory.map((p) => {
+                    const expanded = expandedPromptId === p.id;
+                    return (
+                      <li key={p.id} className="rounded-md border border-slate-100">
+                        <button
+                          type="button"
+                          onClick={() => setExpandedPromptId(expanded ? null : p.id)}
+                          className="w-full flex items-center justify-between gap-2 px-2.5 py-1.5 text-left hover:bg-slate-50 transition-colors"
+                        >
+                          <span className="text-sm text-slate-700 truncate">{p.question}</span>
+                          <span className="text-[11px] text-slate-400 shrink-0">
+                            {formatAdded(p.date)} {expanded ? "▲" : "▼"}
+                          </span>
+                        </button>
+                        {expanded && (
+                          <div className="px-2.5 pb-2">
+                            <p className="text-sm text-slate-600 whitespace-pre-wrap">{p.answer}</p>
+                            <div className="flex items-center gap-1 mt-1.5">
+                              <span className="text-[10px] text-slate-400 mr-0.5">Helpful?</span>
+                              <button
+                                type="button"
+                                title="Helpful"
+                                onClick={() => handleFeedback(p.answerId, p.feedback === "up" ? "" : "up")}
+                                className={`text-xs rounded px-1.5 py-0.5 ${
+                                  p.feedback === "up" ? "bg-emerald-100 text-emerald-700" : "text-slate-300 hover:bg-slate-100"
+                                }`}
+                              >
+                                👍
+                              </button>
+                              <button
+                                type="button"
+                                title="Not helpful"
+                                onClick={() => handleFeedback(p.answerId, p.feedback === "down" ? "" : "down")}
+                                className={`text-xs rounded px-1.5 py-0.5 ${
+                                  p.feedback === "down" ? "bg-red-100 text-red-700" : "text-slate-300 hover:bg-slate-100"
+                                }`}
+                              >
+                                👎
+                              </button>
+                            </div>
+                          </div>
+                        )}
+                      </li>
+                    );
+                  })}
+                </ul>
+              )}
+            </div>
+          )}
+
+          <p className="text-[11px] text-slate-400">Generated {formatAdded(summary.generated_at)}</p>
         </div>
       )}
     </section>
+  );
+}
+
+const COMMITMENT_STATUS_OPTIONS = [
+  { value: "open", label: "Open" },
+  { value: "in_progress", label: "In Progress" },
+  { value: "done", label: "Done" },
+];
+
+// A person's explicit promise/obligation - deliberately backed by its own
+// Commitment model (see models.Commitment), NOT Task. "Venkatesh will
+// provide the architecture proposal by Friday" is a commitment; "Create
+// Azure architecture proposal" is the task it might produce - the two are
+// independent records, optionally linked via linked_task. `tasks` here is
+// only for populating the optional "link to task" picker.
+function CommitmentsCard({ topicId, commitments, tasks, onChanged }) {
+  const [adding, setAdding] = useState(false);
+  const [person, setPerson] = useState("");
+  const [commitmentText, setCommitmentText] = useState("");
+  const [dateMade, setDateMade] = useState("");
+  const [dueDate, setDueDate] = useState("");
+  const [linkedTask, setLinkedTask] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  async function handleAdd(e) {
+    e.preventDefault();
+    if (!person.trim() || !commitmentText.trim()) return;
+    setSaving(true);
+    try {
+      await api.createCommitment(topicId, {
+        person: person.trim(),
+        commitment: commitmentText.trim(),
+        date_made: dateMade || null,
+        due_date: dueDate || null,
+        linked_task: linkedTask || null,
+      });
+      setPerson("");
+      setCommitmentText("");
+      setDateMade("");
+      setDueDate("");
+      setLinkedTask("");
+      setAdding(false);
+      onChanged();
+    } catch (e) {
+      alert(e.message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function handleFieldChange(commitmentId, fields) {
+    try {
+      await api.updateCommitment(commitmentId, fields);
+      onChanged();
+    } catch (e) {
+      alert(e.message);
+    }
+  }
+
+  return (
+    <section className="rounded-lg border border-border-warm border-t-2 border-t-teal-dark bg-white shadow-sm p-4 min-w-0">
+      <div className="flex items-center justify-between mb-3">
+        <h2 className="text-[15px] font-bold text-teal-dark">✅ Commitments</h2>
+        <button
+          type="button"
+          onClick={() => setAdding((v) => !v)}
+          className="text-xs font-medium text-brand hover:underline"
+        >
+          {adding ? "Cancel" : "+ Add"}
+        </button>
+      </div>
+      {adding && (
+        <form onSubmit={handleAdd} className="mb-3 space-y-1.5 rounded-md bg-slate-50 border border-slate-100 p-2.5">
+          <div className="flex gap-1.5">
+            <input
+              type="text"
+              placeholder="Person"
+              value={person}
+              onChange={(e) => setPerson(e.target.value)}
+              className="w-32 shrink-0 text-xs border border-slate-200 rounded px-2 py-1"
+              autoFocus
+            />
+            <input
+              type="text"
+              placeholder="What did they commit to?"
+              value={commitmentText}
+              onChange={(e) => setCommitmentText(e.target.value)}
+              className="flex-1 min-w-0 text-xs border border-slate-200 rounded px-2 py-1"
+            />
+          </div>
+          <div className="flex gap-1.5">
+            <label className="flex-1 text-[10px] text-slate-400">
+              Date made
+              <input
+                type="date"
+                value={dateMade}
+                onChange={(e) => setDateMade(e.target.value)}
+                className="w-full text-xs border border-slate-200 rounded px-2 py-1 mt-0.5"
+              />
+            </label>
+            <label className="flex-1 text-[10px] text-slate-400">
+              Due date
+              <input
+                type="date"
+                value={dueDate}
+                onChange={(e) => setDueDate(e.target.value)}
+                className="w-full text-xs border border-slate-200 rounded px-2 py-1 mt-0.5"
+              />
+            </label>
+          </div>
+          {(tasks || []).length > 0 && (
+            <label className="block text-[10px] text-slate-400">
+              Link to task (optional)
+              <select
+                value={linkedTask}
+                onChange={(e) => setLinkedTask(e.target.value)}
+                className="w-full text-xs border border-slate-200 rounded px-2 py-1 mt-0.5"
+              >
+                <option value="">— none —</option>
+                {tasks.map((t) => (
+                  <option key={t.id} value={t.id}>
+                    {t.title}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
+          <button
+            type="submit"
+            disabled={saving || !person.trim() || !commitmentText.trim()}
+            className="text-xs font-medium text-white bg-brand rounded px-2.5 py-1 disabled:opacity-40"
+          >
+            {saving ? "Adding…" : "Add commitment"}
+          </button>
+        </form>
+      )}
+      {(commitments || []).length === 0 ? (
+        <p className="text-xs text-slate-400">
+          No commitments logged yet — add one directly, or they&apos;ll be created here once
+          meeting extraction supports them.
+        </p>
+      ) : (
+        <ul className="space-y-2 max-h-[420px] overflow-y-auto pr-1">
+          {commitments.map((c) => {
+            const urgency = taskUrgency(c);
+            const style = urgency ? URGENCY_STYLES[urgency] : null;
+            return (
+              <li key={c.id} className="rounded-md border border-slate-100 bg-slate-50/50 px-2.5 py-2 text-xs">
+                <div className="flex items-start gap-1.5">
+                  {style && (
+                    <span title={style.label} className={`mt-1 w-1.5 h-1.5 rounded-full shrink-0 ${style.dot}`} />
+                  )}
+                  <p className="text-slate-800 font-medium flex-1 min-w-0 break-words">{c.commitment}</p>
+                </div>
+                <div className="flex items-center justify-between mt-1.5 gap-2 flex-wrap">
+                  <span className="text-[10px] text-slate-500 bg-slate-100 px-1.5 py-0.5 rounded-full truncate max-w-[45%]">
+                    {c.person}
+                  </span>
+                  <input
+                    type="date"
+                    value={c.due_date || ""}
+                    onChange={(e) => handleFieldChange(c.id, { due_date: e.target.value || null })}
+                    className={`text-[10px] border border-slate-200 rounded px-1 py-0.5 bg-white ${
+                      style ? style.text : "text-slate-500"
+                    }`}
+                  />
+                </div>
+                {c.linked_task_title && (
+                  <span className="inline-block mt-1.5 text-[10px] text-teal-dark bg-teal-tint border border-teal-tint-strong px-1.5 py-0.5 rounded-full">
+                    🔗 {c.linked_task_title}
+                  </span>
+                )}
+                <select
+                  value={c.status}
+                  onChange={(e) => handleFieldChange(c.id, { status: e.target.value })}
+                  className="w-full mt-1.5 text-[10px] border border-slate-200 rounded px-1 py-0.5 bg-white"
+                >
+                  {COMMITMENT_STATUS_OPTIONS.map((o) => (
+                    <option key={o.value} value={o.value}>
+                      {o.label}
+                    </option>
+                  ))}
+                </select>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </section>
+  );
+}
+
+// Decisions - genuinely new, structured, persistent data (see
+// models.Decision) - distinct from CaseSummary.decisions_made, which is
+// disposable free text regenerated fresh every brief.
+function DecisionsCard({ topicId, decisions, onChanged }) {
+  const [adding, setAdding] = useState(false);
+  const [decisionText, setDecisionText] = useState("");
+  const [context, setContext] = useState("");
+  const [participants, setParticipants] = useState("");
+  const [decidedDate, setDecidedDate] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  async function handleAdd(e) {
+    e.preventDefault();
+    if (!decisionText.trim()) return;
+    setSaving(true);
+    try {
+      await api.createDecision(topicId, {
+        decision: decisionText.trim(),
+        context: context.trim(),
+        participants: participants.trim(),
+        decided_date: decidedDate || null,
+      });
+      setDecisionText("");
+      setContext("");
+      setParticipants("");
+      setDecidedDate("");
+      setAdding(false);
+      onChanged();
+    } catch (e) {
+      alert(e.message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function toggleStatus(d) {
+    try {
+      await api.updateDecision(d.id, { status: d.status === "decided" ? "reversed" : "decided" });
+      onChanged();
+    } catch (e) {
+      alert(e.message);
+    }
+  }
+
+  return (
+    <section className="rounded-lg border border-border-warm border-t-2 border-t-brand bg-white shadow-sm p-4 min-w-0">
+      <div className="flex items-center justify-between mb-3">
+        <h2 className="text-[15px] font-bold text-brand">📋 Decisions</h2>
+        <button
+          type="button"
+          onClick={() => setAdding((v) => !v)}
+          className="text-xs font-medium text-brand hover:underline"
+        >
+          {adding ? "Cancel" : "+ Add"}
+        </button>
+      </div>
+      {adding && (
+        <form onSubmit={handleAdd} className="mb-3 space-y-1.5 rounded-md bg-slate-50 border border-slate-100 p-2.5">
+          <input
+            type="text"
+            placeholder="What was decided?"
+            value={decisionText}
+            onChange={(e) => setDecisionText(e.target.value)}
+            className="w-full text-xs border border-slate-200 rounded px-2 py-1"
+            autoFocus
+          />
+          <input
+            type="text"
+            placeholder="Context / why (optional)"
+            value={context}
+            onChange={(e) => setContext(e.target.value)}
+            className="w-full text-xs border border-slate-200 rounded px-2 py-1"
+          />
+          <div className="flex gap-1.5">
+            <input
+              type="text"
+              placeholder="Participants"
+              value={participants}
+              onChange={(e) => setParticipants(e.target.value)}
+              className="flex-1 text-xs border border-slate-200 rounded px-2 py-1"
+            />
+            <input
+              type="date"
+              value={decidedDate}
+              onChange={(e) => setDecidedDate(e.target.value)}
+              className="text-xs border border-slate-200 rounded px-2 py-1"
+            />
+          </div>
+          <button
+            type="submit"
+            disabled={saving || !decisionText.trim()}
+            className="text-xs font-medium text-white bg-brand rounded px-2.5 py-1 disabled:opacity-40"
+          >
+            {saving ? "Adding…" : "Add decision"}
+          </button>
+        </form>
+      )}
+      {(decisions || []).length === 0 ? (
+        <p className="text-xs text-slate-400">No decisions logged yet.</p>
+      ) : (
+        <ul className="space-y-2 max-h-[420px] overflow-y-auto pr-1">
+          {decisions.map((d) => (
+            <li key={d.id} className="border-b border-slate-50 pb-2 last:border-0">
+              <div className="flex items-start justify-between gap-2">
+                <p
+                  className={`text-sm flex-1 min-w-0 ${
+                    d.status === "reversed" ? "line-through text-slate-400" : "text-slate-800"
+                  }`}
+                >
+                  {d.decision}
+                </p>
+                <button
+                  type="button"
+                  onClick={() => toggleStatus(d)}
+                  title={d.status === "decided" ? "Mark as reversed" : "Mark as decided"}
+                  className="shrink-0 text-[10px] px-1.5 py-0.5 rounded-full border border-slate-200 text-slate-500 hover:border-brand hover:text-brand"
+                >
+                  {d.status === "decided" ? "Decided" : "Reversed"}
+                </button>
+              </div>
+              {d.context && <p className="text-xs text-slate-500 mt-0.5">{d.context}</p>}
+              {(d.participants || d.decided_date) && (
+                <p className="text-[11px] text-slate-400 mt-0.5">
+                  {[d.participants, d.decided_date].filter(Boolean).join(" · ")}
+                </p>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
+  );
+}
+
+const RISK_STATUS_OPTIONS = [
+  { value: "open", label: "Open" },
+  { value: "mitigated", label: "Mitigated" },
+  { value: "closed", label: "Closed" },
+];
+
+// Structured, tracked risks/blockers (see models.Risk) - distinct from the
+// AI's own free-text risks_and_gaps, which is shown underneath, clearly
+// labeled, preserving the Source vs. Current-State distinction rather than
+// merging the two into one list.
+function RisksCard({ topicId, risks, onChanged, aiRisksText }) {
+  const [adding, setAdding] = useState(false);
+  const [description, setDescription] = useState("");
+  const [impact, setImpact] = useState("");
+  const [owner, setOwner] = useState("");
+  const [saving, setSaving] = useState(false);
+  const aiBullets = toBullets(aiRisksText);
+
+  async function handleAdd(e) {
+    e.preventDefault();
+    if (!description.trim()) return;
+    setSaving(true);
+    try {
+      await api.createRisk(topicId, { description: description.trim(), impact: impact.trim(), owner: owner.trim() });
+      setDescription("");
+      setImpact("");
+      setOwner("");
+      setAdding(false);
+      onChanged();
+    } catch (e) {
+      alert(e.message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function handleStatusChange(riskId, status) {
+    try {
+      await api.updateRisk(riskId, { status });
+      onChanged();
+    } catch (e) {
+      alert(e.message);
+    }
+  }
+
+  return (
+    <div className="space-y-4">
+      <section className="rounded-lg border border-border-warm border-t-2 border-t-accent-orange bg-white shadow-sm p-4 min-w-0">
+        <div className="flex items-center justify-between mb-3">
+          <h2 className="text-[15px] font-bold text-accent-orange">⚠ Risks</h2>
+          <button
+            type="button"
+            onClick={() => setAdding((v) => !v)}
+            className="text-xs font-medium text-brand hover:underline"
+          >
+            {adding ? "Cancel" : "+ Add"}
+          </button>
+        </div>
+        {adding && (
+          <form onSubmit={handleAdd} className="mb-3 space-y-1.5 rounded-md bg-slate-50 border border-slate-100 p-2.5">
+            <input
+              type="text"
+              placeholder="What could prevent this project from succeeding?"
+              value={description}
+              onChange={(e) => setDescription(e.target.value)}
+              className="w-full text-xs border border-slate-200 rounded px-2 py-1"
+              autoFocus
+            />
+            <input
+              type="text"
+              placeholder="Impact (optional)"
+              value={impact}
+              onChange={(e) => setImpact(e.target.value)}
+              className="w-full text-xs border border-slate-200 rounded px-2 py-1"
+            />
+            <input
+              type="text"
+              placeholder="Owner (optional)"
+              value={owner}
+              onChange={(e) => setOwner(e.target.value)}
+              className="w-full text-xs border border-slate-200 rounded px-2 py-1"
+            />
+            <button
+              type="submit"
+              disabled={saving || !description.trim()}
+              className="text-xs font-medium text-white bg-brand rounded px-2.5 py-1 disabled:opacity-40"
+            >
+              {saving ? "Adding…" : "Add risk"}
+            </button>
+          </form>
+        )}
+        {(risks || []).length === 0 ? (
+          <p className="text-xs text-slate-400">No tracked risks yet.</p>
+        ) : (
+          <ul className="space-y-2">
+            {risks.map((r) => (
+              <li key={r.id} className="border-b border-slate-50 pb-2 last:border-0">
+                <div className="flex items-start justify-between gap-2">
+                  <p
+                    className={`text-sm flex-1 min-w-0 ${
+                      r.status === "closed" ? "line-through text-slate-400" : "text-slate-800"
+                    }`}
+                  >
+                    {r.description}
+                  </p>
+                  <select
+                    value={r.status}
+                    onChange={(e) => handleStatusChange(r.id, e.target.value)}
+                    className="shrink-0 text-[10px] border border-slate-200 rounded px-1 py-0.5 bg-white"
+                  >
+                    {RISK_STATUS_OPTIONS.map((o) => (
+                      <option key={o.value} value={o.value}>
+                        {o.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                {r.impact && <p className="text-xs text-slate-500 mt-0.5">{r.impact}</p>}
+                {r.owner && <p className="text-[11px] text-slate-400 mt-0.5">Owner: {r.owner}</p>}
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+
+      {aiBullets.length > 0 && (
+        <section className="rounded-lg border border-slate-200 bg-slate-50/60 p-4 min-w-0">
+          <p className="text-[11px] font-semibold uppercase tracking-wider text-ink-muted mb-1.5">
+            AI&apos;s own read (from latest brief)
+          </p>
+          <ul className="space-y-0.5">
+            {aiBullets.map((b, i) => (
+              <li key={i} className="text-sm text-slate-600 flex gap-1.5">
+                <span className="text-slate-300 shrink-0">•</span>
+                <span>{b}</span>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+    </div>
+  );
+}
+
+// Action Items tab (renamed from "Work" 29 Sep, matching Venki's own
+// vocabulary for what this actually captures - meeting action items, not
+// general "work") - the topic-scoped view onto the same Kanban board as the
+// global /tasks page (TaskBoard.js is already topic-agnostic; this just
+// filters to one topic's tasks, exactly the reuse the spec asked for
+// instead of a second task-management surface). A small inline "+ Add task"
+// form plus the existing PayrollWorkflowPanel (moved here, not rewritten)
+// for process topics round out this tab.
+function WorkTabPanel({ topicId, tasks, onChanged, topicType, payrollRuns, computingPayroll, onComputePayroll, onApprovePayroll }) {
+  const [adding, setAdding] = useState(false);
+  const [title, setTitle] = useState("");
+  const [assignee, setAssignee] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  async function handleAdd(e) {
+    e.preventDefault();
+    if (!title.trim()) return;
+    setSaving(true);
+    try {
+      await api.createTask(topicId, { title: title.trim(), assignee: assignee.trim() });
+      setTitle("");
+      setAssignee("");
+      setAdding(false);
+      onChanged();
+    } catch (e) {
+      alert(e.message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="space-y-4">
+      <section className="rounded-lg border border-slate-200 bg-white p-4 min-w-0">
+        <div className="flex items-center justify-between mb-3">
+          <h2 className="text-sm font-semibold text-slate-700">✅ Action Items</h2>
+          <button
+            type="button"
+            onClick={() => setAdding((v) => !v)}
+            className="text-xs font-medium text-brand hover:underline"
+          >
+            {adding ? "Cancel" : "+ Add task"}
+          </button>
+        </div>
+        {adding && (
+          <form onSubmit={handleAdd} className="mb-3 flex gap-1.5 rounded-md bg-slate-50 border border-slate-100 p-2.5">
+            <input
+              type="text"
+              placeholder="What needs to be done?"
+              value={title}
+              onChange={(e) => setTitle(e.target.value)}
+              className="flex-1 min-w-0 text-xs border border-slate-200 rounded px-2 py-1"
+              autoFocus
+            />
+            <input
+              type="text"
+              placeholder="Assignee"
+              value={assignee}
+              onChange={(e) => setAssignee(e.target.value)}
+              className="w-32 shrink-0 text-xs border border-slate-200 rounded px-2 py-1"
+            />
+            <button
+              type="submit"
+              disabled={saving || !title.trim()}
+              className="shrink-0 text-xs font-medium text-white bg-brand rounded px-2.5 py-1 disabled:opacity-40"
+            >
+              {saving ? "Adding…" : "Add"}
+            </button>
+          </form>
+        )}
+        <TaskBoard
+          tasks={tasks}
+          emptyMessage="No tasks yet — they're pulled automatically from meeting transcripts, or add one directly."
+        />
+      </section>
+
+      {topicType === "process" && (
+        <PayrollWorkflowPanel
+          runs={payrollRuns}
+          computing={computingPayroll}
+          onCompute={onComputePayroll}
+          onApprove={onApprovePayroll}
+        />
+      )}
+    </div>
+  );
+}
+
+// Sources - a plain browse list of every ingested file (already loaded on
+// this page); the actual add/upload actions stay in the existing
+// ManageSourcesModal, opened from here, matching the spec's own "Drawer/
+// modal → editing" guidance instead of duplicating that UI in the tab.
+// Explicit "Project Intelligence" editing - same overlay/close-button shell
+// as CalendarModal/ManageSourcesModal further down this file, not a new
+// pattern.
+function EditProjectModal({ projectState, topic, onClose, onSave }) {
+  const [value, setValue] = useState(projectState?.current_position || "");
+  const [stage, setStage] = useState(topic?.stage || "");
+  const [customerName, setCustomerName] = useState(topic?.customer_name || "");
+  const [saving, setSaving] = useState(false);
+
+  async function handleSave() {
+    setSaving(true);
+    try {
+      const topicFields = {};
+      if (stage !== (topic?.stage || "")) topicFields.stage = stage;
+      if (customerName.trim() !== (topic?.customer_name || "")) topicFields.customer_name = customerName.trim();
+      await onSave(value, topicFields);
+      onClose();
+    } catch (e) {
+      alert(e.message);
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 bg-black/40 flex items-center justify-center p-4 z-50" onClick={onClose}>
+      <div className="bg-white rounded-lg shadow-xl w-full max-w-lg" onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-center justify-between px-4 pt-4">
+          <h2 className="text-sm font-semibold text-slate-800">Edit Project — Current Position</h2>
+          <button type="button" onClick={onClose} className="text-slate-400 hover:text-slate-600 text-lg leading-none">
+            ×
+          </button>
+        </div>
+        <div className="p-4">
+          <p className="text-xs text-slate-500 mb-2">
+            State where things actually stand, in your own words. OrientMe treats this as ground
+            truth over the source documents — the source files themselves are never changed.
+          </p>
+          {(projectState?.previous_position || "").trim() && (
+            <details className="mb-2 text-xs text-slate-500">
+              <summary className="cursor-pointer hover:text-slate-700">Previous value</summary>
+              <p className="mt-1 whitespace-pre-wrap">{projectState.previous_position}</p>
+            </details>
+          )}
+          <textarea
+            value={value}
+            onChange={(e) => setValue(e.target.value)}
+            rows={6}
+            className="w-full text-sm border border-slate-200 rounded-md px-3 py-2"
+            autoFocus
+          />
+          {/* Optional - for tracking a customer opportunity through its
+              stages; leaving both blank changes nothing. */}
+          <div className="grid grid-cols-2 gap-3 mt-3">
+            <label className="block text-xs text-slate-500">
+              Stage (optional)
+              <select
+                value={stage}
+                onChange={(e) => setStage(e.target.value)}
+                className="mt-1 w-full text-sm border border-slate-200 rounded-md px-2 py-1.5 bg-white text-slate-800"
+              >
+                <option value="">Not set</option>
+                {STAGE_OPTIONS.map((s) => (
+                  <option key={s.key} value={s.key}>
+                    {s.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="block text-xs text-slate-500">
+              Customer name (optional)
+              <input
+                value={customerName}
+                onChange={(e) => setCustomerName(e.target.value)}
+                maxLength={200}
+                className="mt-1 w-full text-sm border border-slate-200 rounded-md px-2 py-1.5 text-slate-800"
+              />
+            </label>
+          </div>
+        </div>
+        <div className="flex items-center justify-end gap-2 px-4 pb-4">
+          <button
+            type="button"
+            onClick={onClose}
+            className="text-xs font-medium text-slate-500 hover:text-slate-700 px-3 py-1.5"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            onClick={handleSave}
+            disabled={saving}
+            className="text-xs font-medium text-white bg-brand rounded-md px-3 py-1.5 disabled:opacity-40"
+          >
+            {saving ? "Saving…" : "Save"}
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -1202,14 +2398,28 @@ function StakeholdersCard({ meetingMetadata, relatedPeople }) {
   if (names.length === 0) return null;
 
   return (
-    <section className="rounded-lg border border-slate-200 bg-white p-4">
-      <h2 className="text-sm font-semibold text-slate-700 mb-2">Key Stakeholders</h2>
-      <div className="flex flex-wrap gap-1">
-        {names.map((n) => (
-          <span key={n} className="text-[11px] text-slate-600 bg-slate-100 px-2 py-0.5 rounded-full">
-            {n}
-          </span>
-        ))}
+    <section className="rounded-lg border border-slate-200 bg-white p-4 min-w-0">
+      <h2 className="text-sm font-semibold text-slate-700 mb-3 flex items-center gap-1.5">
+        👥 Key Stakeholders
+      </h2>
+      <div className="flex flex-col gap-2">
+        {names.map((n) => {
+          const { color, initials } = avatarStyle(n);
+          return (
+            <div
+              key={n}
+              className="flex items-center gap-2.5 rounded-lg border border-slate-100 bg-slate-50/60 px-2.5 py-2"
+            >
+              <span
+                className="w-7 h-7 rounded-full flex items-center justify-center text-[11px] font-bold text-white shrink-0"
+                style={{ background: color }}
+              >
+                {initials}
+              </span>
+              <span className="text-sm font-medium text-slate-800 truncate">{n}</span>
+            </div>
+          );
+        })}
       </div>
     </section>
   );
@@ -1269,7 +2479,7 @@ function ManageSourcesModal({ onClose, children }) {
   );
 }
 
-function MeetingInfoCard({ entry }) {
+function MeetingInfoCard({ entry, topicId, onChanged }) {
   const name = fileDisplayName(entry);
   const dateLabel = formatMeetingDate(entry.meeting_date);
   const chip = [dateLabel, entry.meeting_time].filter(Boolean).join(" · ");
@@ -1310,6 +2520,13 @@ function MeetingInfoCard({ entry }) {
       {entry.meeting_title && (
         <p className="text-[11px] text-slate-400 mt-2 font-mono truncate">{name}</p>
       )}
+      {topicId && (
+        <>
+          <MeetingTypeEditor entry={entry} onChanged={onChanged} />
+          <WhoSaidWhat entry={entry} />
+          <MeetingNotes topicId={topicId} entry={entry} onChanged={onChanged} />
+        </>
+      )}
     </div>
   );
 }
@@ -1329,16 +2546,47 @@ const TIMELINE_DOT_STYLES = {
   "status-update": "bg-violet-500",
   "payroll-computed": "bg-amber-400",
   "payroll-approved": "bg-amber-600",
+  email: "bg-sky-500",
+  document: "bg-indigo-500",
+  note: "bg-amber-500",
 };
+
+// Small marker in front of the label for the business event kinds, so they
+// read apart from meetings/tasks at a glance (existing kinds get none).
+const TIMELINE_KIND_ICONS = { email: "✉", document: "📄", note: "📝" };
 
 function truncateText(text, max) {
   if (!text) return "";
   return text.length > max ? `${text.slice(0, max).trim()}…` : text;
 }
 
-function ProjectTimeline({ topic, meetingMetadata, tasks, summaryHistory, workflowHistory }) {
-  const [expandedKey, setExpandedKey] = useState(null);
+// Pulled out of ProjectTimeline so the Context Node's condensed "Recent
+// Activity" list (top 4, newest first) and the full Project Timeline (every
+// entry, oldest first) share one computation - two independent copies of
+// this merge/label logic already drifted apart once this session (see the
+// meeting-title dedup fix), not repeating that.
+function buildTimelineEvents(topic, meetingMetadata, tasks, summaryHistory, workflowHistory, businessEvents) {
   const events = [];
+
+  // Emails, key documents (proposal/quotation/PRD/charter/plan) and human
+  // notes from /timeline_events/ - meetings are NOT taken from there (they
+  // already come from meetingMetadata above/below, with type + sequence in
+  // timeline_title), so nothing shows twice.
+  (businessEvents || []).forEach((b, i) => {
+    if (!b.date || !TIMELINE_KIND_ICONS[b.kind]) return;
+    const dateOnly = String(b.date).length <= 10;
+    const ts = new Date(dateOnly ? `${b.date}T00:00:00` : b.date).getTime();
+    if (isNaN(ts)) return;
+    events.push({
+      key: `${b.kind}-${b.file_id || b.note_id || i}`,
+      sortTs: ts,
+      dateLabel: dateOnly ? `${formatMeetingDate(b.date)}${b.approx_date ? " (approx.)" : ""}` : formatAdded(b.date),
+      label: b.title,
+      kind: b.kind,
+      path: "",
+      detail: b,
+    });
+  });
 
   meetingMetadata.forEach((m) => {
     if (!m.meeting_date) return;
@@ -1441,6 +2689,28 @@ function ProjectTimeline({ topic, meetingMetadata, tasks, summaryHistory, workfl
   });
 
   events.sort((a, b) => a.sortTs - b.sortTs);
+  return events;
+}
+
+// The compact, height-bounded sidebar column used on the Overview tab, next
+// to Context Node (the separate Timeline tab this once also powered was
+// redundant with this column and was removed - see PROJECT_TABS above).
+function ProjectTimeline({ topic, meetingMetadata, tasks, summaryHistory, workflowHistory, businessEvents, focus }) {
+  const [expandedKey, setExpandedKey] = useState(null);
+  const events = buildTimelineEvents(topic, meetingMetadata, tasks, summaryHistory, workflowHistory, businessEvents);
+
+  // An anchor on the "at a glance" strip (or its "Full timeline" link) asks
+  // this list to open that entry and bring it into view.
+  const [handledFocus, setHandledFocus] = useState(0);
+  if (focus && focus.n !== handledFocus) {
+    setHandledFocus(focus.n);
+    setExpandedKey(focus.key);
+  }
+  useEffect(() => {
+    if (!focus || !focus.n) return;
+    const el = focus.key ? document.getElementById(`tl-${focus.key}`) : document.getElementById("project-timeline");
+    el?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }, [focus]);
 
   if (events.length === 0) return null;
 
@@ -1448,24 +2718,23 @@ function ProjectTimeline({ topic, meetingMetadata, tasks, summaryHistory, workfl
   const fileHref = (path) => (isRealPath(path) ? `file:///${path.replace(/\\/g, "/")}` : null);
 
   return (
-    <section className="rounded-lg border border-slate-200 bg-white p-4">
-      <h2 className="text-sm font-semibold text-slate-700 mb-3">Project Timeline</h2>
-      <p className="text-xs text-slate-400 mb-3">
-        Meetings, board activity, status updates, and payroll runs, in the order they happened.
-        Click one to expand.
-      </p>
-      <div>
+    <section
+      id="project-timeline"
+      className="rounded-lg border border-slate-200 bg-white p-3.5 scroll-mt-4 min-w-0 flex flex-col max-h-[calc(100vh-2rem)]"
+    >
+      <h2 className="text-sm font-semibold text-slate-700 mb-0.5 shrink-0">Project Timeline</h2>
+      <p className="text-[11px] text-slate-400 mb-3 shrink-0">Click a title to expand.</p>
+      {/* Bounded + independently scrollable - many more entries typically
+          exist here than the Context Node has content for, so an unbounded
+          sticky column just kept growing well past it. */}
+      <div className="flex-1 min-h-0 overflow-y-auto pr-1 -mr-1">
         {events.map((e, i) => {
           const expanded = expandedKey === e.key;
           return (
-            <div key={e.key} className="flex gap-3">
-              <div className="flex flex-col items-center">
-                <span
-                  className={`w-2.5 h-2.5 rounded-full mt-1 shrink-0 ${
-                    TIMELINE_DOT_STYLES[e.kind] || "bg-slate-300"
-                  }`}
-                />
-                {i < events.length - 1 && <span className="w-px flex-1 bg-slate-200" />}
+            <div key={e.key} id={`tl-${e.key}`} className="flex gap-2">
+              <div className="flex flex-col items-center pt-1.5">
+                <span className={`w-2 h-2 rounded-full shrink-0 ${TIMELINE_DOT_STYLES[e.kind] || "bg-slate-300"}`} />
+                {i < events.length - 1 && <span className="w-px flex-1 bg-slate-200 my-1" />}
               </div>
               <div className="pb-3 min-w-0 flex-1">
                 <button
@@ -1473,13 +2742,16 @@ function ProjectTimeline({ topic, meetingMetadata, tasks, summaryHistory, workfl
                   onClick={() => setExpandedKey(expanded ? null : e.key)}
                   className="text-left w-full group"
                 >
-                  <p className="text-[11px] text-slate-400">{e.dateLabel}</p>
-                  <p className="text-sm text-slate-700 truncate group-hover:text-brand">
+                  <span className="block text-[10px] font-semibold text-slate-400 mb-0.5">
+                    {e.dateLabel}
+                  </span>
+                  <span className="block text-[12.5px] font-medium text-slate-700 leading-snug group-hover:text-brand">
+                    {TIMELINE_KIND_ICONS[e.kind] && <span className="mr-1">{TIMELINE_KIND_ICONS[e.kind]}</span>}
                     {e.label}
-                  </p>
+                  </span>
                 </button>
                 {expanded && (
-                  <div className="mt-1.5 mb-1 pl-2 border-l-2 border-slate-100 text-xs text-slate-600 space-y-1">
+                  <div className="mt-1.5 pl-2 border-l-2 border-slate-100 text-[11px] text-slate-600 space-y-1">
                     {e.kind === "meeting" && (
                       <>
                         {(e.detail.meeting_title || e.detail.file_display_name) && (
@@ -1515,12 +2787,10 @@ function ProjectTimeline({ topic, meetingMetadata, tasks, summaryHistory, workfl
                             {e.detail.assignee}
                           </p>
                         )}
-                        {e.detail.due_date && (
-                          <p>
-                            <span className="font-medium text-slate-500">Due: </span>
-                            {formatMeetingDate(e.detail.due_date)}
-                          </p>
-                        )}
+                        <p>
+                          <span className="font-medium text-slate-500">Added: </span>
+                          {formatAddedDate(e.detail.created_at)}
+                        </p>
                         <p>
                           <span className="font-medium text-slate-500">Status: </span>
                           {e.detail.status}
@@ -1545,6 +2815,20 @@ function ProjectTimeline({ topic, meetingMetadata, tasks, summaryHistory, workfl
                           <p>
                             <span className="font-medium text-slate-500">Next step: </span>
                             {e.detail.next_step}
+                          </p>
+                        )}
+                      </>
+                    )}
+                    {(e.kind === "email" || e.kind === "document") && e.detail.body && (
+                      <p>{e.detail.body}</p>
+                    )}
+                    {e.kind === "note" && (
+                      <>
+                        <p className="whitespace-pre-wrap">{e.detail.body}</p>
+                        {(e.detail.author || e.detail.meeting_title) && (
+                          <p className="text-slate-400">
+                            {e.detail.author}
+                            {e.detail.meeting_title ? ` · after ${e.detail.meeting_title}` : ""}
                           </p>
                         )}
                       </>
